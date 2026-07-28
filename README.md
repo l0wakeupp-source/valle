@@ -1,15 +1,9 @@
 # rick
 
-A lightweight, good-looking terminal AI coding agent. Single Go binary, fast
-startup, permission-gated by default.
+A fast, focused terminal AI coding agent for building, inspecting, and changing
+projects without leaving your shell.
 
-```
-  ██████  ██  ██████ ██   ██
-  ██   ██ ██ ██      ██  ██
-  ██████  ██ ██      █████
-  ██   ██ ██ ██      ██  ██
-  ██   ██ ██  ██████ ██   ██
-```
+![rick terminal example](rick-term.png)
 
 ## Install
 
@@ -18,7 +12,8 @@ startup, permission-gated by default.
 Install the latest release directly from GitHub:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rick-cli/rick/main/scripts/install.sh | bash
+curl -fsSL \
+  https://raw.githubusercontent.com/rick-cli/rick/main/scripts/install.sh | bash
 ```
 
 This installs `rick` to `~/.local/bin`. If that directory is not already on
@@ -36,7 +31,8 @@ permanent.
 Run PowerShell as your normal user:
 
 ```powershell
-irm https://raw.githubusercontent.com/rick-cli/rick/main/scripts/Install-Rick.ps1 | iex
+$base = "https://raw.githubusercontent.com/rick-cli/rick/main"
+irm "$base/scripts/Install-Rick.ps1" | iex
 ```
 
 This installs `rick.exe` to `%LOCALAPPDATA%\Rick\bin` and adds that directory
@@ -52,9 +48,8 @@ also download release binaries manually from the
 ```sh
 go install ./cmd/rick
 # or: go build -o rick ./cmd/rick
-```
 
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_KEY=[REDACTED]
 rick                         # in any project directory
 ```
 
@@ -63,7 +58,7 @@ shell out to it. `git` enables snapshot-backed undo/redo.
 
 ## Usage
 
-```
+```sh
 rick [path]              open a session in a directory (default: cwd)
 rick -p "fix the bug"    send an initial prompt
 rick -m openai/gpt-5     pick a model
@@ -82,7 +77,7 @@ rick version
 ## Keys
 
 | Key | Action |
-|---|---|
+| --- | --- |
 | `enter` | send |
 | `esc` | interrupt a run / clear the input |
 | `tab` | cycle build ⇄ plan (empty input), or complete a slash command |
@@ -231,23 +226,15 @@ two exchanges verbatim.
 
 ## Themes
 
-Four ship built in: `pickle-rick` (dark green), `rick-black` (pure black · neon green), `evil-rick` (blood red · dark romance), `rick-neon` (cyberpunk · hot pink). Drop JSON files
-in `~/.config/rick/themes/` or `.rick/themes/` to add your own. A `defs` block
-holds reusable colour tokens; each role may be a bare colour or
-`{"dark": ..., "light": ...}`.
-
-## Development
-
-```sh
-go build ./...
-go run ./cmd/rickverify    # 247 checks: tools, permissions, agent loop, TUI
-go run ./cmd/ricke2e       # 19 checks: full loop over real HTTP + SSE
-go vet ./...
-```
+Four ship built in: `pickle-rick` (dark green), `rick-black` (pure black ·
+neon green), `evil-rick` (blood red · dark romance), and `rick-neon`
+(cyberpunk · hot pink). Drop JSON files in `~/.config/rick/themes/` or
+`.rick/themes/` to add your own. A `defs` block holds reusable colour tokens;
+each role may be a bare colour or `{"dark": ..., "light": ...}`.
 
 ## Layout
 
-```
+```text
 cmd/rick/            CLI entrypoint
 internal/agent/      tool-calling loop, prompts, subagents
 internal/provider/   Provider interface + anthropic, openai adapters
