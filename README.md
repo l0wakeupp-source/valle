@@ -13,8 +13,47 @@ startup, permission-gated by default.
 
 ## Install
 
+### Linux and macOS
+
+Install the latest release directly from GitHub:
+
 ```sh
-go install ./cmd/rick        # or: go build -o rick ./cmd/rick
+curl -fsSL https://raw.githubusercontent.com/rick-cli/rick/main/scripts/install.sh | bash
+```
+
+This installs `rick` to `~/.local/bin`. If that directory is not already on
+`PATH`, run:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Open a new terminal after adding it to your shell profile to make the change
+permanent.
+
+### Windows PowerShell
+
+Run PowerShell as your normal user:
+
+```powershell
+irm https://raw.githubusercontent.com/rick-cli/rick/main/scripts/Install-Rick.ps1 | iex
+```
+
+This installs `rick.exe` to `%LOCALAPPDATA%\Rick\bin` and adds that directory
+to your user `PATH`. Open a new terminal if the current one does not see the
+updated `PATH`.
+
+The installers download the latest release for the detected platform. You can
+also download release binaries manually from the
+[GitHub Releases page](https://github.com/rick-cli/rick/releases).
+
+### From source
+
+```sh
+go install ./cmd/rick
+# or: go build -o rick ./cmd/rick
+```
+
 export ANTHROPIC_API_KEY=sk-ant-...
 rick                         # in any project directory
 ```
