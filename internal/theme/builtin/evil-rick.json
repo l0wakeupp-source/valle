@@ -1,0 +1,74 @@
+{
+  "name": "evil-rick",
+  "defs": {
+    "accent": "#E56B6B",
+    "accentDim": "#B85555",
+    "gold": "#E3C57C",
+    "text": "#F5E6E8",
+    "textMuted": "#9B7B7E",
+    "textDim": "#6B4E51",
+    "border": "#3D2A2C",
+    "planBorder": "#C08497",
+    "error": "#FF4444",
+    "warning": "#E3C57C",
+    "panel": "#120608",
+    "overlay": "#16080A",
+    "userBg": "#1A0A0C",
+    "diffAddBg": "#1A2E1A",
+    "diffAddFg": "#8FE6A0",
+    "diffDelBg": "#2E1A1A",
+    "diffDelFg": "#E68F8F"
+  },
+  "theme": {
+    "background": "#0E0506",
+    "backgroundPanel": "panel",
+    "backgroundOverlay": "overlay",
+    "userMessageBg": "userBg",
+
+    "text": "text",
+    "textMuted": "textMuted",
+    "textFaint": "textDim",
+
+    "border": "border",
+    "borderSubtle": "#2A1A1C",
+    "borderActive": "accent",
+    "promptBorder": "accent",
+    "planModeBorder": "planBorder",
+
+    "primary": "accent",
+    "accent": "accent",
+    "secondary": "gold",
+    "success": "#8FE6A0",
+    "warning": "warning",
+    "error": "error",
+    "info": "planBorder",
+
+    "user": "accent",
+    "assistant": "text",
+    "thinking": "textDim",
+    "tool": "textMuted",
+    "toolOk": "accentDim",
+    "toolErr": "error",
+
+    "diffAdded": "diffAddFg",
+    "diffRemoved": "diffDelFg",
+    "diffAddedBg": "diffAddBg",
+    "diffRemovedBg": "diffDelBg",
+    "diffContext": "textMuted",
+    "diffLineNumber": "textDim",
+
+    "markdownHeading": "accent",
+    "markdownLink": "planBorder",
+    "markdownCode": "gold",
+    "markdownBlockQuote": "textMuted",
+    "markdownListItem": "accentDim",
+
+    "syntaxKeyword": "gold",
+    "syntaxString": "accent",
+    "number": "accentDim",
+    "syntaxNumber": "accentDim",
+    "syntaxComment": "textDim",
+    "syntaxFunction": "planBorder",
+    "syntaxType": "text"
+  }
+}

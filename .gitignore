@@ -1,0 +1,14 @@
+# Build output
+/rick
+/rick.exe
+*.exe
+dist/
+
+# Rick local state and caches
+.rick/
+.cache/
+
+# Local configuration and secrets
+.env
+.env.*
+*.local

@@ -1,0 +1,74 @@
+{
+  "name": "rick-black",
+  "defs": {
+    "accent": "#00D4AA",
+    "accentDim": "#00A080",
+    "magenta": "#FF6EC7",
+    "cyan": "#00E5FF",
+    "text": "#F0F0F0",
+    "textMuted": "#8A8F98",
+    "textDim": "#5C6168",
+    "border": "#2A2A2A",
+    "planBorder": "#00E5FF",
+    "error": "#FF6B6B",
+    "warning": "#FFD166",
+    "panel": "#080808",
+    "overlay": "#0C0C0C",
+    "userBg": "#0A0A0A",
+    "diffAddBg": "#0A1F15",
+    "diffAddFg": "#39FF14",
+    "diffDelBg": "#1F0A0A",
+    "diffDelFg": "#FF4444"
+  },
+  "theme": {
+    "background": "#000000",
+    "backgroundPanel": "panel",
+    "backgroundOverlay": "overlay",
+    "userMessageBg": "userBg",
+
+    "text": "text",
+    "textMuted": "textMuted",
+    "textFaint": "textDim",
+
+    "border": "border",
+    "borderSubtle": "#1A1A1A",
+    "borderActive": "accent",
+    "promptBorder": "accent",
+    "planModeBorder": "planBorder",
+
+    "primary": "accent",
+    "accent": "accent",
+    "secondary": "magenta",
+    "success": "accent",
+    "warning": "warning",
+    "error": "error",
+    "info": "planBorder",
+
+    "user": "accent",
+    "assistant": "text",
+    "thinking": "textDim",
+    "tool": "textMuted",
+    "toolOk": "accentDim",
+    "toolErr": "error",
+
+    "diffAdded": "diffAddFg",
+    "diffRemoved": "diffDelFg",
+    "diffAddedBg": "diffAddBg",
+    "diffRemovedBg": "diffDelBg",
+    "diffContext": "textMuted",
+    "diffLineNumber": "textDim",
+
+    "markdownHeading": "accent",
+    "markdownLink": "planBorder",
+    "markdownCode": "magenta",
+    "markdownBlockQuote": "textMuted",
+    "markdownListItem": "cyan",
+
+    "syntaxKeyword": "magenta",
+    "syntaxString": "accent",
+    "syntaxNumber": "cyan",
+    "syntaxComment": "textDim",
+    "syntaxFunction": "planBorder",
+    "syntaxType": "text"
+  }
+}

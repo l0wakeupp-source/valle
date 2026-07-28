@@ -1,0 +1,74 @@
+{
+  "name": "synthwave",
+  "defs": {
+    "pink": "#ff6ac1",
+    "purple": "#b967ff",
+    "cyan": "#01cdfe",
+    "yellow": "#fffb96",
+    "orange": "#ff9e00",
+    "text": "#f0e6ff",
+    "textMuted": "#a08cbf",
+    "textDim": "#6b5a80",
+    "border": "#342554",
+    "error": "#ff3860",
+    "warning": "#fffb96",
+    "panel": "#1a1030",
+    "overlay": "#221540",
+    "userBg": "#150e28",
+    "diffAddBg": "#0a2a1a",
+    "diffAddFg": "#05ffa1",
+    "diffDelBg": "#2a0a1a",
+    "diffDelFg": "#ff3860"
+  },
+  "theme": {
+    "background": "#0d0221",
+    "backgroundPanel": "panel",
+    "backgroundOverlay": "overlay",
+    "userMessageBg": "userBg",
+
+    "text": "text",
+    "textMuted": "textMuted",
+    "textFaint": "textDim",
+
+    "border": "border",
+    "borderSubtle": "#261a40",
+    "borderActive": "pink",
+    "promptBorder": "pink",
+    "planModeBorder": "cyan",
+
+    "primary": "pink",
+    "accent": "pink",
+    "secondary": "cyan",
+    "success": "#05ffa1",
+    "warning": "warning",
+    "error": "error",
+    "info": "cyan",
+
+    "user": "pink",
+    "assistant": "text",
+    "thinking": "textDim",
+    "tool": "textMuted",
+    "toolOk": "purple",
+    "toolErr": "error",
+
+    "diffAdded": "diffAddFg",
+    "diffRemoved": "diffDelFg",
+    "diffAddedBg": "diffAddBg",
+    "diffRemovedBg": "diffDelBg",
+    "diffContext": "textMuted",
+    "diffLineNumber": "textDim",
+
+    "markdownHeading": "pink",
+    "markdownLink": "cyan",
+    "markdownCode": "yellow",
+    "markdownBlockQuote": "textMuted",
+    "markdownListItem": "cyan",
+
+    "syntaxKeyword": "purple",
+    "syntaxString": "yellow",
+    "syntaxNumber": "orange",
+    "syntaxComment": "textDim",
+    "syntaxFunction": "cyan",
+    "syntaxType": "pink"
+  }
+}

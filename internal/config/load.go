@@ -1,0 +1,475 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Load resolves the full config chain for a working directory.
+//
+// Precedence (later wins):
+//  1. built-in defaults
+//  2. global   ~/.config/rick/{rick,tui}.json
+//  3. RICK_CONFIG  (explicit file path)
+//  4. project  <root>/rick.json + <root>/tui.json  (and .rick/ variants)
+//  5. RICK_CONFIG_CONTENT (inline JSON override)
+func Load(cwd string) (*Loaded, error) {
+	cfg, tui := Defaults()
+	root := FindProjectRoot(cwd)
+	l := &Loaded{ProjectRoot: root}
+
+	apply := func(path string) {
+		if path == "" {
+			return
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		base := filepath.Dir(path)
+		if err := mergeInto(&cfg, &tui, raw, base, filepath.Base(path)); err != nil {
+			l.Sources = append(l.Sources, fmt.Sprintf("%s (ERROR: %v)", path, err))
+			return
+		}
+		l.Sources = append(l.Sources, path)
+	}
+
+	g := GlobalDir()
+	apply(firstExisting(filepath.Join(g, "rick.jsonc"), filepath.Join(g, "rick.json")))
+	apply(firstExisting(filepath.Join(g, "tui.jsonc"), filepath.Join(g, "tui.json")))
+
+	if p := os.Getenv("RICK_CONFIG"); p != "" {
+		apply(p)
+	}
+
+	apply(firstExisting(
+		filepath.Join(root, "rick.jsonc"), filepath.Join(root, "rick.json"),
+		filepath.Join(root, ".rick", "rick.jsonc"), filepath.Join(root, ".rick", "rick.json"),
+	))
+	apply(firstExisting(
+		filepath.Join(root, "tui.jsonc"), filepath.Join(root, "tui.json"),
+		filepath.Join(root, ".rick", "tui.jsonc"), filepath.Join(root, ".rick", "tui.json"),
+	))
+
+	if inline := os.Getenv("RICK_CONFIG_CONTENT"); inline != "" {
+		if err := mergeInto(&cfg, &tui, []byte(inline), root, "rick.json"); err == nil {
+			l.Sources = append(l.Sources, "RICK_CONFIG_CONTENT")
+		} else {
+			l.Sources = append(l.Sources, "RICK_CONFIG_CONTENT (ERROR: "+err.Error()+")")
+		}
+	}
+
+	// Environment API keys fill in providers that lack one.
+	applyEnvKeys(&cfg)
+
+	l.Config = cfg
+	l.TUI = tui
+	return l, nil
+}
+
+func firstExisting(paths ...string) string {
+	for _, p := range paths {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// mergeInto decodes raw (JSONC + substitutions) and merges it key-by-key.
+// A document is routed to the TUI struct if its filename starts with "tui",
+// or if it contains no rick-only keys but does contain tui-only keys.
+func mergeInto(cfg *Config, tui *TUI, raw []byte, baseDir, name string) error {
+	clean := Substitute(StripJSONC(raw), baseDir)
+
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(clean, &probe); err != nil {
+		return err
+	}
+
+	isTUIFile := len(name) >= 3 && name[:3] == "tui"
+	if isTUIFile {
+		var t TUI
+		if err := json.Unmarshal(clean, &t); err != nil {
+			return err
+		}
+		mergeTUI(tui, t, probe)
+		return nil
+	}
+
+	// A combined rick.json may carry a "tui" sub-object.
+	if sub, ok := probe["tui"]; ok {
+		var t TUI
+		if err := json.Unmarshal(sub, &t); err == nil {
+			var subProbe map[string]json.RawMessage
+			_ = json.Unmarshal(sub, &subProbe)
+			mergeTUI(tui, t, subProbe)
+		}
+		delete(probe, "tui")
+	}
+
+	var c Config
+	if err := json.Unmarshal(clean, &c); err != nil {
+		return err
+	}
+	mergeConfig(cfg, c, probe)
+	return nil
+}
+
+func has(p map[string]json.RawMessage, k string) bool { _, ok := p[k]; return ok }
+
+func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
+	if has(p, "model") {
+		dst.Model = src.Model
+	}
+	if has(p, "small_model") {
+		dst.SmallModel = src.SmallModel
+	}
+	if has(p, "max_tokens") {
+		dst.MaxTokens = src.MaxTokens
+	}
+	if has(p, "context_reserve") {
+		dst.ContextReserve = src.ContextReserve
+	}
+	if has(p, "autocompact") {
+		dst.AutoCompact = src.AutoCompact
+	}
+	if has(p, "subagent_depth") {
+		dst.SubagentDepth = src.SubagentDepth
+	}
+	if has(p, "instructions") {
+		dst.Instructions = append(dst.Instructions, src.Instructions...)
+	}
+	if has(p, "plugin") {
+		dst.Plugins = append(dst.Plugins, src.Plugins...)
+	}
+	if has(p, "provider") {
+		if dst.Providers == nil {
+			dst.Providers = map[string]Provider{}
+		}
+		for k, v := range src.Providers {
+			cur := dst.Providers[k]
+			if v.Type != "" {
+				cur.Type = v.Type
+			}
+			if v.APIKey != "" {
+				cur.APIKey = v.APIKey
+			}
+			if v.BaseURL != "" {
+				cur.BaseURL = v.BaseURL
+			}
+			if v.Enabled != nil {
+				cur.Enabled = v.Enabled
+			}
+			dst.Providers[k] = cur
+		}
+	}
+	if has(p, "tools") {
+		if dst.Tools == nil {
+			dst.Tools = map[string]bool{}
+		}
+		for k, v := range src.Tools {
+			dst.Tools[k] = v
+		}
+	}
+	if has(p, "agent") {
+		if dst.Agents == nil {
+			dst.Agents = map[string]Agent{}
+		}
+		for k, v := range src.Agents {
+			dst.Agents[k] = mergeAgent(dst.Agents[k], v)
+		}
+	}
+	if has(p, "mcp") {
+		if dst.MCP == nil {
+			dst.MCP = map[string]MCPServer{}
+		}
+		for k, v := range src.MCP {
+			dst.MCP[k] = v
+		}
+	}
+	if has(p, "command") {
+		if dst.Commands == nil {
+			dst.Commands = map[string]Command{}
+		}
+		for k, v := range src.Commands {
+			dst.Commands[k] = v
+		}
+	}
+	if has(p, "permission") && src.Permission != nil {
+		dst.Permission = MergePermission(dst.Permission, src.Permission)
+	}
+	if has(p, "permission_profile") {
+		if dst.Profiles == nil {
+			dst.Profiles = map[string]Permission{}
+		}
+		for k, v := range src.Profiles {
+			// A profile redefined in a closer config layer overlays the
+			// outer one rather than replacing it wholesale.
+			if existing, ok := dst.Profiles[k]; ok {
+				dst.Profiles[k] = *MergePermission(&existing, &v)
+			} else {
+				dst.Profiles[k] = v
+			}
+		}
+	}
+	if has(p, "sandbox") && src.Sandbox != nil {
+		dst.Sandbox = MergeSandbox(dst.Sandbox, src.Sandbox)
+	}
+}
+
+func mergeAgent(dst, src Agent) Agent {
+	if src.Description != "" {
+		dst.Description = src.Description
+	}
+	if src.Mode != "" {
+		dst.Mode = src.Mode
+	}
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
+	if src.Temperature != nil {
+		dst.Temperature = src.Temperature
+	}
+	if src.Prompt != "" {
+		dst.Prompt = src.Prompt
+	}
+	if src.Tools != nil {
+		if dst.Tools == nil {
+			dst.Tools = map[string]bool{}
+		}
+		for k, v := range src.Tools {
+			dst.Tools[k] = v
+		}
+	}
+	if src.Permission != nil {
+		dst.Permission = MergePermission(dst.Permission, src.Permission)
+	}
+	return dst
+}
+
+// MergePermission overlays src onto dst, returning a new value.
+func MergePermission(dst, src *Permission) *Permission {
+	out := Permission{}
+	if dst != nil {
+		out = *dst
+		out.Bash = copyLevels(dst.Bash)
+		out.Tools = copyLevels(dst.Tools)
+		out.Paths = copyLevels(dst.Paths)
+		out.Hosts = copyLevels(dst.Hosts)
+	}
+	if src == nil {
+		return &out
+	}
+	if src.Default != "" {
+		out.Default = src.Default
+	}
+	if src.Edit != "" {
+		out.Edit = src.Edit
+	}
+	if src.Write != "" {
+		out.Write = src.Write
+	}
+	if src.Read != "" {
+		out.Read = src.Read
+	}
+	if src.WebF != "" {
+		out.WebF = src.WebF
+	}
+	if len(src.Extends) > 0 {
+		out.Extends = append([]string(nil), src.Extends...)
+	}
+	out.Bash = overlayLevels(out.Bash, src.Bash)
+	out.Tools = overlayLevels(out.Tools, src.Tools)
+	out.Paths = overlayLevels(out.Paths, src.Paths)
+	out.Hosts = overlayLevels(out.Hosts, src.Hosts)
+	if src.Sandbox != nil {
+		out.Sandbox = MergeSandbox(out.Sandbox, src.Sandbox)
+	}
+	return &out
+}
+
+func copyLevels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func overlayLevels(dst, src map[string]string) map[string]string {
+	if src == nil {
+		return dst
+	}
+	if dst == nil {
+		dst = map[string]string{}
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// MergeSandbox overlays src onto dst, returning a new value.
+//
+// Scalars replace when set; list fields replace rather than append, because a
+// closer config layer narrowing "writable_roots" must not silently inherit the
+// wider set from the layer above it.
+func MergeSandbox(dst, src *SandboxConfig) *SandboxConfig {
+	out := SandboxConfig{}
+	if dst != nil {
+		out = *dst
+	}
+	if src == nil {
+		return &out
+	}
+	if src.Mode != "" {
+		out.Mode = src.Mode
+	}
+	if src.Enforcement != "" {
+		out.Enforcement = src.Enforcement
+	}
+	if src.Network != nil {
+		out.Network = src.Network
+	}
+	if src.KeepCredentials != nil {
+		out.KeepCredentials = src.KeepCredentials
+	}
+	if src.AllowHosts != nil {
+		out.AllowHosts = src.AllowHosts
+	}
+	if src.DenyHosts != nil {
+		out.DenyHosts = src.DenyHosts
+	}
+	if src.WritableRoots != nil {
+		out.WritableRoots = src.WritableRoots
+	}
+	if src.ReadableRoots != nil {
+		out.ReadableRoots = src.ReadableRoots
+	}
+	if src.DenyPaths != nil {
+		out.DenyPaths = src.DenyPaths
+	}
+	if src.AllowEnv != nil {
+		out.AllowEnv = src.AllowEnv
+	}
+	if src.DenyEnv != nil {
+		out.DenyEnv = src.DenyEnv
+	}
+	if src.MemoryMB > 0 {
+		out.MemoryMB = src.MemoryMB
+	}
+	if src.CPUSeconds > 0 {
+		out.CPUSeconds = src.CPUSeconds
+	}
+	if src.Processes > 0 {
+		out.Processes = src.Processes
+	}
+	if src.FileSizeMB > 0 {
+		out.FileSizeMB = src.FileSizeMB
+	}
+	return &out
+}
+
+func mergeTUI(dst *TUI, src TUI, p map[string]json.RawMessage) {
+	if has(p, "theme") {
+		dst.Theme = src.Theme
+	}
+	if has(p, "diff") {
+		dst.DiffMode = src.DiffMode
+	}
+	if has(p, "diff_threshold") {
+		dst.DiffThreshold = src.DiffThreshold
+	}
+	if has(p, "scroll_speed") {
+		dst.ScrollSpeed = src.ScrollSpeed
+	}
+	if has(p, "notifications") {
+		dst.Notifications = src.Notifications
+	}
+	if has(p, "show_thinking") {
+		dst.ShowThinking = src.ShowThinking
+	}
+	if has(p, "tool_details") {
+		dst.ToolDetails = src.ToolDetails
+	}
+	if has(p, "hide_status") {
+		dst.HideStatus = src.HideStatus
+	}
+	if has(p, "hide_tips") {
+		dst.HideTips = src.HideTips
+	}
+	if has(p, "mouse") {
+		dst.Mouse = src.Mouse
+	}
+	if has(p, "keybinds") {
+		k := src.Keybinds
+		d := &dst.Keybinds
+		set := func(dstf *string, v string) {
+			if v != "" {
+				*dstf = v
+			}
+		}
+		set(&d.Leader, k.Leader)
+		set(&d.AppExit, k.AppExit)
+		set(&d.SessionNew, k.SessionNew)
+		set(&d.SessionList, k.SessionList)
+		set(&d.MessagesUndo, k.MessagesUndo)
+		set(&d.MessagesRedo, k.MessagesRedo)
+		set(&d.ModelList, k.ModelList)
+		set(&d.ThemeList, k.ThemeList)
+		set(&d.AgentCycle, k.AgentCycle)
+		set(&d.ToolDetails, k.ToolDetails)
+		set(&d.MessagesPageUp, k.MessagesPageUp)
+		set(&d.MessagesPageDown, k.MessagesPageDown)
+		set(&d.Help, k.Help)
+		set(&d.InputClear, k.InputClear)
+		set(&d.Interrupt, k.Interrupt)
+	}
+}
+
+var envKeys = map[string][]string{
+	"anthropic":  {"ANTHROPIC_API_KEY"},
+	"openai":     {"OPENAI_API_KEY"},
+	"openrouter": {"OPENROUTER_API_KEY"},
+	"google":     {"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+}
+
+func applyEnvKeys(cfg *Config) {
+	if cfg.Providers == nil {
+		cfg.Providers = map[string]Provider{}
+	}
+	for name, vars := range envKeys {
+		p := cfg.Providers[name]
+		if p.APIKey == "" {
+			for _, v := range vars {
+				if val := os.Getenv(v); val != "" {
+					p.APIKey = val
+					break
+				}
+			}
+		}
+		if p.Type == "" {
+			p.Type = name
+		}
+		if p.APIKey != "" || cfg.Providers[name].BaseURL != "" {
+			cfg.Providers[name] = p
+		}
+	}
+}
+
+// SplitModel splits "provider/model-id" into its parts. A bare model id
+// defaults to the anthropic provider.
+func SplitModel(s string) (providerID, modelID string) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			return s[:i], s[i+1:]
+		}
+	}
+	return "anthropic", s
+}

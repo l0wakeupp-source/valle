@@ -1,0 +1,74 @@
+{
+  "name": "rick-neon",
+  "defs": {
+    "accent": "#FF10F0",
+    "accentDim": "#CC0CC0",
+    "cyan": "#00FFFF",
+    "yellow": "#FFE600",
+    "text": "#FAFAFA",
+    "textMuted": "#8A8A8A",
+    "textDim": "#5C5C5C",
+    "border": "#2E2E2E",
+    "planBorder": "#00FFFF",
+    "error": "#FF3131",
+    "warning": "#FFE600",
+    "panel": "#0A0A0A",
+    "overlay": "#0E0E0E",
+    "userBg": "#080808",
+    "diffAddBg": "#051A0A",
+    "diffAddFg": "#39FF14",
+    "diffDelBg": "#1A0505",
+    "diffDelFg": "#FF3131"
+  },
+  "theme": {
+    "background": "#050505",
+    "backgroundPanel": "panel",
+    "backgroundOverlay": "overlay",
+    "userMessageBg": "userBg",
+
+    "text": "text",
+    "textMuted": "textMuted",
+    "textFaint": "textDim",
+
+    "border": "border",
+    "borderSubtle": "#1E1E1E",
+    "borderActive": "accent",
+    "promptBorder": "accent",
+    "planModeBorder": "planBorder",
+
+    "primary": "accent",
+    "accent": "accent",
+    "secondary": "cyan",
+    "success": "cyan",
+    "warning": "warning",
+    "error": "error",
+    "info": "planBorder",
+
+    "user": "accent",
+    "assistant": "text",
+    "thinking": "textDim",
+    "tool": "textMuted",
+    "toolOk": "accentDim",
+    "toolErr": "error",
+
+    "diffAdded": "diffAddFg",
+    "diffRemoved": "diffDelFg",
+    "diffAddedBg": "diffAddBg",
+    "diffRemovedBg": "diffDelBg",
+    "diffContext": "textMuted",
+    "diffLineNumber": "textDim",
+
+    "markdownHeading": "accent",
+    "markdownLink": "cyan",
+    "markdownCode": "yellow",
+    "markdownBlockQuote": "textMuted",
+    "markdownListItem": "cyan",
+
+    "syntaxKeyword": "cyan",
+    "syntaxString": "accent",
+    "syntaxNumber": "yellow",
+    "syntaxComment": "textDim",
+    "syntaxFunction": "planBorder",
+    "syntaxType": "text"
+  }
+}

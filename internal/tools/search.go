@@ -1,0 +1,423 @@
+package tools
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"rick/internal/glob"
+)
+
+// ripgrepPath resolves the rg binary once.
+var ripgrepPath = func() string {
+	if p := os.Getenv("RICK_RIPGREP"); p != "" {
+		return p
+	}
+	if p, err := exec.LookPath("rg"); err == nil {
+		return p
+	}
+	return ""
+}()
+
+// HasRipgrep reports whether rg is available.
+func HasRipgrep() bool { return ripgrepPath != "" }
+
+// ---------- grep ----------
+
+// GrepTool searches file contents with ripgrep.
+type GrepTool struct{ MaxResults int }
+
+// Name implements Tool.
+func (GrepTool) Name() string { return "grep" }
+
+// ReadOnly implements Tool.
+func (GrepTool) ReadOnly() bool { return true }
+
+// Description implements Tool.
+func (GrepTool) Description() string {
+	return "Search file contents with a regular expression (ripgrep). Respects " +
+		".gitignore. Use 'files_with_matches' when you only need to know which " +
+		"files match. Prefer this over 'grep' via bash."
+}
+
+// Schema implements Tool.
+func (GrepTool) Schema() map[string]any {
+	return obj(map[string]any{
+		"pattern": strProp("Regular expression to search for (Rust regex syntax)."),
+		"path":    strProp("Directory or file to search. Defaults to the project root."),
+		"include": strProp("Glob filter for filenames, e.g. '*.go' or '**/*.{ts,tsx}'."),
+		"mode": map[string]any{
+			"type": "string", "enum": []string{"content", "files_with_matches", "count"},
+			"description": "Output mode. Default 'content'.",
+		},
+		"case_insensitive": boolProp("Case-insensitive search."),
+		"context":          numProp("Lines of context around each match. Default 0."),
+		"limit":            numProp("Maximum matches to return. Default 100."),
+	}, "pattern")
+}
+
+type grepArgs struct {
+	Pattern         string `json:"pattern"`
+	Path            string `json:"path"`
+	Include         string `json:"include"`
+	Mode            string `json:"mode"`
+	CaseInsensitive bool   `json:"case_insensitive"`
+	Context         int    `json:"context"`
+	Limit           int    `json:"limit"`
+}
+
+// Run implements Tool.
+func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
+	var a grepArgs
+	if err := decodeArgs(in, &a); err != nil {
+		return Errf("invalid arguments: %v", err), nil
+	}
+	if a.Pattern == "" {
+		return Errf("pattern is required"), nil
+	}
+	if ripgrepPath == "" {
+		return Errf("ripgrep (rg) not found on PATH; install it or set RICK_RIPGREP"), nil
+	}
+	limit := a.Limit
+	if limit <= 0 {
+		limit = t.MaxResults
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	searchPath := tc.Cwd
+	if a.Path != "" {
+		searchPath = resolvePath(tc.Cwd, a.Path)
+	}
+
+	args := []string{"--no-heading", "--color=never", "--line-number", "--with-filename"}
+	switch a.Mode {
+	case "files_with_matches":
+		args = []string{"--files-with-matches", "--color=never"}
+	case "count":
+		args = []string{"--count-matches", "--color=never"}
+	default:
+		if a.Context > 0 {
+			args = append(args, "--context", strconv.Itoa(a.Context))
+		}
+		args = append(args, "--max-count", strconv.Itoa(limit))
+	}
+	if a.CaseInsensitive {
+		args = append(args, "-i")
+	}
+	if a.Include != "" {
+		args = append(args, "--glob", a.Include)
+	}
+	args = append(args, "--", a.Pattern, searchPath)
+
+	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, ripgrepPath, args...)
+	cmd.Dir = tc.Cwd
+	out := boundedBuffer{limit: defaultSearchOutputLimit}
+	errb := boundedBuffer{limit: 64 << 10}
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	err := cmd.Run()
+
+	if out.Len() == 0 {
+		if err != nil && errb.Len() > 0 && !isExitCode(err, 1) {
+			return Errf("ripgrep: %s", strings.TrimSpace(errb.String())), nil
+		}
+		return Result{Output: "no matches found", Title: "grep " + a.Pattern}, nil
+	}
+
+	lines := []string{}
+	sc := bufio.NewScanner(strings.NewReader(out.String()))
+	sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
+	n := 0
+	for sc.Scan() {
+		line := sc.Text()
+		// Make paths relative for compactness.
+		if i := strings.Index(line, ":"); i > 0 {
+			if p := line[:i]; filepath.IsAbs(p) {
+				line = relTo(tc.Cwd, p) + line[i:]
+			}
+		} else if filepath.IsAbs(line) {
+			line = relTo(tc.Cwd, line)
+		}
+		lines = append(lines, line)
+		n++
+		if n >= limit {
+			lines = append(lines, fmt.Sprintf("… <truncated at %d results>", limit))
+			break
+		}
+	}
+
+	output := strings.Join(lines, "\n")
+	if out.Truncated() {
+		output += "\n… <ripgrep output capped>"
+	}
+	return Result{
+		Output: output,
+		Title:  fmt.Sprintf("grep %q (%d)", a.Pattern, n),
+		Meta:   map[string]any{"count": n},
+	}, nil
+}
+
+func isExitCode(err error, code int) bool {
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode() == code
+	}
+	return false
+}
+
+// ---------- glob ----------
+
+// GlobTool finds files by name pattern, newest first.
+type GlobTool struct{ MaxResults int }
+
+// Name implements Tool.
+func (GlobTool) Name() string { return "glob" }
+
+// ReadOnly implements Tool.
+func (GlobTool) ReadOnly() bool { return true }
+
+// Description implements Tool.
+func (GlobTool) Description() string {
+	return "Find files by glob pattern (e.g. '**/*.go', 'src/**/test_*.py'). " +
+		"Respects .gitignore; a .ignore file with '!' lines can re-include " +
+		"ignored paths. Results are sorted newest-modified first."
+}
+
+// Schema implements Tool.
+func (GlobTool) Schema() map[string]any {
+	return obj(map[string]any{
+		"pattern": strProp("Glob pattern to match filenames against."),
+		"path":    strProp("Directory to search. Defaults to the project root."),
+		"limit":   numProp("Maximum results. Default 200."),
+	}, "pattern")
+}
+
+type globArgs struct {
+	Pattern string `json:"pattern"`
+	Path    string `json:"path"`
+	Limit   int    `json:"limit"`
+}
+
+// Run implements Tool.
+func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
+	var a globArgs
+	if err := decodeArgs(in, &a); err != nil {
+		return Errf("invalid arguments: %v", err), nil
+	}
+	if a.Pattern == "" {
+		a.Pattern = "**/*"
+	}
+	limit := a.Limit
+	if limit <= 0 {
+		limit = t.MaxResults
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	searchPath := tc.Cwd
+	if a.Path != "" {
+		searchPath = resolvePath(tc.Cwd, a.Path)
+	}
+
+	var paths []string
+	if ripgrepPath != "" {
+		runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(runCtx, ripgrepPath,
+			"--files", "--color=never", "--glob", a.Pattern, searchPath)
+		cmd.Dir = tc.Cwd
+		out := boundedBuffer{limit: defaultSearchOutputLimit}
+		cmd.Stdout = &out
+		_ = cmd.Run()
+		sc := bufio.NewScanner(strings.NewReader(out.String()))
+		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
+		for sc.Scan() {
+			if l := strings.TrimSpace(sc.Text()); l != "" {
+				paths = append(paths, l)
+			}
+		}
+	} else {
+		paths = walkGlob(searchPath, a.Pattern, limit*4)
+	}
+
+	type entry struct {
+		path string
+		mod  time.Time
+	}
+	entries := make([]entry, 0, len(paths))
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, entry{p, st.ModTime()})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].mod.After(entries[j].mod) })
+
+	truncated := false
+	if len(entries) > limit {
+		entries = entries[:limit]
+		truncated = true
+	}
+	if len(entries) == 0 {
+		return Result{Output: "no files matched " + a.Pattern, Title: "glob " + a.Pattern}, nil
+	}
+
+	var b strings.Builder
+	for _, e := range entries {
+		b.WriteString(relTo(tc.Cwd, e.path))
+		b.WriteByte('\n')
+	}
+	if truncated {
+		fmt.Fprintf(&b, "… <truncated at %d results>\n", limit)
+	}
+	return Result{
+		Output: strings.TrimRight(b.String(), "\n"),
+		Title:  fmt.Sprintf("glob %s (%d)", a.Pattern, len(entries)),
+		Meta:   map[string]any{"count": len(entries)},
+	}, nil
+}
+
+// walkGlob is the no-ripgrep fallback.
+func walkGlob(root, pattern string, max int) []string {
+	var out []string
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true, "dist": true,
+		"build": true, "target": true, ".venv": true, "__pycache__": true,
+	}
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		if globMatch(pattern, rel) || globMatch(pattern, d.Name()) {
+			out = append(out, p)
+		}
+		if len(out) >= max {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return out
+}
+
+// globMatch matches a path against a pattern, falling back to the basename so
+// "*.go" finds "src/main.go" the way users expect.
+func globMatch(pattern, name string) bool {
+	if strings.Contains(pattern, "**") {
+		return glob.MatchPath(pattern, name)
+	}
+	if ok, err := filepath.Match(pattern, name); err == nil && ok {
+		return true
+	}
+	ok, _ := filepath.Match(pattern, filepath.Base(name))
+	return ok
+}
+
+// ---------- list ----------
+
+// ListTool prints a directory tree.
+type ListTool struct{}
+
+// Name implements Tool.
+func (ListTool) Name() string { return "list" }
+
+// ReadOnly implements Tool.
+func (ListTool) ReadOnly() bool { return true }
+
+// Description implements Tool.
+func (ListTool) Description() string {
+	return "List the contents of a directory as a tree. Useful for orienting " +
+		"yourself in an unfamiliar project."
+}
+
+// Schema implements Tool.
+func (ListTool) Schema() map[string]any {
+	return obj(map[string]any{
+		"path":  strProp("Directory to list. Defaults to the project root."),
+		"depth": numProp("How many levels deep to descend. Default 2."),
+	})
+}
+
+type listArgs struct {
+	Path  string `json:"path"`
+	Depth int    `json:"depth"`
+}
+
+// Run implements Tool.
+func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
+	var a listArgs
+	if err := decodeArgs(in, &a); err != nil {
+		return Errf("invalid arguments: %v", err), nil
+	}
+	root := tc.Cwd
+	if a.Path != "" {
+		root = resolvePath(tc.Cwd, a.Path)
+	}
+	depth := a.Depth
+	if depth <= 0 {
+		depth = 2
+	}
+	skip := map[string]bool{".git": true, "node_modules": true, "vendor": true, ".venv": true}
+
+	var b strings.Builder
+	b.WriteString(relTo(tc.Cwd, root) + "/\n")
+	count := 0
+	var walk func(dir, prefix string, level int)
+	walk = func(dir, prefix string, level int) {
+		if level > depth || count > 500 {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].IsDir() != entries[j].IsDir() {
+				return entries[i].IsDir()
+			}
+			return entries[i].Name() < entries[j].Name()
+		})
+		for i, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") && e.Name() != ".rick" || skip[e.Name()] {
+				continue
+			}
+			last := i == len(entries)-1
+			branch := "├─ "
+			nextPrefix := prefix + "│  "
+			if last {
+				branch = "└─ "
+				nextPrefix = prefix + "   "
+			}
+			name := e.Name()
+			if e.IsDir() {
+				name += "/"
+			}
+			b.WriteString(prefix + branch + name + "\n")
+			count++
+			if e.IsDir() {
+				walk(filepath.Join(dir, e.Name()), nextPrefix, level+1)
+			}
+		}
+	}
+	walk(root, "", 1)
+	return Result{Output: b.String(), Title: fmt.Sprintf("list %s (%d)", relTo(tc.Cwd, root), count)}, nil
+}

@@ -1,0 +1,427 @@
+// Package config loads rick's two config files (rick.json for runtime
+// behaviour, tui.json for presentation) with layered precedence.
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+)
+
+// Permission levels.
+const (
+	PermAllow = "allow"
+	PermAsk   = "ask"
+	PermDeny  = "deny"
+)
+
+// Provider is one configured LLM backend.
+type Provider struct {
+	Type    string `json:"type,omitempty"` // anthropic | openai | openrouter | google
+	APIKey  string `json:"apiKey,omitempty"`
+	BaseURL string `json:"baseUrl,omitempty"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+// Permission is the allow/ask/deny policy set.
+//
+// A permission block can either be written inline or inherit from a named
+// profile via Extends. Resolution order, weakest to strongest, is:
+// profile chain -> this block's coarse levels -> this block's glob rules.
+type Permission struct {
+	Bash    map[string]string `json:"bash,omitempty"`     // glob pattern -> level
+	Edit    string            `json:"edit,omitempty"`     // level
+	Write   string            `json:"write,omitempty"`    // level
+	Read    string            `json:"read,omitempty"`     // level
+	WebF    string            `json:"webfetch,omitempty"` // level
+	Default string            `json:"default,omitempty"`  // fallback level
+
+	// Extends names profiles from the top-level "permission_profile" map to
+	// inherit from, in order. Later entries win, and this block wins over all
+	// of them.
+	Extends []string `json:"extends,omitempty"`
+
+	// Tools maps a tool-name glob to a level, covering MCP tools and any
+	// built-in the coarse fields above do not name explicitly.
+	Tools map[string]string `json:"tools,omitempty"`
+
+	// Paths maps a path glob to a level for file-touching tools. More
+	// specific (longer) patterns win, so a deny on "**/.env" survives an
+	// allow on "**".
+	Paths map[string]string `json:"paths,omitempty"`
+
+	// Hosts maps a hostname glob to a level for webfetch and websearch.
+	Hosts map[string]string `json:"hosts,omitempty"`
+
+	// Sandbox overrides the sandbox policy while this permission set is
+	// active, letting a plan-mode agent run read-only without a global flag.
+	Sandbox *SandboxConfig `json:"sandbox,omitempty"`
+}
+
+// SandboxConfig is the JSON shape of a sandbox policy. It mirrors
+// sandbox.Policy but lives here so config has no dependency on the sandbox
+// package.
+type SandboxConfig struct {
+	Mode            string   `json:"mode,omitempty"`        // read-only | workspace-write | trusted | off
+	Enforcement     string   `json:"enforcement,omitempty"` // auto | os | static
+	Network         *bool    `json:"network,omitempty"`
+	AllowHosts      []string `json:"allow_hosts,omitempty"`
+	DenyHosts       []string `json:"deny_hosts,omitempty"`
+	WritableRoots   []string `json:"writable_roots,omitempty"`
+	ReadableRoots   []string `json:"readable_roots,omitempty"`
+	DenyPaths       []string `json:"deny_paths,omitempty"`
+	AllowEnv        []string `json:"allow_env,omitempty"`
+	DenyEnv         []string `json:"deny_env,omitempty"`
+	KeepCredentials *bool    `json:"keep_credentials,omitempty"`
+	MemoryMB        int      `json:"memory_mb,omitempty"`
+	CPUSeconds      int      `json:"cpu_seconds,omitempty"`
+	Processes       int      `json:"processes,omitempty"`
+	FileSizeMB      int      `json:"file_size_mb,omitempty"`
+}
+
+// Agent is a named agent definition.
+type Agent struct {
+	Description string            `json:"description,omitempty"`
+	Mode        string            `json:"mode,omitempty"` // primary | subagent | all
+	Model       string            `json:"model,omitempty"`
+	Temperature *float64          `json:"temperature,omitempty"`
+	Prompt      string            `json:"prompt,omitempty"`
+	Tools       map[string]bool   `json:"tools,omitempty"`
+	Permission  *Permission       `json:"permission,omitempty"`
+	Options     map[string]string `json:"options,omitempty"`
+}
+
+// MCPServer is one MCP server definition.
+type MCPServer struct {
+	Type        string            `json:"type,omitempty"` // local | remote
+	Command     []string          `json:"command,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Enabled     *bool             `json:"enabled,omitempty"`
+}
+
+// Command is a config-defined custom slash command.
+type Command struct {
+	Description string `json:"description,omitempty"`
+	Template    string `json:"template"`
+	Agent       string `json:"agent,omitempty"`
+	Model       string `json:"model,omitempty"`
+}
+
+// WebSearchConfig restricts web search results by domain.
+type WebSearchConfig struct {
+	AllowDomains []string `json:"allow_domains,omitempty"` // if set, only these domains
+	DenyDomains  []string `json:"deny_domains,omitempty"`  // always blocked
+	MaxResults   int      `json:"max_results,omitempty"`   // default 5
+	MaxSearchesPerSession int `json:"max_searches_per_session,omitempty"` // budget, default 10
+}
+
+// Config is rick.json.
+type Config struct {
+	Schema         string               `json:"$schema,omitempty"`
+	Model          string               `json:"model,omitempty"`
+	SmallModel     string               `json:"small_model,omitempty"`
+	MaxTokens      int                  `json:"max_tokens,omitempty"`
+	Providers      map[string]Provider  `json:"provider,omitempty"`
+	Permission     *Permission          `json:"permission,omitempty"`
+	// Profiles are reusable named permission sets referenced by
+	// Permission.Extends and by agents. The built-ins (readonly, standard,
+	// trusted, ci) are always present and may be overridden here.
+	Profiles map[string]Permission `json:"permission_profile,omitempty"`
+	// Sandbox is the global command-confinement policy. A permission block
+	// or agent may override it.
+	Sandbox *SandboxConfig `json:"sandbox,omitempty"`
+	Tools          map[string]bool      `json:"tools,omitempty"`
+	Agents         map[string]Agent     `json:"agent,omitempty"`
+	MCP            map[string]MCPServer `json:"mcp,omitempty"`
+	Commands       map[string]Command   `json:"command,omitempty"`
+	Instructions   []string             `json:"instructions,omitempty"`
+	AutoCompact    *bool                `json:"autocompact,omitempty"`
+	ContextReserve int                  `json:"context_reserve,omitempty"`
+	SubagentDepth  *int                 `json:"subagent_depth,omitempty"`
+	Plugins        []string             `json:"plugin,omitempty"`
+	WebSearch      *WebSearchConfig     `json:"web_search,omitempty"`
+}
+
+// Keybinds is the tui.json keybind block.
+type Keybinds struct {
+	Leader           string `json:"leader,omitempty"`
+	AppExit          string `json:"app_exit,omitempty"`
+	SessionNew       string `json:"session_new,omitempty"`
+	SessionList      string `json:"session_list,omitempty"`
+	MessagesUndo     string `json:"messages_undo,omitempty"`
+	MessagesRedo     string `json:"messages_redo,omitempty"`
+	ModelList        string `json:"model_list,omitempty"`
+	ThemeList        string `json:"theme_list,omitempty"`
+	AgentCycle       string `json:"agent_cycle,omitempty"`
+	ToolDetails      string `json:"tool_details,omitempty"`
+	MessagesPageUp   string `json:"messages_page_up,omitempty"`
+	MessagesPageDown string `json:"messages_page_down,omitempty"`
+	Help             string `json:"help,omitempty"`
+	InputClear       string `json:"input_clear,omitempty"`
+	Interrupt        string `json:"interrupt,omitempty"`
+}
+
+// TUI is tui.json.
+type TUI struct {
+	Schema        string   `json:"$schema,omitempty"`
+	Theme         string   `json:"theme,omitempty"`
+	DiffMode      string   `json:"diff,omitempty"` // auto | stacked
+	DiffThreshold int      `json:"diff_threshold,omitempty"`
+	ScrollSpeed   int      `json:"scroll_speed,omitempty"`
+	Notifications *bool    `json:"notifications,omitempty"`
+	ShowThinking  *bool    `json:"show_thinking,omitempty"`
+	ToolDetails   *bool    `json:"tool_details,omitempty"`
+	HideStatus    bool     `json:"hide_status,omitempty"`
+	HideTips      bool     `json:"hide_tips,omitempty"`
+	Mouse         bool     `json:"mouse,omitempty"`
+	Links         *bool    `json:"links,omitempty"`
+	Keybinds      Keybinds `json:"keybinds,omitempty"`
+}
+
+// Loaded is the resolved config pair plus provenance.
+type Loaded struct {
+	Config      Config
+	TUI         TUI
+	ProjectRoot string
+	Sources     []string
+}
+
+// ---------- defaults ----------
+
+// Defaults returns the built-in tier.
+func Defaults() (Config, TUI) {
+	yes := true
+	depth := 1
+	c := Config{
+		Model:      "anthropic/claude-sonnet-4-5-20250929",
+		SmallModel: "anthropic/claude-3-5-haiku-20241022",
+		MaxTokens:  16384,
+		Permission: &Permission{
+			Default: PermAllow,
+			Edit:    PermAsk,
+			Write:   PermAsk,
+			Read:    PermAllow,
+			WebF:    PermAllow,
+			Bash: map[string]string{
+				"*":           PermAsk,
+				"ls*":         PermAllow,
+				"cat*":        PermAllow,
+				"pwd":         PermAllow,
+				"echo*":       PermAllow,
+				"git status*": PermAllow,
+				"git diff*":   PermAllow,
+				"git log*":    PermAllow,
+				"git show*":   PermAllow,
+				"go build*":   PermAllow,
+				"go test*":    PermAllow,
+				"go vet*":     PermAllow,
+				"rm *":        PermAsk,
+				"git push*":   PermAsk,
+				"sudo*":       PermDeny,
+			},
+		},
+		AutoCompact:    &yes,
+		ContextReserve: 24000,
+		SubagentDepth:  &depth,
+	}
+	t := TUI{
+		Theme:         "pickle-rick",
+		DiffMode:      "auto",
+		DiffThreshold: 120,
+		ScrollSpeed:   3,
+		ShowThinking:  &yes,
+		Keybinds: Keybinds{
+			Leader:           "ctrl+x",
+			AppExit:          "ctrl+c",
+			SessionNew:       "<leader>n",
+			SessionList:      "<leader>l",
+			MessagesUndo:     "<leader>u",
+			MessagesRedo:     "<leader>r",
+			ModelList:        "<leader>m",
+			ThemeList:        "<leader>t",
+			AgentCycle:       "tab",
+			ToolDetails:      "<leader>d",
+			MessagesPageUp:   "pgup",
+			MessagesPageDown: "pgdown",
+			Help:             "<leader>h",
+			InputClear:       "ctrl+u",
+			Interrupt:        "esc",
+		},
+	}
+	return c, t
+}
+
+// ---------- JSONC ----------
+
+// StripJSONC removes // and /* */ comments and trailing commas, ignoring
+// anything inside string literals.
+func StripJSONC(b []byte) []byte {
+	var out []byte
+	inStr, esc, inLine, inBlock := false, false, false, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case inLine:
+			if c == '\n' {
+				inLine = false
+				out = append(out, c)
+			}
+		case inBlock:
+			if c == '*' && i+1 < len(b) && b[i+1] == '/' {
+				inBlock = false
+				i++
+			}
+		case inStr:
+			out = append(out, c)
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+		default:
+			if c == '"' {
+				inStr = true
+				out = append(out, c)
+			} else if c == '/' && i+1 < len(b) && b[i+1] == '/' {
+				inLine = true
+				i++
+			} else if c == '/' && i+1 < len(b) && b[i+1] == '*' {
+				inBlock = true
+				i++
+			} else {
+				out = append(out, c)
+			}
+		}
+	}
+	return stripTrailingCommas(out)
+}
+
+func stripTrailingCommas(b []byte) []byte {
+	var out []byte
+	inStr, esc := false, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inStr {
+			out = append(out, c)
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(b) && (b[j] == ' ' || b[j] == '\t' || b[j] == '\n' || b[j] == '\r') {
+				j++
+			}
+			if j < len(b) && (b[j] == '}' || b[j] == ']') {
+				continue // drop the comma
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// ---------- substitution ----------
+
+var subRe = regexp.MustCompile(`\{(env|file):([^}]+)\}`)
+
+// Substitute expands {env:VAR} and {file:path} inside every string value.
+func Substitute(b []byte, baseDir string) []byte {
+	return subRe.ReplaceAllFunc(b, func(m []byte) []byte {
+		parts := subRe.FindSubmatch(m)
+		kind, arg := string(parts[1]), strings.TrimSpace(string(parts[2]))
+		var val string
+		switch kind {
+		case "env":
+			val = os.Getenv(arg)
+		case "file":
+			p := arg
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(baseDir, p)
+			}
+			if data, err := os.ReadFile(p); err == nil {
+				val = strings.TrimRight(string(data), "\r\n")
+			}
+		}
+		// JSON-escape so the substituted value can't break the document.
+		enc, err := json.Marshal(val)
+		if err != nil {
+			return []byte{}
+		}
+		return enc[1 : len(enc)-1]
+	})
+}
+
+// ---------- paths ----------
+
+// GlobalDir is ~/.config/rick (or %APPDATA%\rick on Windows).
+func GlobalDir() string {
+	if v := os.Getenv("RICK_HOME"); v != "" {
+		return v
+	}
+	if runtime.GOOS == "windows" {
+		if ad := os.Getenv("APPDATA"); ad != "" {
+			return filepath.Join(ad, "rick")
+		}
+	}
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "rick")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "rick")
+}
+
+// DataDir is where sessions and snapshots live.
+func DataDir() string {
+	if v := os.Getenv("RICK_DATA"); v != "" {
+		return v
+	}
+	if runtime.GOOS == "windows" {
+		if ad := os.Getenv("LOCALAPPDATA"); ad != "" {
+			return filepath.Join(ad, "rick")
+		}
+	}
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		return filepath.Join(xdg, "rick")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "rick")
+}
+
+// FindProjectRoot walks up from dir looking for .git, falling back to dir.
+func FindProjectRoot(dir string) string {
+	d, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		if _, err := os.Stat(filepath.Join(d, "rick.json")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return dir
+		}
+		d = parent
+	}
+}

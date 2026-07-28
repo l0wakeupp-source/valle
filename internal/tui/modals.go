@@ -1,0 +1,1017 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"rick/internal/agent"
+	"rick/internal/config"
+	"rick/internal/goal"
+	"rick/internal/plugin"
+	"rick/internal/provider"
+	"rick/internal/session"
+	"rick/internal/tools"
+)
+
+func (m *Model) closeModal() {
+	m.modal = modalNone
+	m.listFilter = ""
+	m.input.Focus()
+}
+
+// ---------- specific modals ----------
+
+// cmdThemes lists themes inline with an "Add theme" option.
+func (m *Model) cmdThemes() (tea.Model, tea.Cmd) {
+	var opts []choiceOption
+	for _, name := range m.deps.Themes.SortedNames() {
+		detail := ""
+		switch name {
+		case "pickle-rick":
+			detail = "dark · light green"
+		case "rick-black":
+			detail = "pure black · neon green"
+		case "evil-rick":
+			detail = "blood red · dark romance"
+		case "rick-neon":
+			detail = "cyberpunk · hot pink"
+		case "synthwave":
+			detail = "retrowave · neon sunset"
+		}
+		opts = append(opts, choiceOption{
+			value: name, label: name, detail: detail, active: name == m.themeName,
+		})
+	}
+	opts = append(opts, choiceOption{value: "__add__", label: "＋ Add theme"})
+	m.armChoice("select a theme", pendingTheme, "", opts)
+	return m, nil
+}
+
+// cmdThemeSource shows the file-vs-URL sub-menu for adding a theme.
+func (m *Model) cmdThemeSource() (tea.Model, tea.Cmd) {
+	m.armChoice("add theme from…", pendingThemeSource, "", []choiceOption{
+		{value: "file", label: "Select file"},
+		{value: "url", label: "Enter URL"},
+	})
+	return m, nil
+}
+
+// addThemeFromSource loads a theme from a file path or URL and auto-selects it.
+func (m *Model) addThemeFromSource(src string) (tea.Model, tea.Cmd) {
+	var addErr error
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		addErr = m.deps.Themes.AddFromURL(src)
+	} else {
+		addErr = m.deps.Themes.AddFromFile(src)
+	}
+	if addErr != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "theme add failed: " + addErr.Error(), Time: time.Now()})
+		return m, nil
+	}
+	name := themeNameFromSource(src)
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "theme added: " + name, Time: time.Now()})
+	return m.applyTheme(name)
+}
+
+// ---------- session management ----------
+
+// cmdSessionsMenu shows the top-level session management menu.
+func (m *Model) cmdSessionsMenu() (tea.Model, tea.Cmd) {
+	m.armChoice("session management", pendingSessionMenu, "", []choiceOption{
+		{value: "browse", label: "Browse & resume"},
+		{value: "search", label: "Search"},
+		{value: "fork", label: "Fork current"},
+		{value: "rename", label: "Rename current"},
+		{value: "delete", label: "Delete"},
+		{value: "favorite", label: "Favorite"},
+	})
+	return m, nil
+}
+
+// applySessionMenu routes a session management menu choice.
+func (m *Model) applySessionMenu(action string) (tea.Model, tea.Cmd) {
+	switch action {
+	case "browse":
+		return m.cmdSessionPage("0")
+	case "search":
+		m.armInput("search sessions:", pendingSessionSearch, "")
+		return m, nil
+	case "fork":
+		if m.sess == nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active session to fork", Time: time.Now()})
+			return m, nil
+		}
+		forked, err := m.deps.Store.Fork(m.sess.ID)
+		if err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "fork: " + err.Error(), Time: time.Now()})
+			return m, nil
+		}
+		m.appendMsg(ChatMsg{Kind: MsgSystem,
+			Text: fmt.Sprintf("forked session %s → %s", m.sess.ID, forked.ID), Time: time.Now()})
+		return m, nil
+	case "rename":
+		if m.sess == nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active session to rename", Time: time.Now()})
+			return m, nil
+		}
+		m.armInput("new title for session:", pendingSessionRename, "")
+		return m, nil
+	case "delete":
+		return m.cmdSessionDeleteList()
+	case "favorite":
+		return m.cmdSessionFavoriteList()
+	}
+	return m, nil
+}
+
+// cmdSessionPage shows a paginated session list (10 at a time).
+// ctx is the page offset as a string.
+func (m *Model) cmdSessionPage(ctx string) (tea.Model, tea.Cmd) {
+	offset, _ := strconv.Atoi(ctx)
+	metas, err := m.deps.Store.List(m.deps.Cwd)
+	if err != nil || len(metas) == 0 {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no saved sessions here yet", Time: time.Now()})
+		return m, nil
+	}
+	pageSize := 10
+	end := offset + pageSize
+	if end > len(metas) {
+		end = len(metas)
+	}
+	page := metas[offset:end]
+
+	var opts []choiceOption
+	for _, meta := range page {
+		title := meta.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		fav := ""
+		if meta.Favorite {
+			fav = "★ "
+		}
+		opts = append(opts, choiceOption{
+			value: meta.ID, label: fav + truncate(title, 38),
+			detail: humanAge(meta.Updated),
+			active: m.sess != nil && m.sess.ID == meta.ID,
+		})
+	}
+	if end < len(metas) {
+		opts = append(opts, choiceOption{
+			value: "__next__", label: "→ next page",
+			detail: fmt.Sprintf("%d–%d of %d", offset+1, end, len(metas)),
+		})
+	}
+	nextCtx := strconv.Itoa(end)
+	m.armChoice(fmt.Sprintf("sessions (%d–%d of %d)", offset+1, end, len(metas)),
+		pendingSessionPage, nextCtx, opts)
+	return m, nil
+}
+
+// cmdSessionDeleteList shows sessions to pick for deletion.
+func (m *Model) cmdSessionDeleteList() (tea.Model, tea.Cmd) {
+	metas, err := m.deps.Store.List(m.deps.Cwd)
+	if err != nil || len(metas) == 0 {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no sessions to delete", Time: time.Now()})
+		return m, nil
+	}
+	if len(metas) > 20 {
+		metas = metas[:20]
+	}
+	var opts []choiceOption
+	for _, meta := range metas {
+		title := meta.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		opts = append(opts, choiceOption{
+			value: meta.ID, label: truncate(title, 40), detail: humanAge(meta.Updated),
+		})
+	}
+	m.armChoice("pick a session to delete", pendingSessionDelete, "", opts)
+	return m, nil
+}
+
+// cmdSessionFavoriteList shows sessions to toggle favorite.
+func (m *Model) cmdSessionFavoriteList() (tea.Model, tea.Cmd) {
+	metas, err := m.deps.Store.List(m.deps.Cwd)
+	if err != nil || len(metas) == 0 {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no sessions", Time: time.Now()})
+		return m, nil
+	}
+	if len(metas) > 20 {
+		metas = metas[:20]
+	}
+	var opts []choiceOption
+	for _, meta := range metas {
+		title := meta.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		fav := "☆"
+		if meta.Favorite {
+			fav = "★"
+		}
+		opts = append(opts, choiceOption{
+			value: meta.ID, label: fav + " " + truncate(title, 38), detail: humanAge(meta.Updated),
+		})
+	}
+	m.armChoice("toggle favorite (pick a session)", pendingSessionFavToggle, "", opts)
+	return m, nil
+}
+
+// cmdSessionsArgs handles /sessions with subcommands (backward compat).
+func (m *Model) cmdSessionsArgs(args string) (tea.Model, tea.Cmd) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return m.cmdSessionsMenu()
+	}
+	switch strings.ToLower(fields[0]) {
+	case "search":
+		query := strings.TrimSpace(strings.TrimPrefix(args, fields[0]))
+		if query == "" {
+			m.armInput("search sessions:", pendingSessionSearch, "")
+			return m, nil
+		}
+		metas, err := m.deps.Store.Search(query)
+		if err != nil || len(metas) == 0 {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no sessions match: " + query, Time: time.Now()})
+			return m, nil
+		}
+		if len(metas) > 20 {
+			metas = metas[:20]
+		}
+		var opts []choiceOption
+		for _, meta := range metas {
+			title := meta.Title
+			if title == "" {
+				title = "(untitled)"
+			}
+			opts = append(opts, choiceOption{
+				value: meta.ID, label: truncate(title, 40),
+				detail: humanAge(meta.Updated),
+				active: m.sess != nil && m.sess.ID == meta.ID,
+			})
+		}
+		m.armChoice("search results: "+query, pendingSession, "", opts)
+		return m, nil
+	case "fork":
+		if m.sess == nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active session to fork", Time: time.Now()})
+			return m, nil
+		}
+		forked, err := m.deps.Store.Fork(m.sess.ID)
+		if err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "fork: " + err.Error(), Time: time.Now()})
+			return m, nil
+		}
+		m.appendMsg(ChatMsg{Kind: MsgSystem,
+			Text: fmt.Sprintf("forked session %s → %s", m.sess.ID, forked.ID), Time: time.Now()})
+		return m, nil
+	case "rename":
+		title := strings.TrimSpace(strings.TrimPrefix(args, fields[0]))
+		if title == "" {
+			m.armInput("new title for session:", pendingSessionRename, "")
+			return m, nil
+		}
+		if m.sess == nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active session to rename", Time: time.Now()})
+			return m, nil
+		}
+		if err := m.deps.Store.Rename(m.sess.ID, title); err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "rename: " + err.Error(), Time: time.Now()})
+			return m, nil
+		}
+		m.sess.Title = title
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "session renamed: " + title, Time: time.Now()})
+		return m, nil
+	default:
+		return m.cmdSessionsMenu()
+	}
+}
+
+// cmdSessions lists resumable sessions inline (used by leader key).
+func (m *Model) cmdSessions() (tea.Model, tea.Cmd) {
+	metas, err := m.deps.Store.List(m.deps.Cwd)
+	if err != nil || len(metas) == 0 {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no saved sessions here yet", Time: time.Now()})
+		return m, nil
+	}
+	if len(metas) > 20 {
+		metas = metas[:20]
+	}
+	var opts []choiceOption
+	for _, meta := range metas {
+		title := meta.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		opts = append(opts, choiceOption{
+			value: meta.ID, label: truncate(title, 40),
+			detail: humanAge(meta.Updated),
+			active: m.sess != nil && m.sess.ID == meta.ID,
+		})
+	}
+	m.armChoice("resume a session", pendingSession, "", opts)
+	return m, nil
+}
+
+// cmdAgents lists the primary agents inline.
+func (m *Model) cmdAgents() (tea.Model, tea.Cmd) {
+	opts := []choiceOption{
+		{value: "build", label: "build", detail: "all tools allowed", active: m.agentName == "build"},
+		{value: "plan", label: "plan", detail: "edits and bash ask first", active: m.agentName == "plan"},
+	}
+	m.armChoice("select an agent", pendingAgent, "", opts)
+	return m, nil
+}
+
+func (m *Model) applyTheme(name string) (tea.Model, tea.Cmd) {
+	th := m.deps.Themes.Get(name)
+	if th == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "unknown theme: " + name, Time: time.Now()})
+		return m, nil
+	}
+	m.themeName = name
+	m.styles = NewStyles(th)
+	m.rebuildMarkdown(m.contentWidth())
+	m.tx.invalidateAll(m.contentWidth())
+	m.refresh()
+	if err := config.SaveThemeChoice(name); err != nil {
+		m.setStatus("theme: " + name + " (not saved: " + err.Error() + ")")
+	} else {
+		m.setStatus("theme: " + name)
+	}
+	return m, nil
+}
+
+// themeNameFromSource derives a theme registry name from a file path or URL,
+// matching the logic in theme.themeBaseName.
+func themeNameFromSource(src string) string {
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		trimmed := strings.TrimRight(src, "/")
+		if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+			trimmed = trimmed[idx+1:]
+		}
+		src = trimmed
+	} else {
+		src = filepath.Base(src)
+	}
+	lower := strings.ToLower(src)
+	if strings.HasSuffix(lower, ".rick") {
+		return src[:len(src)-5]
+	}
+	if strings.HasSuffix(lower, ".json") {
+		return src[:len(src)-5]
+	}
+	return src
+}
+
+func humanAge(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// ---------- session commands ----------
+
+func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
+	if m.running {
+		if m.agentCancel != nil {
+			m.agentCancel()
+		}
+		if m.permReply != nil {
+			m.answerPermission(agent.DecideReject)
+		}
+		m.running = false
+	}
+	m.agentCh = nil
+	m.agentCancel = nil
+	m.resetSwarmRuntime()
+	m.pendingTools = map[string]int{}
+	m.childActive = nil
+	m.closeModal()
+	m.auth.active = false
+
+	m.msgs = nil
+	m.history = nil
+	m.sess = nil
+	m.streamBuf.Reset()
+	m.thinkBuf.Reset()
+	m.tx.reset()
+	m.resetStats()
+	if m.deps.Todos != nil {
+		m.deps.Todos.Clear()
+	}
+	tools.ResetFileState()
+	m.refresh()
+	m.setStatus("new session")
+	return m, nil
+}
+
+func (m *Model) doResume(id string) {
+	if m.agentCancel != nil {
+		m.agentCancel()
+		m.agentCancel = nil
+		m.running = false
+	}
+	m.resetSwarmRuntime()
+	sess, err := m.deps.Store.Load(id)
+	if err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "resume: " + err.Error(), Time: time.Now()})
+		return
+	}
+	m.sess = sess
+	m.history = sess.Messages
+	m.resetStats()
+	m.usage = sess.Usage
+	if sess.Model != "" {
+		m.modelID = sess.Model
+		m.updateContextWindow()
+	}
+	if sess.Agent != "" {
+		m.agentName = sess.Agent
+		m.applyAgentPermissions()
+	}
+	if m.deps.Snapshots.Enabled() {
+		m.deps.Snapshots.LoadHistory(sess.Snapshots)
+	}
+	m.msgs = messagesToChat(sess.Messages)
+	m.refresh()
+	m.setStatus(fmt.Sprintf("resumed %q (%d messages)", sess.Title, len(sess.Messages)))
+}
+
+func messagesToChat(msgs []provider.Message) []ChatMsg {
+	var out []ChatMsg
+	toolNames := map[string]string{}
+	for _, msg := range msgs {
+		for _, b := range msg.Content {
+			switch b.Type {
+			case "text":
+				if strings.TrimSpace(b.Text) == "" {
+					continue
+				}
+				kind := MsgAssistant
+				if msg.Role == provider.RoleUser {
+					kind = MsgUser
+				}
+				out = append(out, ChatMsg{Kind: kind, Text: b.Text})
+			case "tool_use":
+				toolNames[b.ID] = b.Name
+				out = append(out, ChatMsg{
+					Kind: MsgTool, CallID: b.ID, ToolName: b.Name,
+					ToolTitle: b.Name, ToolInput: b.Input,
+				})
+			case "tool_result":
+				for i := len(out) - 1; i >= 0; i-- {
+					if out[i].Kind == MsgTool && out[i].CallID == b.ToolUseID {
+						out[i].ToolOutput = b.Content
+						out[i].ToolErr = b.IsError
+						break
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (m *Model) saveSession() {
+	if len(m.history) == 0 {
+		return
+	}
+	if m.sess == nil {
+		m.sess = &session.Session{
+			ID:      session.NewID(),
+			Cwd:     m.deps.Cwd,
+			Created: time.Now(),
+		}
+		_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
+	}
+	m.sess.Messages = m.history
+	m.sess.Model = m.modelID
+	m.sess.Agent = m.agentName
+	m.sess.Usage = m.usage
+	if m.deps.Snapshots.Enabled() {
+		m.sess.Snapshots = m.deps.Snapshots.History()
+	}
+	if m.sess.Title == "" {
+		m.sess.Title = session.Title(m.history)
+	}
+	_ = m.deps.Store.Save(m.sess)
+}
+
+func (m *Model) cmdUndo() (tea.Model, tea.Cmd) {
+	if !m.deps.Snapshots.Enabled() {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "snapshots unavailable (git not found)", Time: time.Now()})
+		return m, nil
+	}
+	snap, err := m.deps.Snapshots.Undo()
+	if err != nil {
+		m.setStatus(err.Error())
+		return m, nil
+	}
+	m.appendMsg(ChatMsg{Kind: MsgSystem,
+		Text: fmt.Sprintf("undid changes back to snapshot %s (%s)", snap.ID[:8], snap.Label), Time: time.Now()})
+	return m, nil
+}
+
+func (m *Model) cmdRedo() (tea.Model, tea.Cmd) {
+	if !m.deps.Snapshots.Enabled() {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "snapshots unavailable (git not found)", Time: time.Now()})
+		return m, nil
+	}
+	snap, err := m.deps.Snapshots.Redo()
+	if err != nil {
+		m.setStatus(err.Error())
+		return m, nil
+	}
+	m.appendMsg(ChatMsg{Kind: MsgSystem,
+		Text: fmt.Sprintf("redid changes to snapshot %s (%s)", snap.ID[:8], snap.Label), Time: time.Now()})
+	return m, nil
+}
+
+// ---------- compaction ----------
+
+func (m *Model) maybeAutoCompact() {
+	cfg := m.deps.Loaded.Config
+	if cfg.AutoCompact != nil && !*cfg.AutoCompact {
+		return
+	}
+	reserve := cfg.ContextReserve
+	if reserve <= 0 {
+		reserve = 24000
+	}
+	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
+	if m.ctxWindow > 0 && used > m.ctxWindow-reserve && len(m.history) > 6 {
+		m.setStatus("context nearly full — run /compact")
+	}
+}
+
+func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
+	if m.running {
+		m.setStatus("cannot compact while working")
+		return m, nil
+	}
+	if len(m.history) < 4 {
+		m.setStatus("nothing to compact")
+		return m, nil
+	}
+
+	prov, modelID, err := m.resolveProvider()
+	if err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	small := m.deps.Loaded.Config.SmallModel
+	if small != "" {
+		if pid, mid := config.SplitModel(small); m.deps.Providers[pid] != nil {
+			prov = m.deps.Providers[pid]
+			modelID = mid
+		}
+	}
+
+	keep := 4
+	if len(m.history) <= keep {
+		return m, nil
+	}
+	head := append([]provider.Message(nil), m.history[:len(m.history)-keep]...)
+	tail := append([]provider.Message(nil), m.history[len(m.history)-keep:]...)
+
+	m.setStatus("compacting…")
+
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+
+		req := provider.Request{
+			Model:     modelID,
+			System:    agent.CompactPrompt,
+			Messages:  append(head, provider.UserText("Summarise the conversation above now.")),
+			MaxTokens: 4096,
+		}
+		ch := make(chan provider.Event, 128)
+		go prov.Stream(ctx, req, ch)
+
+		var sb strings.Builder
+		for ev := range ch {
+			switch ev.Kind {
+			case provider.EventText:
+				sb.WriteString(ev.Text)
+			case provider.EventError:
+				return compactDoneMsg{err: ev.Err}
+			}
+		}
+		return compactDoneMsg{summary: sb.String(), tail: tail}
+	}
+}
+
+type compactDoneMsg struct {
+	summary string
+	tail    []provider.Message
+	err     error
+}
+
+// ---------- goal commands ----------
+
+// cmdGoal handles /goal — shows an interactive menu, or handles backward-compat
+// subcommands when args are provided.
+func (m *Model) cmdGoal(args string) (tea.Model, tea.Cmd) {
+	if m.deps.Goals == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goals not available", Time: time.Now()})
+		return m, nil
+	}
+	args = strings.TrimSpace(args)
+
+	// Bare /goal: show active goal status or prompt for a task.
+	if args == "" {
+		g, _ := m.deps.Goals.GetActive()
+		if g != nil && g.Status == "active" {
+			// Show progress + management menu.
+			title := fmt.Sprintf("goal: %s · %s", g.Title, goal.Progress(g))
+			m.armChoice(title, pendingGoalMenu, "active", []choiceOption{
+				{value: "done", label: "Mark done"},
+				{value: "abort", label: "Abort"},
+				{value: "steps", label: "View steps"},
+			})
+			return m, nil
+		}
+		m.armInput("what should I work on?", pendingGoalTitle, "")
+		return m, nil
+	}
+
+	// /goal <task> — create and immediately start working on it.
+	return m.createAndStartGoal(args)
+}
+
+// createAndStartGoal creates a goal from the task text and kicks off the agent.
+func (m *Model) createAndStartGoal(task string) (tea.Model, tea.Cmd) {
+	g := &goal.Goal{
+		Title:  task,
+		Status: "active",
+	}
+	if err := m.deps.Goals.Save(g); err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goal: " + err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	_ = m.deps.Goals.SetActive(g.ID)
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "goal set: " + task, Time: time.Now()})
+	m.setStatus("goal: " + truncate(task, 40))
+	// Start the agent with the goal as the prompt.
+	m.appendMsg(ChatMsg{Kind: MsgUser, Text: task, Time: time.Now()})
+	return m, m.startAgent(task)
+}
+
+// cmdGoalMenu shows the interactive goal menu.
+func (m *Model) cmdGoalMenu() (tea.Model, tea.Cmd) {
+	g, err := m.deps.Goals.GetActive()
+	if err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goal: " + err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	if g == nil {
+		m.armChoice("no active goal", pendingGoalMenu, "none", []choiceOption{
+			{value: "create", label: "Create goal"},
+			{value: "history", label: "View history"},
+		})
+		return m, nil
+	}
+	// Show progress in the title.
+	title := fmt.Sprintf("goal: %s · %s", g.Title, goal.Progress(g))
+	m.armChoice(title, pendingGoalMenu, "active", []choiceOption{
+		{value: "budget", label: "Set budget"},
+		{value: "done", label: "Mark done"},
+		{value: "abort", label: "Abort"},
+		{value: "step", label: "Add step"},
+		{value: "steps", label: "View steps"},
+	})
+	return m, nil
+}
+
+// applyGoalMenu routes a goal menu choice.
+func (m *Model) applyGoalMenu(action string) (tea.Model, tea.Cmd) {
+	switch action {
+	case "create":
+		m.armInput("goal title:", pendingGoalTitle, "")
+		return m, nil
+	case "history":
+		goals, err := m.deps.Goals.List()
+		if err != nil || len(goals) == 0 {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no goals yet", Time: time.Now()})
+			return m, nil
+		}
+		var b strings.Builder
+		for _, g := range goals {
+			fmt.Fprintf(&b, "  [%s] %s — %s\n", g.Status, g.Title, goal.Progress(&g))
+		}
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: strings.TrimRight(b.String(), "\n"), Time: time.Now()})
+		return m, nil
+	case "budget":
+		m.armInput("budget in k tokens:", pendingGoalBudget, "")
+		return m, nil
+	case "done":
+		return m.goalDone()
+	case "abort":
+		return m.goalAbort()
+	case "step":
+		m.armInput("step description:", pendingGoalStep, "")
+		return m, nil
+	case "steps":
+		g, err := m.deps.Goals.GetActive()
+		if err != nil || g == nil {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no active goal", Time: time.Now()})
+			return m, nil
+		}
+		if len(g.Steps) == 0 {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no steps yet", Time: time.Now()})
+			return m, nil
+		}
+		var b strings.Builder
+		for _, st := range g.Steps {
+			marker := "○"
+			switch st.Status {
+			case "done":
+				marker = "✓"
+			case "in_progress":
+				marker = "▶"
+			case "skipped":
+				marker = "⊘"
+			}
+			fmt.Fprintf(&b, "  %s [%s] %s\n", marker, st.ID, st.Content)
+		}
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: strings.TrimRight(b.String(), "\n"), Time: time.Now()})
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *Model) goalDone() (tea.Model, tea.Cmd) {
+	g, err := m.deps.Goals.GetActive()
+	if err != nil || g == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active goal", Time: time.Now()})
+		return m, nil
+	}
+	g.Status = "completed"
+	if err := m.deps.Goals.Save(g); err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goal: " + err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	_ = m.deps.Goals.ClearActive()
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: fmt.Sprintf("goal completed: %s (%s)", g.Title, goal.Progress(g)), Time: time.Now()})
+	m.setStatus("goal done")
+	return m, nil
+}
+
+func (m *Model) goalAbort() (tea.Model, tea.Cmd) {
+	g, err := m.deps.Goals.GetActive()
+	if err != nil || g == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "no active goal", Time: time.Now()})
+		return m, nil
+	}
+	g.Status = "aborted"
+	if err := m.deps.Goals.Save(g); err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goal: " + err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	_ = m.deps.Goals.ClearActive()
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "goal aborted: " + g.Title, Time: time.Now()})
+	m.setStatus("goal aborted")
+	return m, nil
+}
+
+// ---------- tools menu ----------
+
+// cmdToolsMenu shows all tools with on/off status for interactive toggling.
+func (m *Model) cmdToolsMenu() (tea.Model, tea.Cmd) {
+	names := m.deps.Registry.Names()
+	if len(names) == 0 {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no tools registered", Time: time.Now()})
+		return m, nil
+	}
+	var opts []choiceOption
+	for _, name := range names {
+		status := "[on]"
+		if m.disabledTools[name] {
+			status = "[off]"
+		}
+		opts = append(opts, choiceOption{
+			value: name, label: status + " " + name,
+		})
+	}
+	opts = append(opts,
+		choiceOption{value: "__enable_all__", label: "Enable all"},
+		choiceOption{value: "__disable_all__", label: "Disable all"},
+	)
+	m.armChoice("toggle tools", pendingToolToggle, "", opts)
+	return m, nil
+}
+
+// ---------- skill helpers ----------
+
+// showSkillContent displays a skill's content inline.
+func (m *Model) showSkillContent(name string) (tea.Model, tea.Cmd) {
+	for _, s := range m.deps.Skills {
+		if strings.EqualFold(s.Name, name) {
+			var b strings.Builder
+			fmt.Fprintf(&b, "## %s\n", s.Name)
+			if s.Description != "" {
+				fmt.Fprintf(&b, "%s\n\n", s.Description)
+			}
+			if len(s.Trigger) > 0 {
+				fmt.Fprintf(&b, "Triggers: %s\n\n", strings.Join(s.Trigger, ", "))
+			}
+			b.WriteString(s.Body)
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: b.String(), Time: time.Now()})
+			return m, nil
+		}
+	}
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "skill not found: " + name, Time: time.Now()})
+	return m, nil
+}
+
+// cmdSkillSource shows the add-skill sub-menu.
+func (m *Model) cmdSkillSource() (tea.Model, tea.Cmd) {
+	m.armChoice("add skill from…", pendingSkillSource, "", []choiceOption{
+		{value: "file", label: "From file"},
+		{value: "url", label: "From URL"},
+		{value: "create", label: "Create new"},
+	})
+	return m, nil
+}
+
+// addSkillFromFile loads a skill from a .md file path.
+func (m *Model) addSkillFromFile(path string) (tea.Model, tea.Cmd) {
+	skills := plugin.LoadSkills(filepath.Dir(path))
+	// Find the skill that matches the file.
+	base := strings.TrimSuffix(filepath.Base(path), ".md")
+	for _, s := range skills {
+		if strings.EqualFold(s.Name, base) || s.Source == path {
+			m.deps.Skills = append(m.deps.Skills, s)
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "skill added: " + s.Name, Time: time.Now()})
+			return m, nil
+		}
+	}
+	// If LoadSkills didn't find it (maybe no frontmatter), just note it.
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "could not parse skill from: " + path, Time: time.Now()})
+	return m, nil
+}
+
+// addSkillFromURL fetches a skill from a URL.
+func (m *Model) addSkillFromURL(rawURL string) (tea.Model, tea.Cmd) {
+	// Download to a temp file and parse.
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "fetching skill from: " + rawURL, Time: time.Now()})
+	// For now, just note that URL skill loading requires network.
+	// We'll use a simple HTTP GET approach.
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "URL skill loading not yet implemented — use file or create", Time: time.Now()})
+	return m, nil
+}
+
+// ---------- plugin helpers ----------
+
+// cmdPluginsMenu shows plugins as an interactive toggle list with "Add plugin".
+func (m *Model) cmdPluginsMenu() (tea.Model, tea.Cmd) {
+	if m.deps.Plugins == nil || m.deps.Plugins.Len() == 0 {
+		m.armChoice("no plugins loaded", pendingPluginAdd, "", []choiceOption{
+			{value: "__add__", label: "＋ Add plugin"},
+		})
+		return m, nil
+	}
+	infos := m.deps.Plugins.List()
+	var opts []choiceOption
+	for _, info := range infos {
+		status := "●"
+		if !info.Enabled {
+			status = "○"
+		}
+		desc := ""
+		if info.Description != "" {
+			desc = " — " + info.Description
+		}
+		opts = append(opts, choiceOption{
+			value: info.Name, label: status + " " + info.Name, detail: desc,
+		})
+	}
+	opts = append(opts, choiceOption{value: "__add__", label: "＋ Add plugin"})
+	m.armChoice("plugins (pick to toggle, or open source)", pendingPluginOpen, "", opts)
+	return m, nil
+}
+
+// openPluginSource opens a plugin's source file in the explorer, or its URL in
+// the browser when the plugin is remote.
+func (m *Model) openPluginSource(name string) (tea.Model, tea.Cmd) {
+	man := m.pluginManifest(name)
+	if man == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "plugin not found: " + name, Time: time.Now()})
+		return m, nil
+	}
+	if man.Source != "" {
+		if err := openInExplorer(man.Source); err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "open: " + err.Error(), Time: time.Now()})
+			return m, nil
+		}
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "opened: " + man.Source, Time: time.Now()})
+		return m, nil
+	}
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "plugin has no source path: " + name, Time: time.Now()})
+	return m, nil
+}
+
+// pluginManifest finds a loaded plugin's manifest by name.
+func (m *Model) pluginManifest(name string) *plugin.Manifest {
+	for _, dir := range []string{
+		filepath.Join(config.GlobalDir(), "plugins"),
+		filepath.Join(m.deps.Loaded.ProjectRoot, ".rick", "plugins"),
+	} {
+		if ms, err := plugin.LoadDir(dir); err == nil {
+			for i := range ms {
+				if ms[i].Name == name {
+					return &ms[i]
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// openSkillSource opens a skill's source file in the OS file explorer.
+func (m *Model) openSkillSource(name string) (tea.Model, tea.Cmd) {
+	for _, s := range m.deps.Skills {
+		if strings.EqualFold(s.Name, name) {
+			if s.Source == "" {
+				m.appendMsg(ChatMsg{Kind: MsgError, Text: "skill has no source path: " + name, Time: time.Now()})
+				return m, nil
+			}
+			if err := openInExplorer(s.Source); err != nil {
+				m.appendMsg(ChatMsg{Kind: MsgError, Text: "open: " + err.Error(), Time: time.Now()})
+				return m, nil
+			}
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "opened: " + s.Source, Time: time.Now()})
+			return m, nil
+		}
+	}
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "skill not found: " + name, Time: time.Now()})
+	return m, nil
+}
+
+// cmdPluginSource shows the add-plugin sub-menu.
+func (m *Model) cmdPluginSource() (tea.Model, tea.Cmd) {
+	m.armChoice("add plugin from…", pendingPluginSource, "", []choiceOption{
+		{value: "file", label: "From file"},
+		{value: "url", label: "From URL"},
+	})
+	return m, nil
+}
+
+// addPluginFromSource loads a plugin from a file path or URL.
+func (m *Model) addPluginFromSource(src string) (tea.Model, tea.Cmd) {
+	var manifests []plugin.Manifest
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		man, err := plugin.LoadURL(src)
+		if err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "plugin add: " + err.Error(), Time: time.Now()})
+			return m, nil
+		}
+		manifests = append(manifests, man)
+	} else {
+		ms, err := plugin.LoadDir(src)
+		if err != nil {
+			ms = nil
+		}
+		if len(ms) == 0 {
+			man, ok := plugin.LoadFile(src)
+			if !ok {
+				m.appendMsg(ChatMsg{Kind: MsgError, Text: "no plugin manifests found at: " + src, Time: time.Now()})
+				return m, nil
+			}
+			manifests = append(manifests, man)
+		} else {
+			manifests = ms
+		}
+	}
+	for _, man := range manifests {
+		hooks := plugin.ManifestToHooks(man)
+		m.deps.Plugins.Register(hooks)
+		m.deps.Plugins.SetEnabled(man.Name, man.IsEnabled())
+	}
+	names := make([]string, len(manifests))
+	for i, man := range manifests {
+		names[i] = man.Name
+	}
+	m.appendMsg(ChatMsg{Kind: MsgSystem,
+		Text: fmt.Sprintf("added %d plugin(s): %s", len(manifests), strings.Join(names, ", ")), Time: time.Now()})
+	return m, nil
+}

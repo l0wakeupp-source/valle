@@ -1,0 +1,502 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "rick.json",
+  "description": "Configuration for the rick terminal coding agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "level": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ],
+      "description": "allow = run silently, ask = prompt the user, deny = refuse."
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "$ref": "#/definitions/level",
+          "description": "Fallback for anything not matched below."
+        },
+        "edit": {
+          "$ref": "#/definitions/level"
+        },
+        "write": {
+          "$ref": "#/definitions/level"
+        },
+        "read": {
+          "$ref": "#/definitions/level"
+        },
+        "webfetch": {
+          "$ref": "#/definitions/level"
+        },
+        "bash": {
+          "type": "object",
+          "description": "Glob pattern -> level. The most specific matching pattern wins; each sub-command of a compound line is checked and the strictest level applies.",
+          "additionalProperties": {
+            "$ref": "#/definitions/level"
+          },
+          "examples": [
+            {
+              "*": "ask",
+              "go test*": "allow",
+              "sudo*": "deny"
+            }
+          ]
+        },
+        "extends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Permission profiles to inherit from, weakest first. Later entries win; this block wins over all of them. Built-ins: readonly, standard, trusted, ci.",
+          "examples": [
+            [
+              "standard"
+            ],
+            [
+              "ci",
+              "my-overrides"
+            ]
+          ]
+        },
+        "tools": {
+          "type": "object",
+          "description": "Tool-name glob -> level. Covers MCP tools and any built-in not named by the coarse fields above. Exact names beat globs.",
+          "additionalProperties": {
+            "$ref": "#/definitions/level"
+          },
+          "examples": [
+            {
+              "mcp_*": "ask",
+              "mcp_readonly": "allow",
+              "dangerous_*": "deny"
+            }
+          ]
+        },
+        "paths": {
+          "type": "object",
+          "description": "Path glob -> level for file-touching tools. Longer patterns win, and an explicit deny always beats a coarse allow.",
+          "additionalProperties": {
+            "$ref": "#/definitions/level"
+          },
+          "examples": [
+            {
+              "**/.env": "ask",
+              "**/.ssh/**": "deny",
+              "**/*.pem": "deny"
+            }
+          ]
+        },
+        "hosts": {
+          "type": "object",
+          "description": "Hostname glob -> level for webfetch and websearch.",
+          "additionalProperties": {
+            "$ref": "#/definitions/level"
+          },
+          "examples": [
+            {
+              "*": "ask",
+              "*.github.com": "allow",
+              "evil.com": "deny"
+            }
+          ]
+        },
+        "sandbox": {
+          "$ref": "#/definitions/sandbox",
+          "description": "Sandbox policy to activate alongside this permission set. Overrides the top-level sandbox block."
+        }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Confinement applied to every command the bash tool runs.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "trusted",
+            "off"
+          ],
+          "default": "workspace-write",
+          "description": "read-only: no writes, no network. workspace-write: writes confined to the project (default). trusted: resource limits only. off: no confinement."
+        },
+        "enforcement": {
+          "enum": [
+            "auto",
+            "os",
+            "static"
+          ],
+          "default": "auto",
+          "description": "auto: use OS confinement when available, else fall back to static analysis. os: refuse to run when the kernel fence is unavailable (use in CI). static: analysis only."
+        },
+        "network": {
+          "type": "boolean",
+          "description": "Allow outbound network access. Forced false in read-only mode."
+        },
+        "allow_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Host globs reachable when the network is on. Empty means every host.",
+          "examples": [
+            [
+              "*.github.com",
+              "proxy.golang.org"
+            ]
+          ]
+        },
+        "deny_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Host globs blocked even when the network is on."
+        },
+        "writable_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Extra absolute directories commands may write to, on top of the workspace and temp."
+        },
+        "readable_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Restrict reads to these directories. Empty means the whole filesystem is readable."
+        },
+        "deny_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Path globs blocked for both reads and writes.",
+          "examples": [
+            [
+              "**/.ssh/**",
+              "**/.aws/**"
+            ]
+          ]
+        },
+        "allow_env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Environment variable globs that survive credential scrubbing."
+        },
+        "deny_env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Environment variable globs to strip on top of the built-in credential patterns."
+        },
+        "keep_credentials": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable credential scrubbing. Needed for commands that legitimately push to a remote."
+        },
+        "memory_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Memory cap per process. 0 means no limit."
+        },
+        "cpu_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "CPU time cap across the process tree. 0 means no limit."
+        },
+        "processes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum concurrent processes in the tree. 0 means no limit."
+        },
+        "file_size_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Largest file a command may create. 0 means no limit."
+        }
+      }
+    }
+  },
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string",
+      "description": "Active model as provider/model-id, e.g. anthropic/claude-sonnet-4-5-20250929.",
+      "default": "anthropic/claude-sonnet-4-5-20250929"
+    },
+    "small_model": {
+      "type": "string",
+      "description": "Cheap model used for session titles and context compaction."
+    },
+    "max_tokens": {
+      "type": "integer",
+      "description": "Maximum output tokens per turn.",
+      "default": 16384,
+      "minimum": 256
+    },
+    "context_reserve": {
+      "type": "integer",
+      "description": "Tokens held back from the context window before compaction is suggested.",
+      "default": 24000
+    },
+    "autocompact": {
+      "type": "boolean",
+      "description": "Warn and offer compaction as the context window fills.",
+      "default": true
+    },
+    "subagent_depth": {
+      "type": "integer",
+      "description": "How many levels of subagent spawning are permitted.",
+      "default": 1,
+      "minimum": 0,
+      "maximum": 3
+    },
+    "provider": {
+      "type": "object",
+      "description": "LLM backends. The key is the name used in model ids.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Wire protocol. Defaults to the provider key. Unknown types with a baseUrl are treated as OpenAI-compatible.",
+            "enum": [
+              "anthropic",
+              "openai",
+              "openrouter",
+              "groq",
+              "deepseek",
+              "together",
+              "openai-compatible"
+            ]
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "Supports {env:VAR} and {file:path} substitution."
+          },
+          "baseUrl": {
+            "type": "string",
+            "description": "Override the API endpoint (local gateways, proxies)."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+    "permission": {
+      "$ref": "#/definitions/permission"
+    },
+    "permission_profile": {
+      "type": "object",
+      "description": "Reusable named permission sets referenced by permission.extends and by agents. The built-ins (readonly, standard, trusted, ci) are always available and may be overridden here.",
+      "additionalProperties": {
+        "$ref": "#/definitions/permission"
+      },
+      "examples": [
+        {
+          "strict-ci": {
+            "extends": [
+              "ci"
+            ],
+            "bash": {
+              "docker*": "deny"
+            }
+          }
+        }
+      ]
+    },
+    "sandbox": {
+      "$ref": "#/definitions/sandbox",
+      "description": "Global command confinement. A permission profile may override it."
+    },
+    "tools": {
+      "type": "object",
+      "description": "Enable or disable tools by exact name or glob, e.g. {\"mymcp_*\": false}.",
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "agent": {
+      "type": "object",
+      "description": "Named agents. Also loadable from .rick/agents/*.md.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "subagent",
+              "all"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "prompt": {
+            "type": "string",
+            "description": "System prompt. Supports {file:path}."
+          },
+          "tools": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "permission": {
+            "$ref": "#/definitions/permission"
+          }
+        }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "description": "Model Context Protocol servers. Their tools register as <server>_<tool>.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "local",
+              "remote"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Local servers: argv to spawn, communicating over stdio."
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "url": {
+            "type": "string",
+            "description": "Remote servers: the HTTP endpoint."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Static auth headers, e.g. {\"Authorization\": \"Bearer {env:TOKEN}\"}."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "description": "Custom slash commands. Also loadable from .rick/commands/*.md.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "template"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string",
+            "description": "Prompt sent to the model. $ARGUMENTS is replaced with the command's arguments."
+          },
+          "agent": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "instructions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Extra instruction file globs always included in the system prompt. RICK.md and AGENTS.md are picked up automatically."
+    },
+    "plugin": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Plugin identifiers to load."
+    },
+    "tui": {
+      "type": "object",
+      "description": "Presentation settings. Prefer a separate tui.json.",
+      "additionalProperties": true
+    },
+    "web_search": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Web search restrictions and budget.",
+      "properties": {
+        "allow_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "If set, only return results from these domains."
+        },
+        "deny_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Domains to exclude from results."
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 5,
+          "description": "Maximum results per query (default 5)."
+        },
+        "max_searches_per_session": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max web searches per session (default 10)."
+        }
+      }
+    }
+  }
+}

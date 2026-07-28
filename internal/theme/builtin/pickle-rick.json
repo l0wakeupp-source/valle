@@ -1,0 +1,72 @@
+{
+  "name": "pickle-rick",
+  "defs": {
+    "accent": "#7CE38B",
+    "accentDim": "#4E9A5C",
+    "text": "#E6E6E6",
+    "textMuted": "#8A8F98",
+    "textDim": "#5C6168",
+    "border": "#2E3338",
+    "planBorder": "#5CB8E0",
+    "error": "#E56B6B",
+    "warning": "#E3C57C",
+    "panel": "#16191C",
+    "overlay": "#1A1E22",
+    "userBg": "#12261A",
+    "diffAddBg": "#1F3D2B",
+    "diffAddFg": "#8FE6A0",
+    "diffDelBg": "#3D1F1F",
+    "diffDelFg": "#E68F8F"
+  },
+  "theme": {
+    "background": "#0D0F11",
+    "backgroundPanel": "panel",
+    "backgroundOverlay": "overlay",
+    "userMessageBg": "userBg",
+
+    "text": "text",
+    "textMuted": "textMuted",
+    "textFaint": "textDim",
+
+    "border": "border",
+    "borderSubtle": "#22262A",
+    "borderActive": "accent",
+    "promptBorder": "accent",
+    "planModeBorder": "planBorder",
+
+    "primary": "accent",
+    "accent": "accent",
+    "secondary": "accentDim",
+    "success": "accent",
+    "warning": "warning",
+    "error": "error",
+    "info": "planBorder",
+
+    "user": "accent",
+    "assistant": "text",
+    "thinking": "textDim",
+    "tool": "textMuted",
+    "toolOk": "accentDim",
+    "toolErr": "error",
+
+    "diffAdded": "diffAddFg",
+    "diffRemoved": "diffDelFg",
+    "diffAddedBg": "diffAddBg",
+    "diffRemovedBg": "diffDelBg",
+    "diffContext": "textMuted",
+    "diffLineNumber": "textDim",
+
+    "markdownHeading": "accent",
+    "markdownLink": "planBorder",
+    "markdownCode": "warning",
+    "markdownBlockQuote": "textMuted",
+    "markdownListItem": "accentDim",
+
+    "syntaxKeyword": "accentDim",
+    "syntaxString": "accent",
+    "syntaxNumber": "warning",
+    "syntaxComment": "textDim",
+    "syntaxFunction": "planBorder",
+    "syntaxType": "text"
+  }
+}

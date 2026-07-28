@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "tui.json",
+  "description": "Presentation settings for the rick TUI.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "theme": {
+      "type": "string",
+      "description": "Theme name. Built in: pickle-rick, rick-black, evil-rick, rick-neon. Custom themes load from ~/.config/rick/themes/ and .rick/themes/.",
+      "default": "rick"
+    },
+    "diff": {
+      "type": "string",
+      "enum": ["auto", "stacked", "split"],
+      "description": "auto = side-by-side when the terminal is wide enough, stacked otherwise.",
+      "default": "auto"
+    },
+    "diff_threshold": {
+      "type": "integer",
+      "description": "Terminal width at which auto mode switches to side-by-side.",
+      "default": 120
+    },
+    "scroll_speed": { "type": "integer", "default": 3, "minimum": 1 },
+    "notifications": { "type": "boolean", "default": false },
+    "show_thinking": {
+      "type": "boolean",
+      "description": "Render the model's reasoning stream.",
+      "default": true
+    },
+    "tool_details": {
+      "type": "boolean",
+      "description": "Show full tool output instead of a one-line summary. Toggle live with /details.",
+      "default": false
+    },
+    "keybinds": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Use <leader> as a prefix to build chords, e.g. \"<leader>m\".",
+      "properties": {
+        "leader": { "type": "string", "default": "ctrl+x" },
+        "app_exit": { "type": "string", "default": "ctrl+c" },
+        "session_new": { "type": "string", "default": "<leader>n" },
+        "session_list": { "type": "string", "default": "<leader>l" },
+        "messages_undo": { "type": "string", "default": "<leader>u" },
+        "messages_redo": { "type": "string", "default": "<leader>r" },
+        "model_list": { "type": "string", "default": "<leader>m" },
+        "theme_list": { "type": "string", "default": "<leader>t" },
+        "agent_cycle": { "type": "string", "default": "tab" },
+        "tool_details": { "type": "string", "default": "<leader>d" },
+        "messages_page_up": { "type": "string", "default": "pgup" },
+        "messages_page_down": { "type": "string", "default": "pgdown" },
+        "help": { "type": "string", "default": "<leader>h" },
+        "input_clear": { "type": "string", "default": "ctrl+u" },
+        "interrupt": { "type": "string", "default": "esc" }
+      }
+    }
+  }
+}
