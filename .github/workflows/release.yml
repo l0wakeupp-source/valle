@@ -70,8 +70,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Add installer scripts
-        run: cp scripts/install.sh scripts/Install-Rick.ps1 dist/
+      - name: Add installer, update, and uninstall scripts
+        run: cp scripts/install.sh scripts/Install-Rick.ps1 scripts/update.sh scripts/Update-Rick.ps1 scripts/uninstall.sh scripts/Uninstall-Rick.ps1 dist/
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

@@ -105,6 +105,8 @@ func main() {
 		doctorCmd(),
 		securityCmd(),
 		applyCmd(),
+		updateCmd(),
+		uninstallCmd(),
 	)
 
 	if err := root.Execute(); err != nil {

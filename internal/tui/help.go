@@ -39,6 +39,8 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"/models", "pick a provider, then a model"},
 		{"/model <id>", "switch directly, e.g. openai/gpt-5"},
 		{"/auth", "connect or edit a provider"},
+		{"/update", "update Rick to the latest GitHub release"},
+		{"/uninstall", "choose FULL or PART removal"},
 	})
 	group("appearance", [][2]string{
 		{"/theme", "switch theme"},

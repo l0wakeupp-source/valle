@@ -1074,7 +1074,7 @@ func (m *Model) AgentName() string { return m.agentName }
 // RunSlash dispatches a slash command and returns the resulting transcript
 // text (test helper).
 func (m *Model) RunSlash(text string) string {
-	m.RunSlash(text)
+	m.runSlash(text)
 	if len(m.msgs) == 0 {
 		return ""
 	}

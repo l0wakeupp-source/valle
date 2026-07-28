@@ -74,6 +74,8 @@ rick --yolo              skip all permission prompts (dangerous)
 rick sessions            list saved sessions
 rick config              show the resolved configuration
 rick models              list available models
+rick update              update to the latest GitHub release
+rick uninstall           choose FULL or PART removal
 rick version
 ```
 
@@ -99,7 +101,11 @@ Leader key is `ctrl+x` (configurable), then:
 
 `/help` `/new` `/sessions` `/models` `/themes` `/agent` `/compact` `/undo`
 `/redo` `/details` `/thinking` `/init` `/tools` `/mcp` `/plugins`
-`/permissions` `/config` `/exit`
+`/permissions` `/config` `/update` `/uninstall` `/exit`
+
+`/update` downloads the latest release updater and applies it safely. `/uninstall`
+asks for a scope: **FULL** removes Rick and its credentials, sessions, config, and
+user data; **PART** removes only the executable and keeps that data.
 
 Custom commands live in `.rick/commands/<name>.md` or the `command` block in
 `rick.json`; `$ARGUMENTS` is substituted with whatever follows the command.

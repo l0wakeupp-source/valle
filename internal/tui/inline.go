@@ -66,11 +66,11 @@ const (
 	pendingThemeURL    // waiting for URL input
 
 	// session management
-	pendingSessionMenu    // session management menu
-	pendingSessionSearch  // waiting for search query
-	pendingSessionRename  // waiting for new title
-	pendingSessionDelete  // waiting for delete confirmation
-	pendingSessionPage    // paginated session browse
+	pendingSessionMenu      // session management menu
+	pendingSessionSearch    // waiting for search query
+	pendingSessionRename    // waiting for new title
+	pendingSessionDelete    // waiting for delete confirmation
+	pendingSessionPage      // paginated session browse
 	pendingSessionFavToggle // toggle favorite on a session
 
 	// skill management
@@ -94,26 +94,29 @@ const (
 	pendingPluginURL    // waiting for URL input
 
 	// open skill / plugin source in explorer, or plugin URL
-	pendingSkillOpen   // skill chosen — open source
-	pendingPluginOpen  // plugin chosen — open source or URL
+	pendingSkillOpen  // skill chosen — open source
+	pendingPluginOpen // plugin chosen — open source or URL
 
 	// MCP management
-	pendingMCPMenu      // MCP management menu
-	pendingMCPAddName   // adding a custom MCP server: name
-	pendingMCPAddType   // adding: local vs remote
-	pendingMCPAddCmd    // adding local: command
-	pendingMCPAddURL    // adding remote: URL
-	pendingMCPToggle    // toggle an MCP server on/off
-	pendingMCPRemove    // remove an MCP server
+	pendingMCPMenu    // MCP management menu
+	pendingMCPAddName // adding a custom MCP server: name
+	pendingMCPAddType // adding: local vs remote
+	pendingMCPAddCmd  // adding local: command
+	pendingMCPAddURL  // adding remote: URL
+	pendingMCPToggle  // toggle an MCP server on/off
+	pendingMCPRemove  // remove an MCP server
 
 	// permissions
-	pendingPermission   // permission mode/profile choice
+	pendingPermission // permission mode/profile choice
 
 	// multi-key management
-	pendingKeyManage    // key management menu
-	pendingKeyAdd       // adding new keys
-	pendingKeyRemove    // removing a key
-	pendingKeyMode      // setting rotation mode
+	pendingKeyManage // key management menu
+	pendingKeyAdd    // adding new keys
+	pendingKeyRemove // removing a key
+	pendingKeyMode   // setting rotation mode
+
+	// maintenance
+	pendingMaintenance
 )
 
 // pendingChoice is an armed numbered selection.
@@ -122,7 +125,7 @@ type pendingChoice struct {
 	options   []choiceOption
 	context   string // e.g. the provider id while choosing a model
 	edit      *editModal
-	textInput bool   // true when waiting for free text, not a number
+	textInput bool // true when waiting for free text, not a number
 }
 
 type choiceOption struct {
@@ -379,6 +382,8 @@ func (m *Model) applyChoice(o choiceOption) (tea.Model, tea.Cmd) {
 		return m.applyKeyManage(o.value)
 	case pendingKeyMode:
 		return m.applyKeyMode(o.value)
+	case pendingMaintenance:
+		return m, runUninstall(o.value)
 	}
 	return m, nil
 }
@@ -456,9 +461,9 @@ func (m *Model) applyTextInput(kind pendingKind, ctx, text string) (tea.Model, t
 			return m, nil
 		}
 		g.Steps = append(g.Steps, goal.Step{
-			ID:     fmt.Sprintf("s%d", len(g.Steps)+1),
+			ID:      fmt.Sprintf("s%d", len(g.Steps)+1),
 			Content: text,
-			Status: "pending",
+			Status:  "pending",
 		})
 		if err := m.deps.Goals.Save(g); err != nil {
 			m.appendMsg(ChatMsg{Kind: MsgError, Text: "goal: " + err.Error(), Time: nowFn()})

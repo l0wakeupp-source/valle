@@ -439,7 +439,7 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 
 	// Slash command.
 	if len(text) > 0 && text[0] == '/' {
-		m.RunSlash(text)
+		m.runSlash(text)
 		return m, nil
 	}
 
