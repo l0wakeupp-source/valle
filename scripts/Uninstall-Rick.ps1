@@ -19,8 +19,12 @@ if ($Mode -eq "full") {
 if (Test-Path $target) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("rick-uninstall-{0}.ps1" -f ([guid]::NewGuid()))
     @"
-Start-Sleep -Milliseconds 800
-Remove-Item -Force '$target' -ErrorAction SilentlyContinue
+`$deadline = (Get-Date).AddSeconds(30)
+do {
+    Remove-Item -LiteralPath '$target' -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath '$target')) { break }
+    Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt `$deadline)
 Remove-Item -Force '$tmp' -ErrorAction SilentlyContinue
 "@ | Set-Content -Encoding UTF8 $tmp
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"

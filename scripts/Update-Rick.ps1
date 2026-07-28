@@ -24,7 +24,20 @@ try {
     }
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     if (-not (Test-Path $powershell)) { throw "Windows PowerShell was not found at $powershell" }
-    $replace = "Start-Sleep -Milliseconds 800; Move-Item -Force '$tmp' '$target'; & '$target' version"
+    $replace = @"
+`$deadline = (Get-Date).AddSeconds(30)
+do {
+    try {
+        Move-Item -LiteralPath '$tmp' -Destination '$target' -Force -ErrorAction Stop
+        break
+    }
+    catch {
+        Start-Sleep -Milliseconds 500
+    }
+} while ((Get-Date) -lt `$deadline)
+if (-not (Test-Path -LiteralPath '$target')) { throw "Rick update could not replace $target" }
+Start-Process -FilePath '$target'
+"@
     Start-Process $powershell -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $replace) | Out-Null
     Write-Host "Rick update downloaded. It will finish as this process exits."
 }

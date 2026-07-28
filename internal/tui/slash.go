@@ -80,7 +80,9 @@ func runUpdate() tea.Cmd {
 		if err := maintenance.Update(&stdout, &stderr); err != nil {
 			return statusMsg{text: "update failed: " + err.Error()}
 		}
-		return statusMsg{text: strings.TrimSpace(stdout.String())}
+		output := strings.TrimSpace(stdout.String())
+		alreadyCurrent := strings.Contains(strings.ToLower(output), "already up to date")
+		return statusMsg{text: output, quit: !alreadyCurrent}
 	}
 }
 
@@ -90,6 +92,6 @@ func runUninstall(mode string) tea.Cmd {
 		if err := maintenance.UninstallMode(mode, &stdout, &stderr); err != nil {
 			return statusMsg{text: "uninstall failed: " + err.Error()}
 		}
-		return statusMsg{text: strings.TrimSpace(stdout.String())}
+		return statusMsg{text: strings.TrimSpace(stdout.String()), quit: true}
 	}
 }

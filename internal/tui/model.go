@@ -238,7 +238,10 @@ func (m *Model) SetProgram(p *tea.Program) { m.program = p }
 type spinnerTickMsg time.Time
 type themePollMsg time.Time
 type readAgentMsg struct{}
-type statusMsg struct{ text string }
+type statusMsg struct {
+	text string
+	quit bool
+}
 type errMsg struct{ err error }
 type permAskMsg struct {
 	req   permission.Request
@@ -565,6 +568,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		m.setStatus(msg.text)
+		if msg.quit {
+			return m, tea.Quit
+		}
 		return m, nil
 
 	case errMsg:

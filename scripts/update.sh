@@ -28,4 +28,4 @@ fi
 
 mv "$TMP_FILE" "$TARGET"
 printf 'Rick updated: %s\n' "$TARGET"
-"$TARGET" version
+"$TARGET" >/dev/null 2>&1 &
