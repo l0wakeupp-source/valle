@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,9 +100,13 @@ func runScript(unixName, windowsName string, args []string, stdout, stderr io.Wr
 	commandArgs = append(commandArgs, args...)
 	cmd := exec.Command(command, commandArgs...)
 	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	var scriptStderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(stderr, &scriptStderr)
 	cmd.Env = append(os.Environ(), "RICK_TARGET="+currentExecutable())
 	if err := cmd.Run(); err != nil {
+		if message := strings.TrimSpace(scriptStderr.String()); message != "" {
+			return fmt.Errorf("run %s: %w: %s", name, err, message)
+		}
 		return fmt.Errorf("run %s: %w", name, err)
 	}
 	return nil

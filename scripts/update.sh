@@ -3,7 +3,8 @@ set -euo pipefail
 
 REPO="${RICK_REPO:-rick-cli/rick}"
 INSTALL_DIR="${RICK_INSTALL_DIR:-$HOME/.local/bin}"
-TARGET="$INSTALL_DIR/rick"
+TARGET="${RICK_TARGET:-$INSTALL_DIR/rick}"
+INSTALL_DIR="$(dirname "$TARGET")"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download"
 
 case "$(uname -s):$(uname -m)" in

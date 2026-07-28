@@ -322,7 +322,11 @@ func (m *Model) rebuildHistory() {
 func (m *Model) interrupt() {
 	if m.agentCancel != nil {
 		m.agentCancel()
+		m.agentCancel = nil
 	}
+	// Stop already-scheduled drain commands from consuming a future run's
+	// channel. The runner observes the cancelled context and exits on its own.
+	m.agentCh = nil
 	if m.permReply != nil {
 		m.answerPermission(agent.DecideReject)
 	}

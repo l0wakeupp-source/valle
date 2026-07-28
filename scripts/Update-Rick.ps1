@@ -6,7 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $asset = "rick-windows-amd64.exe"
-$target = Join-Path $InstallDirectory "rick.exe"
+$target = if ($env:RICK_TARGET) { $env:RICK_TARGET } else { Join-Path $InstallDirectory "rick.exe" }
+$InstallDirectory = Split-Path -Parent $target
 $download = "https://github.com/$Repository/releases/latest/download/$asset"
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("rick-update-{0}.exe" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
@@ -21,9 +22,10 @@ try {
             exit 0
         }
     }
-    $self = $PID
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path $powershell)) { throw "Windows PowerShell was not found at $powershell" }
     $replace = "Start-Sleep -Milliseconds 800; Move-Item -Force '$tmp' '$target'; & '$target' version"
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $replace) | Out-Null
+    Start-Process $powershell -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $replace) | Out-Null
     Write-Host "Rick update downloaded. It will finish as this process exits."
 }
 catch {

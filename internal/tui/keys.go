@@ -415,9 +415,13 @@ func (m *Model) historyDown() {
 // ---------- submit ----------
 
 func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
-	// Control commands must work while the agent is running — /new and
-	// /stop are exactly what a user reaches for when a run goes wrong.
-	// Blocking every slash command made them silently do nothing.
+	// Slash commands remain available while an agent is running so control
+	// commands such as /new and /stop can cancel or reset the active run.
+	if len(text) > 0 && text[0] == '/' {
+		return m.runSlash(text)
+	}
+
+	// Ordinary prompts stay blocked while the agent is running.
 	if m.running {
 		m.setStatus("still working — esc to interrupt")
 		return m, nil
@@ -435,12 +439,6 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.runShell(cmdline)
-	}
-
-	// Slash command.
-	if len(text) > 0 && text[0] == '/' {
-		m.runSlash(text)
-		return m, nil
 	}
 
 	// A leading @subagent mention becomes a task delegation.

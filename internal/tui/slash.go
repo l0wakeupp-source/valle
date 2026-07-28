@@ -34,6 +34,19 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 			return m.cmdSessionsArgs(args)
 		}
 		return m.cmdSessions()
+	case "model":
+		if args == "" {
+			return m.cmdModels()
+		}
+		if m.running {
+			m.interrupt()
+		}
+		m.setModel(args)
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "model: " + args, Time: nowFn()})
+		m.setStatus("model: " + shortModel(args))
+		return m, nil
+	case "thinking":
+		return m.cmdReasoning(args)
 	case "models":
 		return m.cmdModels()
 	case "auth":

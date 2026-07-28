@@ -161,6 +161,10 @@ func borderColor(view string) string {
 }
 
 func build(tmp, themeName string, w, h int) *tui.Model {
+	return buildWithCredentials(tmp, themeName, w, h, nil)
+}
+
+func buildWithCredentials(tmp, themeName string, w, h int, creds *config.Credentials) *tui.Model {
 	cwd := filepath.Join(tmp, "proj")
 	_ = os.MkdirAll(cwd, 0o755)
 	loaded, _ := config.Load(cwd)
@@ -176,8 +180,9 @@ func build(tmp, themeName string, w, h int) *tui.Model {
 		Registry: tools.NewRegistry(), Todos: tools.NewTodoStore(),
 		Perms: permission.New(loaded.Config.Permission, cwd),
 		Store: store, Snapshots: snaps,
-		Providers: stubProviders(),
-		Cwd:       cwd, Version: "v1.2.0",
+		Providers:   stubProviders(),
+		Credentials: creds,
+		Cwd:         cwd, Version: "v1.2.0",
 	}), tea.WindowSizeMsg{Width: w, Height: h})
 }
 
@@ -619,6 +624,25 @@ func testReportedIssues(tmp string) {
 	check("  the choice is cleared", chosen.PendingKind() == 0, fmt.Sprint(chosen.PendingKind()))
 	check("  it is confirmed in the chat",
 		strings.Contains(chosen.ChatContent(), "model:"), "no confirmation")
+
+	// Direct model selection must return the slash command's model and command
+	// values instead of dropping them in submit().
+	direct := run(build(tmp, "pickle-rick", 88, 30), "/model rick")
+	check("DIRECT /MODEL SWITCHES THE ACTIVE MODEL", direct.ModelID() == "rick", direct.ModelID())
+	check("  direct model selection is confirmed", strings.Contains(direct.ChatContent(), "model: rick"))
+
+	// Key management must remain inside /auth after entering its submenu.
+	creds := &config.Credentials{Providers: map[string]config.Credential{
+		"anthropic": {APIKey: "test-key", APIKeys: []string{"test-key", "test-key-2"}, Models: []string{"model-a"}},
+	}}
+	keys := run(buildWithCredentials(tmp, "pickle-rick", 88, 30, creds), "/auth")
+	keys = typeStr(keys, "1")
+	keys = key(keys, "enter")
+	keys = key(keys, "1")
+	check("/AUTH MANAGE KEYS STAYS OPEN", keys.AuthActive(), "auth closed")
+	check("  key submenu is rendered", strings.Contains(plain(keys.View()), "Keys for anthropic"))
+	keys = key(keys, "esc")
+	check("  esc returns to provider editing", keys.AuthActive(), "auth closed after back")
 
 	// A non-numeric reply must fall through as a normal prompt, never trap.
 	esc := run(build(tmp, "pickle-rick", 88, 30), "/models")
