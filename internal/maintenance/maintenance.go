@@ -82,7 +82,7 @@ func runScript(unixName, windowsName string, args []string, stdout, stderr io.Wr
 	}
 
 	tempDir := os.TempDir()
-	tempFile, err := os.CreateTemp(tempDir, "rick-maintenance-*")
+	tempFile, err := os.CreateTemp(tempDir, "rick-maintenance-*.ps1")
 	if err != nil {
 		return fmt.Errorf("create temporary maintenance script: %w", err)
 	}
