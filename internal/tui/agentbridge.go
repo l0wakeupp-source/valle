@@ -40,7 +40,19 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	m.turnStart = time.Now()
 	m.streamBuf.Reset()
 	m.thinkBuf.Reset()
-
+	if m.deps.AgentRegistry != nil {
+		id, registerErr := m.deps.AgentRegistry.Register(agent.AgentEntry{
+			Name: m.agentName, Depth: 0, Status: agent.AgentIdle,
+			Description: prompt, Cancel: cancel,
+		})
+		if registerErr != nil {
+			cancel()
+			m.running = false
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "agent registry: " + registerErr.Error(), Time: time.Now()})
+			return nil
+		}
+		m.agentID = id
+	}
 	cfg := m.deps.Loaded.Config
 	cfg.Instructions = append([]string(nil), cfg.Instructions...)
 	agentName := m.agentName
@@ -88,6 +100,8 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			Cwd:         cwd,
 			SessionID:   sessionID,
 			AgentName:   agentName,
+			AgentID:     m.agentID,
+			Registry:    m.deps.AgentRegistry,
 			Snapshotter: snapshotter,
 			Plugins:     plugins,
 			Parallel:    true,
@@ -207,6 +221,12 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 	case agent.EvTurnEnd:
 		m.flushStream()
 
+	case agent.EvAgentBackground, agent.EvAgentReattached, agent.EvAgentMessage:
+		if strings.TrimSpace(ev.Text) != "" {
+			m.msgs = append(m.msgs, ChatMsg{Kind: MsgSystem, Text: ev.Text, Time: time.Now()})
+			m.tx.noteAppend()
+		}
+
 	case agent.EvError:
 		m.flushStream()
 		if ev.Err != nil {
@@ -270,10 +290,14 @@ func (m *Model) finishRun(err error) tea.Cmd {
 	return nil
 }
 
-// rebuildHistory reconstructs provider messages from the rendered transcript.
-// The transcript is the source of truth the user sees, so replaying from it
-// keeps the model's view and the user's view identical.
+// rebuildHistory reconstructs bounded provider messages from the rendered
+// transcript. Large tool results remain available to local session export and
+// in-memory replay, but are not replayed in full on every provider turn.
 func (m *Model) rebuildHistory() {
+	m.history = capHistory(m.buildHistory(historyToolOutputChars))
+}
+
+func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
 	var out []provider.Message
 	var pendingAssistant *provider.Message
 	var pendingResults []provider.ContentBlock
@@ -321,12 +345,12 @@ func (m *Model) rebuildHistory() {
 				Type: "tool_use", ID: msg.CallID, Name: msg.ToolName, Input: input,
 			})
 			pendingResults = append(pendingResults,
-				provider.ToolResultBlock(msg.CallID, m.fullToolOutput(msg), msg.ToolErr))
+				provider.ToolResultBlock(msg.CallID, compactToolOutput(m.fullToolOutput(msg), toolOutputLimit), msg.ToolErr))
 		}
 	}
 	flushAssistant()
 	flushResults()
-	m.history = capHistory(out)
+	return out
 }
 
 const maxHistoryMessages = 500

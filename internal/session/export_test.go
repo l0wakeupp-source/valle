@@ -143,8 +143,16 @@ func TestExportRoundTrip(t *testing.T) {
 	if err := Export(orig, &buf); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "\n  \"id\": \"cx-1\"") {
-		t.Fatalf("not indented:\n%s", buf.String())
+	if strings.Contains(buf.String(), "\n  \"id\": \"cx-1\"") {
+		t.Fatalf("default export should be compact:\n%s", buf.String())
+	}
+
+	var pretty bytes.Buffer
+	if err := ExportPretty(orig, &pretty); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pretty.String(), "\n  \"id\": \"cx-1\"") {
+		t.Fatalf("pretty export was not indented:\n%s", pretty.String())
 	}
 
 	back, err := Import(&buf, SourceAuto)

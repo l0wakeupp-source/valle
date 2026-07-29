@@ -17,8 +17,8 @@ import (
 type BashTool struct {
 	Timeout   time.Duration
 	MaxOutput int
-	ShellPath string           // override for tests
-	Sandbox   *sandbox.Holder  // nil means unconfined (tests, legacy callers)
+	ShellPath string          // override for tests
+	Sandbox   *sandbox.Holder // nil means unconfined (tests, legacy callers)
 }
 
 // Name implements Tool.

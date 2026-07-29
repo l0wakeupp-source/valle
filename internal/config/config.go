@@ -4,6 +4,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +18,16 @@ const (
 	PermAsk   = "ask"
 	PermDeny  = "deny"
 )
+
+const MaxSubagentDepth = 10
+
+// ValidateSubagentDepth validates the configured maximum nesting depth.
+func ValidateSubagentDepth(depth int) error {
+	if depth < 1 || depth > MaxSubagentDepth {
+		return fmt.Errorf("subagent_depth must be 1..%d", MaxSubagentDepth)
+	}
+	return nil
+}
 
 // Provider is one configured LLM backend.
 type Provider struct {
@@ -114,37 +125,39 @@ type Command struct {
 
 // WebSearchConfig restricts web search results by domain.
 type WebSearchConfig struct {
-	AllowDomains []string `json:"allow_domains,omitempty"` // if set, only these domains
-	DenyDomains  []string `json:"deny_domains,omitempty"`  // always blocked
-	MaxResults   int      `json:"max_results,omitempty"`   // default 5
-	MaxSearchesPerSession int `json:"max_searches_per_session,omitempty"` // budget, default 10
+	AllowDomains          []string `json:"allow_domains,omitempty"`            // if set, only these domains
+	DenyDomains           []string `json:"deny_domains,omitempty"`             // always blocked
+	MaxResults            int      `json:"max_results,omitempty"`              // default 5
+	MaxSearchesPerSession int      `json:"max_searches_per_session,omitempty"` // budget, default 10
 }
 
 // Config is rick.json.
 type Config struct {
-	Schema         string               `json:"$schema,omitempty"`
-	Model          string               `json:"model,omitempty"`
-	SmallModel     string               `json:"small_model,omitempty"`
-	MaxTokens      int                  `json:"max_tokens,omitempty"`
-	Providers      map[string]Provider  `json:"provider,omitempty"`
-	Permission     *Permission          `json:"permission,omitempty"`
+	Schema     string              `json:"$schema,omitempty"`
+	Model      string              `json:"model,omitempty"`
+	SmallModel string              `json:"small_model,omitempty"`
+	MaxTokens  int                 `json:"max_tokens,omitempty"`
+	Providers  map[string]Provider `json:"provider,omitempty"`
+	Permission *Permission         `json:"permission,omitempty"`
 	// Profiles are reusable named permission sets referenced by
 	// Permission.Extends and by agents. The built-ins (readonly, standard,
 	// trusted, ci) are always present and may be overridden here.
 	Profiles map[string]Permission `json:"permission_profile,omitempty"`
 	// Sandbox is the global command-confinement policy. A permission block
 	// or agent may override it.
-	Sandbox *SandboxConfig `json:"sandbox,omitempty"`
-	Tools          map[string]bool      `json:"tools,omitempty"`
-	Agents         map[string]Agent     `json:"agent,omitempty"`
-	MCP            map[string]MCPServer `json:"mcp,omitempty"`
-	Commands       map[string]Command   `json:"command,omitempty"`
-	Instructions   []string             `json:"instructions,omitempty"`
-	AutoCompact    *bool                `json:"autocompact,omitempty"`
-	ContextReserve int                  `json:"context_reserve,omitempty"`
-	SubagentDepth  *int                 `json:"subagent_depth,omitempty"`
-	Plugins        []string             `json:"plugin,omitempty"`
-	WebSearch      *WebSearchConfig     `json:"web_search,omitempty"`
+	Sandbox          *SandboxConfig       `json:"sandbox,omitempty"`
+	Tools            map[string]bool      `json:"tools,omitempty"`
+	Agents           map[string]Agent     `json:"agent,omitempty"`
+	MCP              map[string]MCPServer `json:"mcp,omitempty"`
+	Commands         map[string]Command   `json:"command,omitempty"`
+	Instructions     []string             `json:"instructions,omitempty"`
+	AutoCompact      *bool                `json:"autocompact,omitempty"`
+	ContextReserve   int                  `json:"context_reserve,omitempty"`
+	SubagentDepth    *int                 `json:"subagent_depth,omitempty"`
+	BackgroundNotify bool                 `json:"background_notify,omitempty"`
+	MaxBackground    int                  `json:"max_background,omitempty"`
+	Plugins          []string             `json:"plugin,omitempty"`
+	WebSearch        *WebSearchConfig     `json:"web_search,omitempty"`
 }
 
 // Keybinds is the tui.json keybind block.
@@ -225,9 +238,11 @@ func Defaults() (Config, TUI) {
 				"sudo*":       PermDeny,
 			},
 		},
-		AutoCompact:    &yes,
-		ContextReserve: 24000,
-		SubagentDepth:  &depth,
+		AutoCompact:      &yes,
+		ContextReserve:   24000,
+		SubagentDepth:    &depth,
+		BackgroundNotify: true,
+		MaxBackground:    8,
 	}
 	t := TUI{
 		Theme:         "pickle-rick",

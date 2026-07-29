@@ -12,9 +12,10 @@ import (
 
 // ParallelTaskTool allows spawning multiple subagents concurrently.
 type ParallelTaskTool struct {
-	Spawn    func(ctx context.Context, kind, description, prompt string, depth int) (string, error)
-	Specs    map[string]SubagentSpec
-	MaxDepth int
+	Spawn           func(ctx context.Context, kind, description, prompt string, depth int) (string, error)
+	SpawnBackground func(ctx context.Context, parentID, kind, description, prompt string, depth int) (string, error)
+	Specs           map[string]SubagentSpec
+	MaxDepth        int
 }
 
 func (ParallelTaskTool) Name() string   { return "parallel_tasks" }
@@ -44,6 +45,7 @@ func (ParallelTaskTool) Schema() map[string]any {
 				"description": "Array of tasks to run concurrently",
 			},
 			"max_concurrent": map[string]any{"type": "number", "description": "Max concurrent agents (default 4)"},
+			"background":     map[string]any{"type": "boolean", "description": "Start all agents in the background and return IDs immediately (default false)"},
 		},
 		"required": []string{"tasks"},
 	}
@@ -55,7 +57,8 @@ type parallelArgs struct {
 		Description  string `json:"description"`
 		Prompt       string `json:"prompt"`
 	} `json:"tasks"`
-	MaxConcurrent int `json:"max_concurrent"`
+	MaxConcurrent int  `json:"max_concurrent"`
+	Background    bool `json:"background"`
 }
 
 func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
@@ -91,7 +94,17 @@ func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.Raw
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			out, err := t.Spawn(ctx, tk.SubagentType, tk.Description, tk.Prompt, tc.Depth+1)
+			var out string
+			var err error
+			if a.Background {
+				if t.SpawnBackground == nil {
+					err = fmt.Errorf("background subagents are not available in this context")
+				} else {
+					out, err = t.SpawnBackground(ctx, tc.AgentID, tk.SubagentType, tk.Description, tk.Prompt, tc.Depth+1)
+				}
+			} else {
+				out, err = t.Spawn(ctx, tk.SubagentType, tk.Description, tk.Prompt, tc.Depth+1)
+			}
 			results[idx] = result{desc: tk.Description, out: out, err: err}
 		}(i, task)
 	}

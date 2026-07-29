@@ -63,6 +63,16 @@ func Load(cwd string) (*Loaded, error) {
 
 	// Environment API keys fill in providers that lack one.
 	applyEnvKeys(&cfg)
+	if cfg.SubagentDepth == nil {
+		depth := 1
+		cfg.SubagentDepth = &depth
+	}
+	if err := ValidateSubagentDepth(*cfg.SubagentDepth); err != nil {
+		return nil, err
+	}
+	if cfg.MaxBackground <= 0 {
+		cfg.MaxBackground = 8
+	}
 
 	l.Config = cfg
 	l.TUI = tui
@@ -138,6 +148,12 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 	}
 	if has(p, "subagent_depth") {
 		dst.SubagentDepth = src.SubagentDepth
+	}
+	if has(p, "background_notify") {
+		dst.BackgroundNotify = src.BackgroundNotify
+	}
+	if has(p, "max_background") {
+		dst.MaxBackground = src.MaxBackground
 	}
 	if has(p, "instructions") {
 		dst.Instructions = append(dst.Instructions, src.Instructions...)

@@ -147,28 +147,35 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 		return nil, err
 	}
 	var out []Meta
+	var legacyEntries []os.DirEntry
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".meta.json") {
+		if e.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
-		if err != nil {
+		if strings.HasSuffix(e.Name(), ".meta.json") {
+			data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			var meta Meta
+			if json.Unmarshal(data, &meta) != nil {
+				continue
+			}
+			if cwd != "" && meta.Cwd != cwd {
+				continue
+			}
+			out = append(out, meta)
 			continue
 		}
-		var meta Meta
-		if json.Unmarshal(data, &meta) != nil {
-			continue
+		if strings.HasSuffix(e.Name(), ".json") && e.Name() != "current.json" {
+			legacyEntries = append(legacyEntries, e)
 		}
-		if cwd != "" && meta.Cwd != cwd {
-			continue
-		}
-		out = append(out, meta)
 	}
-	legacy := s.listLegacy(cwd)
 	known := make(map[string]struct{}, len(out))
 	for _, meta := range out {
 		known[meta.ID] = struct{}{}
 	}
+	legacy := s.listLegacy(cwd, known, legacyEntries)
 	for _, meta := range legacy {
 		if _, ok := known[meta.ID]; !ok {
 			out = append(out, meta)
@@ -178,14 +185,14 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 	return out, nil
 }
 
-func (s *Store) listLegacy(cwd string) []Meta {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil
-	}
+func (s *Store) listLegacy(cwd string, known map[string]struct{}, entries []os.DirEntry) []Meta {
 	var out []Meta
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".meta.json") || e.Name() == "current.json" {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if _, ok := known[id]; ok {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))

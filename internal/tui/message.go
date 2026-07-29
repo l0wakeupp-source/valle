@@ -54,6 +54,11 @@ type ChatMsg struct {
 	SwarmID string
 }
 
+const (
+	toolOutputPreviewChars = 200
+	historyToolOutputChars = 4000
+)
+
 // Render turns a chat entry into styled lines.
 func (m *Model) renderMsg(msg ChatMsg, width int) string {
 	s := m.styles
@@ -143,6 +148,25 @@ func (m *Model) fullToolOutput(msg ChatMsg) string {
 		}
 	}
 	return msg.ToolOutput
+}
+
+func compactToolOutput(output string, limit int) string {
+	if limit <= 0 {
+		return output
+	}
+	runes := []rune(output)
+	if len(runes) <= limit {
+		return output
+	}
+	marker := fmt.Sprintf("\n… [tool output truncated; original %d chars] …\n", len(runes))
+	markerRunes := []rune(marker)
+	available := limit - len(markerRunes)
+	if available <= 1 {
+		return string(runes[:limit])
+	}
+	head := available * 3 / 4
+	tail := available - head
+	return string(runes[:head]) + marker + string(runes[len(runes)-tail:])
 }
 
 func (m *Model) renderTool(msg ChatMsg, width int) string {
@@ -281,7 +305,7 @@ func toolMsgFromEvent(ev *agent.ToolEvent, running bool) ChatMsg {
 		ToolName:    ev.Name,
 		ToolTitle:   ev.Title,
 		ToolInput:   ev.Input,
-		ToolOutput:  truncate(ev.Output, 200),
+		ToolOutput:  truncate(ev.Output, toolOutputPreviewChars),
 		ToolErr:     ev.IsError,
 		ToolRunning: running,
 		ToolElapsed: ev.Elapsed,

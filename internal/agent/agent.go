@@ -24,15 +24,18 @@ type EventKind int
 
 // Agent event kinds.
 const (
-	EvText          EventKind = iota // assistant text delta
-	EvThinking                       // reasoning delta
-	EvToolStart                      // tool execution began
-	EvToolEnd                        // tool execution finished
-	EvPermissionAsk                  // waiting on the user
-	EvTurnEnd                        // one model turn completed
-	EvUsage                          // token accounting
-	EvDone                           // whole run finished
-	EvError                          // fatal error
+	EvText            EventKind = iota // assistant text delta
+	EvThinking                         // reasoning delta
+	EvToolStart                        // tool execution began
+	EvToolEnd                          // tool execution finished
+	EvPermissionAsk                    // waiting on the user
+	EvTurnEnd                          // one model turn completed
+	EvUsage                            // token accounting
+	EvDone                             // whole run finished
+	EvError                            // fatal error
+	EvAgentBackground                  // background agent started
+	EvAgentReattached                  // result surfaced to a parent
+	EvAgentMessage                     // live chat or steering message injected
 )
 
 // ToolEvent describes a tool execution.
@@ -97,6 +100,8 @@ type Config struct {
 	Plugins     *plugin.Registry
 	Goals       *goal.Store
 	Creds       *config.Credentials // for key rotation on rate-limit
+	Registry    *Registry           // optional live hierarchy registry
+	AgentID     string              // registry ID for this run
 }
 
 // Runner executes the loop.
@@ -120,10 +125,40 @@ func (r *Runner) Cfg() Config { return r.cfg }
 // history is the conversation so far; it is NOT mutated. The appended messages
 // produced during the run are returned so the caller can persist them.
 // The runner owns out and closes it exactly once.
-func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<- Event) ([]provider.Message, error) {
+func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<- Event) (appended []provider.Message, runErr error) {
 	defer close(out)
+	if r.cfg.Registry != nil && r.cfg.AgentID != "" {
+		r.cfg.Registry.Update(r.cfg.AgentID, AgentRunning, "", nil)
+		defer func() {
+			status := AgentDone
+			if runErr != nil {
+				status = AgentFailed
+				if ctx.Err() != nil {
+					status = AgentKilled
+				}
+			}
+			output := ""
+			if runErr == nil {
+				for i := len(appended) - 1; i >= 0; i-- {
+					for _, block := range appended[i].Content {
+						if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+							output = block.Text
+							break
+						}
+					}
+					if output != "" {
+						break
+					}
+				}
+			}
+			r.cfg.Registry.Update(r.cfg.AgentID, status, output, runErr)
+		}()
+	}
 
 	emit := func(ev Event) bool {
+		if r.cfg.Registry != nil && r.cfg.AgentID != "" {
+			r.cfg.Registry.Publish(r.cfg.AgentID, ev)
+		}
 		select {
 		case out <- ev:
 			return true
@@ -133,7 +168,6 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 	}
 
 	msgs := append([]provider.Message(nil), history...)
-	var appended []provider.Message
 	var lastErr error
 
 	schemas := r.cfg.Tools.Schemas(r.cfg.ToolFilter)
@@ -142,6 +176,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		if ctx.Err() != nil {
 			return appended, ctx.Err()
 		}
+		r.injectControlMessages(&msgs, &appended, emit)
 
 		// Lifecycle hook: turn start.
 		if r.cfg.Plugins != nil && r.cfg.Plugins.Len() > 0 {
@@ -213,9 +248,9 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			case provider.EventError:
 				streamErr = ev.Err
 			}
-			}
+		}
 
-			if streamErr != nil {
+		if streamErr != nil {
 			// Check for rate-limit / quota errors and rotate keys if configured.
 			if r.cfg.Provider != nil && r.cfg.Creds != nil && isRateLimitError(streamErr) {
 				provID, _ := config.SplitModel(r.cfg.Model)
@@ -227,7 +262,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			}
 			emit(Event{Kind: EvError, Err: streamErr})
 			return appended, streamErr
-			}
+		}
 		assistant := provider.Message{Role: provider.RoleAssistant}
 		if thinkBuf.Len() > 0 {
 			assistant.Content = append(assistant.Content, provider.ContentBlock{
@@ -275,6 +310,36 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 	lastErr = fmt.Errorf("agent: stopped after %d turns without a final answer", r.cfg.MaxTurns)
 	emit(Event{Kind: EvError, Err: lastErr})
 	return appended, lastErr
+}
+
+func (r *Runner) injectControlMessages(msgs *[]provider.Message, appended *[]provider.Message, emit func(Event) bool) {
+	if r.cfg.Registry == nil || r.cfg.AgentID == "" {
+		return
+	}
+	input, ok := r.cfg.Registry.Input(r.cfg.AgentID)
+	if !ok {
+		return
+	}
+	for {
+		select {
+		case msg := <-input:
+			if strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			prefix := "Message"
+			if msg.Steering {
+				prefix = "Steering instruction"
+			}
+			text := fmt.Sprintf("[%s from %s]\n%s", prefix, msg.From, msg.Content)
+			block := provider.TextBlock(text)
+			message := provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{block}}
+			*msgs = append(*msgs, message)
+			*appended = append(*appended, message)
+			emit(Event{Kind: EvAgentMessage, Text: text})
+		default:
+			return
+		}
+	}
 }
 
 func drain(ch <-chan provider.Event) {
@@ -478,6 +543,7 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		Cwd:       r.cfg.Cwd,
 		SessionID: r.cfg.SessionID,
 		Agent:     r.cfg.AgentName,
+		AgentID:   r.cfg.AgentID,
 		CallID:    call.ID,
 		Depth:     r.cfg.Depth,
 	}

@@ -38,13 +38,24 @@ var parsers = map[SessionSource]Parser{
 var autoOrder = []SessionSource{SourceOpencode, SourceKilo, SourceCodex}
 
 // Export writes the full session — messages, snapshots and metadata — to w as
-// indented JSON.
+// compact JSON. Use ExportPretty when a human-readable file is wanted.
 func Export(sess *Session, w io.Writer) error {
+	return export(sess, w, false)
+}
+
+// ExportPretty writes a human-readable indented session JSON document.
+func ExportPretty(sess *Session, w io.Writer) error {
+	return export(sess, w, true)
+}
+
+func export(sess *Session, w io.Writer, pretty bool) error {
 	if sess == nil {
 		return errors.New("session: export nil session")
 	}
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
 	return enc.Encode(sess)
 }
 
@@ -68,14 +79,18 @@ func Import(r io.Reader, source SessionSource) (*Session, error) {
 		return parse(data)
 	}
 
+	kind := detectKind(data)
 	// A payload we exported ourselves round-trips verbatim; the foreign
-	// parsers would flatten its tool blocks and drop snapshots/usage.
-	if sess, err := parseNative(data); err == nil {
-		return sess, nil
+	// parsers would flatten its tool blocks and drop snapshots/usage. Avoid
+	// attempting this full decode for payloads already identified as foreign.
+	if kind == SourceAuto {
+		if sess, err := parseNative(data); err == nil {
+			return sess, nil
+		}
 	}
 
 	order := autoOrder
-	if kind := detectKind(data); kind != SourceAuto {
+	if kind != SourceAuto {
 		order = append([]SessionSource{kind}, autoOrder...)
 	}
 
@@ -122,6 +137,13 @@ func detectKind(data []byte) SessionSource {
 	rawMsgs, hasMsgs := top["messages"]
 	if !hasMsgs {
 		return SourceAuto
+	}
+	// Native sessions carry both RFC3339 fields under their own names. Keep
+	// this shape ambiguous so parseNative can preserve tool blocks and metadata.
+	if _, hasCreated := top["created"]; hasCreated {
+		if _, hasUpdated := top["updated"]; hasUpdated {
+			return SourceAuto
+		}
 	}
 
 	var msgs []map[string]json.RawMessage

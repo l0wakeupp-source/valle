@@ -117,6 +117,13 @@ const (
 
 	// maintenance
 	pendingMaintenance
+
+	// agent and background-job management
+	pendingAgentManage
+	pendingAgentAction
+	pendingAgentChat
+	pendingAgentSteer
+	pendingJobManage
 )
 
 // pendingChoice is an armed numbered selection.
@@ -283,6 +290,10 @@ func (m *Model) applyChoice(o choiceOption) (tea.Model, tea.Cmd) {
 		m.agentName = o.value
 		m.applyAgentPermissions()
 		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "agent: " + o.value, Time: nowFn()})
+	case pendingAgentManage:
+		return m.applyAgentManage(o.value)
+	case pendingAgentAction:
+		return m.applyAgentAction(o.value, ctx)
 	case pendingReasoning:
 		if lvl, ok := provider.ParseEffort(o.value); ok {
 			return m.applyReasoning(lvl)
@@ -493,6 +504,20 @@ func (m *Model) applyTextInput(kind pendingKind, ctx, text string) (tea.Model, t
 		}
 		srv := config.MCPServer{Type: "local", Command: fields}
 		return m.cmdMcpSaveAndConnect(ctx, srv)
+	case pendingAgentChat:
+		if err := m.deps.AgentRegistry.Send(ctx, m.agentID, text); err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "chat: " + err.Error(), Time: nowFn()})
+		} else {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "message sent to " + ctx, Time: nowFn()})
+		}
+		return m, nil
+	case pendingAgentSteer:
+		if err := m.deps.AgentRegistry.Steer(ctx, m.agentID, text); err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "steer: " + err.Error(), Time: nowFn()})
+		} else {
+			m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "steering instruction sent to " + ctx, Time: nowFn()})
+		}
+		return m, nil
 	case pendingKeyAdd:
 		return m.applyKeyAdd(text)
 	}

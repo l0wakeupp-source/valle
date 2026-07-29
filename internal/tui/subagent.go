@@ -45,15 +45,22 @@ func (m *Model) registerTaskTool() {
 	}
 
 	m.deps.Registry.Register(agent.TaskTool{
-		Specs:    specs,
-		MaxDepth: maxDepth,
-		Spawn:    m.spawnSubagent(specs, maxDepth),
+		Specs:           specs,
+		MaxDepth:        maxDepth,
+		Spawn:           m.spawnSubagent(specs, maxDepth),
+		SpawnBackground: m.spawnSubagentBackground(specs, maxDepth),
 	})
 	m.deps.Registry.Register(agent.ParallelTaskTool{
-		Specs:    specs,
-		MaxDepth: maxDepth,
-		Spawn:    m.spawnSubagent(specs, maxDepth),
+		Specs:           specs,
+		MaxDepth:        maxDepth,
+		Spawn:           m.spawnSubagent(specs, maxDepth),
+		SpawnBackground: m.spawnSubagentBackground(specs, maxDepth),
 	})
+	if m.deps.AgentRegistry != nil {
+		m.deps.Registry.Register(agent.ChatTool{Registry: m.deps.AgentRegistry})
+		m.deps.Registry.Register(agent.SteerTool{Registry: m.deps.AgentRegistry})
+		m.deps.Registry.Register(agent.ReportTool{Registry: m.deps.AgentRegistry})
+	}
 
 	// Register the swarm tool if a swarm manager is available.
 	if m.deps.SwarmManager != nil {
@@ -99,13 +106,21 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 			})
 		}
 
+		// /yolo is an explicit request to give child runs the same effective
+		// tool access as Rick. Keep the explore prompt's guidance intact, but do
+		// not hide write/shell tools behind its read-only filter in that mode.
+		toolSpec := spec
+		if m.deps.Perms != nil && m.deps.Perms.Yolo() {
+			toolSpec.ReadOnly = false
+		}
+
 		cfg := agent.Config{
 			Provider:   prov,
 			Model:      modelID,
 			System:     sys,
 			MaxTokens:  m.deps.Loaded.Config.MaxTokens,
 			Tools:      m.deps.Registry,
-			ToolFilter: agent.SubagentToolFilter(spec, m.toolFilter()),
+			ToolFilter: agent.SubagentToolFilter(toolSpec, m.toolFilter()),
 			Perms:      perms,
 			Ask:        m.makeAsker(),
 			Cwd:        m.deps.Cwd,
@@ -139,6 +154,105 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 	}
 }
 
+// spawnSubagentBackground starts the same runner used by foreground delegation,
+// but registers the child first and returns its ID without waiting for completion.
+func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, maxDepth int) func(context.Context, string, string, string, string, int) (string, error) {
+	return func(ctx context.Context, parentID, kind, description, prompt string, depth int) (string, error) {
+		if depth > maxDepth || depth > agent.MaxAllowedDepth {
+			return "", fmt.Errorf("subagent depth %d exceeds configured limit %d", depth, maxDepth)
+		}
+		spec, ok := specs[kind]
+		if !ok {
+			return "", fmt.Errorf("unknown subagent type %q", kind)
+		}
+		if m.deps.AgentRegistry == nil {
+			return "", fmt.Errorf("agent registry is unavailable")
+		}
+		if err := m.deps.AgentRegistry.AcquireBackground(); err != nil {
+			return "", err
+		}
+		parentID = strings.TrimSpace(parentID)
+		if parentID == "" {
+			parentID = m.agentID
+		}
+		parent, ok := m.deps.AgentRegistry.Get(parentID)
+		if !ok {
+			m.deps.AgentRegistry.ReleaseBackground()
+			return "", fmt.Errorf("parent agent %q is not registered", parentID)
+		}
+		if depth != parent.Depth+1 {
+			m.deps.AgentRegistry.ReleaseBackground()
+			return "", fmt.Errorf("subagent depth must be parent depth + 1")
+		}
+		modelRef := m.modelID
+		if spec.Model != "" {
+			modelRef = spec.Model
+		}
+		provID, modelID := config.SplitModel(modelRef)
+		prov, ok := m.deps.Providers[provID]
+		if !ok {
+			m.deps.AgentRegistry.ReleaseBackground()
+			return "", fmt.Errorf("subagent: unknown provider %q", provID)
+		}
+		childCtx, cancel := context.WithCancel(ctx)
+		id, err := m.deps.AgentRegistry.Register(agent.AgentEntry{
+			Name: kind, ParentID: parentID, Depth: depth, Status: agent.AgentIdle,
+			Description: description, Cancel: cancel,
+		})
+		if err != nil {
+			cancel()
+			m.deps.AgentRegistry.ReleaseBackground()
+			return "", err
+		}
+		perms := agent.SubagentPermissions(spec, m.deps.Perms, m.deps.Loaded.ProjectRoot)
+		sys := spec.Prompt + agent.Environment(m.deps.Cwd, modelID, kind, "") +
+			agent.ProjectContext(m.deps.Loaded.ProjectRoot, m.deps.Loaded.Config.Instructions)
+		toolSpec := spec
+		if m.deps.Perms != nil && m.deps.Perms.Yolo() {
+			toolSpec.ReadOnly = false
+		}
+		cfg := agent.Config{
+			Provider: prov, Model: modelID, System: sys,
+			MaxTokens: m.deps.Loaded.Config.MaxTokens, Tools: m.deps.Registry,
+			ToolFilter: agent.SubagentToolFilter(toolSpec, m.toolFilter()), Perms: perms,
+			Ask: m.makeAsker(), Cwd: m.deps.Cwd, SessionID: m.sessionID(),
+			AgentName: kind, AgentID: id, Depth: depth, MaxTurns: 30,
+			Plugins: m.deps.Plugins, Parallel: true, Registry: m.deps.AgentRegistry,
+		}
+		if p := m.program; p != nil {
+			p.Send(subagentEventMsg{kind: kind, description: description, phase: "start"})
+		}
+		m.deps.AgentRegistry.Publish(parentID, agent.Event{Kind: agent.EvAgentBackground, Text: fmt.Sprintf("background agent %s started: %s", id, description)})
+		go func() {
+			defer m.deps.AgentRegistry.ReleaseBackground()
+			toolCount := 0
+			out, runErr := agent.RunSubagent(childCtx, cfg, prompt, func(ev agent.Event) {
+				if ev.Kind == agent.EvToolEnd {
+					toolCount++
+					if p := m.program; p != nil && ev.Tool != nil {
+						p.Send(subagentEventMsg{kind: kind, description: description, phase: "tool", detail: ev.Tool.Name + " " + ev.Tool.Title, count: toolCount})
+					}
+				}
+			})
+			m.deps.AgentRegistry.Update(id, agent.AgentDone, out, runErr)
+			if p := m.program; p != nil {
+				p.Send(subagentResultMsg{id: id, kind: kind, description: description, output: out, err: runErr})
+				p.Send(subagentEventMsg{kind: kind, description: description, phase: "done", count: toolCount})
+			}
+		}()
+		return id, nil
+	}
+}
+
+// subagentResultMsg notifies the orchestrator that a background child produced a result.
+type subagentResultMsg struct {
+	id          string
+	kind        string
+	description string
+	output      string
+	err         error
+}
+
 // subagentEventMsg reports child-session progress to the parent UI.
 type subagentEventMsg struct {
 	kind        string
@@ -146,6 +260,18 @@ type subagentEventMsg struct {
 	phase       string // start | tool | done
 	detail      string
 	count       int
+}
+
+func (m *Model) applySubagentResult(msg subagentResultMsg) {
+	label := msg.description
+	if label == "" {
+		label = msg.kind
+	}
+	if msg.err != nil {
+		m.setStatus(fmt.Sprintf("background agent %s failed: %s", label, truncate(msg.err.Error(), 80)))
+		return
+	}
+	m.setStatus(fmt.Sprintf("background agent %s completed", label))
 }
 
 // applySubagentEvent renders child progress into the transcript.

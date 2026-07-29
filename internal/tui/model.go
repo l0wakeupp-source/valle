@@ -62,7 +62,8 @@ type Deps struct {
 	// reads a reply from stdin and bubbletea owns stdin once running.
 	ImageProto string
 	// Usage persists cumulative token usage per model per day.
-	Usage *usage.Tracker
+	Usage         *usage.Tracker
+	AgentRegistry *agent.Registry
 }
 
 // modal identifies the active overlay, if any.
@@ -94,6 +95,7 @@ type Model struct {
 	history   []provider.Message
 	sess      *session.Session
 	agentName string
+	agentID   string
 	modelID   string
 
 	// streaming
@@ -258,6 +260,22 @@ type todosChangedMsg struct{ items []tools.TodoItem }
 func New(d Deps) *Model {
 	cfg := d.Loaded.Config
 	tuiCfg := d.Loaded.TUI
+	registry := d.AgentRegistry
+	if registry == nil {
+		depth := 1
+		if cfg.SubagentDepth != nil {
+			depth = *cfg.SubagentDepth
+		}
+		registry = agent.NewRegistry(depth, cfg.MaxBackground)
+	}
+	_, rootCancel := context.WithCancel(context.Background())
+	rootID, err := registry.Register(agent.AgentEntry{
+		ID: "orchestrator", Name: "orchestrator", Depth: 0,
+		Status: agent.AgentIdle, Cancel: rootCancel,
+	})
+	if err != nil {
+		rootID = "orchestrator"
+	}
 
 	themeName := tuiCfg.Theme
 	th := d.Themes.Get(themeName)
@@ -295,6 +313,7 @@ func New(d Deps) *Model {
 		themeName:     themeName,
 		input:         ta,
 		agentName:     "build",
+		agentID:       rootID,
 		modelID:       cfg.Model,
 		tx:            newTranscript(),
 		tip:           pickTip(),
@@ -568,6 +587,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case todosChangedMsg:
+		if m.ready {
+			// The checklist lives above the input in the footer. Its height can
+			// change without a terminal resize, so reserve the new rows before
+			// rebuilding the transcript view.
+			m.handleResize(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		}
 		m.refresh()
 		return m, nil
 
@@ -609,6 +634,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case subagentEventMsg:
 		m.applySubagentEvent(msg)
+		return m, nil
+
+	case subagentResultMsg:
+		m.applySubagentResult(msg)
 		return m, nil
 
 	case swarmStartMsg:
@@ -666,11 +695,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 	widthChanged := msg.Width != m.width
-	heightChanged := msg.Height != m.height
 	m.width, m.height = msg.Width, msg.Height
 
 	inputH := m.inputHeight()
-	vpH := m.height - inputH - 4 // header + status + padding
+	vpH := m.height - inputH - 4 - m.todoPanelHeight() // header + status + padding
 	if vpH < 3 {
 		vpH = 3
 	}
@@ -697,11 +725,6 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 	if widthChanged {
 		// Wrapping changed, so every cached block is stale.
 		m.rebuildMarkdown(m.contentWidth())
-		m.tx.invalidateAll(m.contentWidth())
-	} else if heightChanged {
-		// Height changed but width didn't: cached renders are still valid,
-		// but the viewport layout must be rebuilt so scroll position and
-		// line clipping stay consistent.
 		m.tx.invalidateAll(m.contentWidth())
 	}
 	m.refresh()
@@ -800,6 +823,23 @@ func (m *Model) inputHeight() int {
 		h += m.autocompleteHeight() + 1
 	}
 	return h
+}
+
+// todoPanelHeight returns the checklist rows plus the separator appended by
+// footer. The panel is omitted while a swarm owns the footer.
+func (m *Model) todoPanelHeight() int {
+	if m.deps.Todos == nil || m.activeSwarms != 0 {
+		return 0
+	}
+	items := m.deps.Todos.Items()
+	if len(items) == 0 {
+		return 0
+	}
+	panel := m.renderTodos(items, m.contentWidth())
+	if panel == "" {
+		return 0
+	}
+	return strings.Count(panel, "\n") + 2
 }
 
 func (m *Model) rebuildMarkdown(width int) {

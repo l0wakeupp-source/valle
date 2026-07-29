@@ -141,3 +141,13 @@ func TestExtractHost(t *testing.T) {
 		}
 	}
 }
+
+func TestCleanHTMLUsesSinglePassNormalization(t *testing.T) {
+	input := "  <b>Hello</b>&nbsp; &quot;world&quot; &amp; &lt;tag&gt;\n"
+	if got, want := cleanHTML(input), `Hello "world" & <tag>`; got != want {
+		t.Fatalf("cleanHTML(%q) = %q, want %q", input, got, want)
+	}
+	if got, want := cleanHTML("&copy;"), "&copy;"; got != want {
+		t.Fatalf("cleanHTML preserved entity = %q, want %q", got, want)
+	}
+}

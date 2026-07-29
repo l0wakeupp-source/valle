@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"rick/internal/agent"
 	"rick/internal/apply"
 	"rick/internal/config"
 	"rick/internal/doctor"
@@ -35,7 +36,7 @@ import (
 	"rick/internal/usage"
 )
 
-var Version = "0.1.1"
+var Version = "0.1.2"
 
 func main() {
 	var (
@@ -267,6 +268,11 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 
 	todos := tools.NewTodoStore()
 	reg := tools.NewRegistry()
+	depth := 1
+	if loaded.Config.SubagentDepth != nil {
+		depth = *loaded.Config.SubagentDepth
+	}
+	agentRegistry := agent.NewRegistry(depth, loaded.Config.MaxBackground)
 
 	// Token usage tracker: persists cumulative usage per model per day
 	// at ~/.config/rick/usage.json.
@@ -348,7 +354,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 		MCP: mcpMgr, Plugins: plugins, Skills: skills, Agent: o.agent, Credentials: creds,
 		Cwd: abs, Version: "v" + Version, ResumeID: resume, InitialMsg: o.prompt,
 		ImageProto: tui.DetectImageSupport(), SwarmManager: swarm.NewSwarmManager(),
-		Goals: goals, Usage: usageTracker,
+		Goals: goals, Usage: usageTracker, AgentRegistry: agentRegistry,
 	}, nil
 }
 
@@ -411,6 +417,11 @@ func runTUI(dir string, o opts) error {
 
 	_, err = p.Run()
 	deps.MCP.Close()
+	if deps.Usage != nil {
+		if flushErr := deps.Usage.Flush(); err == nil {
+			err = flushErr
+		}
+	}
 	return err
 }
 
@@ -826,11 +837,12 @@ func execCmd() *cobra.Command {
 
 func sessionExportCmd() *cobra.Command {
 	var output string
+	var pretty bool
 	c := &cobra.Command{
 		Use:   "session export <id>",
 		Short: "Export a session to JSON",
 		Long: "Write a single session's full JSON (messages, snapshots, metadata) to a file.\n" +
-			"Default: <session-id>.json in the current directory.",
+			"Default: compact JSON in <session-id>.json; use --pretty for human-readable output.",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -852,14 +864,21 @@ func sessionExportCmd() *cobra.Command {
 				return err
 			}
 			defer f.Close()
-			if err := session.Export(sess, f); err != nil {
-				return err
+			var exportErr error
+			if pretty {
+				exportErr = session.ExportPretty(sess, f)
+			} else {
+				exportErr = session.Export(sess, f)
+			}
+			if exportErr != nil {
+				return exportErr
 			}
 			fmt.Printf("exported %s → %s (%d messages)\n", sess.ID, path, len(sess.Messages))
 			return nil
 		},
 	}
 	c.Flags().StringVarP(&output, "output", "o", "", "output file path (default: <session-id>.json)")
+	c.Flags().BoolVar(&pretty, "pretty", false, "indent JSON for human readability")
 	return c
 }
 

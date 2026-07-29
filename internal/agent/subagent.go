@@ -49,6 +49,8 @@ type TaskTool struct {
 	// Spawn runs a subagent and returns its final text. Injected by the host so
 	// the tools package never depends on the agent runner.
 	Spawn func(ctx context.Context, kind, description, prompt string, depth int) (string, error)
+	// SpawnBackground starts a child and returns its registry ID immediately.
+	SpawnBackground func(ctx context.Context, parentID, kind, description, prompt string, depth int) (string, error)
 
 	Specs    map[string]SubagentSpec
 	MaxDepth int
@@ -74,6 +76,7 @@ func (t TaskTool) Description() string {
 	b.WriteString("SWARM: you also have a 'swarm' tool for multi-agent collaboration with messaging between agents.\n")
 	b.WriteString("Use 'swarm' with action='spawn' to create named agents that can message each other and coordinate.\n")
 	b.WriteString("Use 'task' for one-shot delegation, 'swarm' for ongoing multi-agent coordination.\n\n")
+	b.WriteString("The optional background=true returns immediately with an agent ID; use /agents or chat/steer to follow it.\n\n")
 	b.WriteString("Available subagent types:\n")
 	for n := range t.Specs {
 		fmt.Fprintf(&b, "- %s: %s\n", n, t.Specs[n].Description)
@@ -101,6 +104,10 @@ func (t TaskTool) Schema() map[string]any {
 				"type":        "string",
 				"description": "The complete, self-contained task. Include all context, file paths and constraints the subagent needs, and state exactly what it should report back.",
 			},
+			"background": map[string]any{
+				"type":        "boolean",
+				"description": "Run in the background and return an agent ID immediately (default false).",
+			},
 		},
 		"required": []string{"subagent_type", "description", "prompt"},
 	}
@@ -110,6 +117,14 @@ type taskArgs struct {
 	SubagentType string `json:"subagent_type"`
 	Description  string `json:"description"`
 	Prompt       string `json:"prompt"`
+	Background   bool   `json:"background"`
+}
+
+func titleFor(description, kind string) string {
+	if strings.TrimSpace(description) != "" {
+		return description
+	}
+	return kind + " subagent"
 }
 
 // Run implements tools.Tool.
@@ -145,6 +160,20 @@ func (t TaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage)
 		return tools.Errf("subagents are not available in this context"), nil
 	}
 
+	if a.Background {
+		if t.SpawnBackground == nil {
+			return tools.Errf("background subagents are not available in this context"), nil
+		}
+		id, err := t.SpawnBackground(ctx, tc.AgentID, a.SubagentType, a.Description, a.Prompt, tc.Depth+1)
+		if err != nil {
+			return tools.Errf("background subagent failed: %v", err), nil
+		}
+		return tools.Result{
+			Output: fmt.Sprintf("background agent started: %s", id),
+			Title:  fmt.Sprintf("%s (%s) started", titleFor(a.Description, a.SubagentType), a.SubagentType),
+			Meta:   map[string]any{"agent_id": id, "background": true, "subagent": a.SubagentType},
+		}, nil
+	}
 	out, err := t.Spawn(ctx, a.SubagentType, a.Description, a.Prompt, tc.Depth+1)
 	if err != nil {
 		return tools.Errf("subagent failed: %v", err), nil
@@ -231,9 +260,11 @@ func SubagentToolFilter(spec SubagentSpec, base func(string) bool) func(string) 
 	}
 }
 
-// SubagentPermissions tightens the policy for a read-only subagent.
+// SubagentPermissions tightens the policy for a read-only subagent unless the
+// parent is already in yolo mode. Yolo is an explicit user decision to bypass
+// permission restrictions, and that decision must propagate to child runs.
 func SubagentPermissions(spec SubagentSpec, base *permission.Engine, root string) *permission.Engine {
-	if !spec.ReadOnly {
+	if base == nil || !spec.ReadOnly || base.Yolo() {
 		return base
 	}
 	p := base.Permission()

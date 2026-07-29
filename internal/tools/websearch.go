@@ -25,6 +25,26 @@ var searxJSON []byte
 // chromeUA is the single User-Agent used for every provider.
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
+var (
+	webSearchClient = &http.Client{Timeout: 15 * time.Second}
+
+	bingResultRe      = regexp.MustCompile(`(?s)<li class="b_algo"[^>]*>(.*?)</li>`)
+	bingTitleRe       = regexp.MustCompile(`<h2><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h2>`)
+	bingSnippetRe     = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>`)
+	ddgLinkRe         = regexp.MustCompile(`<a[^>]*rel="nofollow"[^>]*href="([^"]*)"[^>]*>(.*?)</a>`)
+	ddgSnippetRe      = regexp.MustCompile(`(?s)<td[^>]*class="result-snippet"[^>]*>(.*?)</td>`)
+	braveLinkRe       = regexp.MustCompile(`<a[^*]*href="(https?://[^"]*)"[^>]*>([\s\S]*?)</a>`)
+	braveSnippetRe    = regexp.MustCompile(`<p[^>]*class="[^"]*(?:snippet|desc|description)[^"]*"[^>]*>([\s\S]*?)</p>`)
+	braveTitleEndRe   = regexp.MustCompile(`</a>`)
+	tagRe             = regexp.MustCompile(`<[^>]*>`)
+	cleanHTMLReplacer = strings.NewReplacer(
+		"<b>", "", "</b>", "", "<em>", "", "</em>", "", "<wbr>", "",
+		"&quot;", "\"", "&amp;", "&", "&lt;", "<", "&gt;", ">",
+		"&#39;", "'", "&apos;", "'", "&nbsp;", " ",
+		"\n", " ", "\r", " ", "	", " ",
+	)
+)
+
 // --- rate limiting / host tracking ---
 
 var (
@@ -425,8 +445,7 @@ func bingSearch(ctx context.Context, query string, maxResults int) ([]searchResu
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := webSearchClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -445,15 +464,10 @@ func bingSearch(ctx context.Context, query string, maxResults int) ([]searchResu
 	}
 	html := string(body)
 
-	resultRe := regexp.MustCompile(`(?s)<li class="b_algo"[^>]*>(.*?)</li>`)
-	titleRe := regexp.MustCompile(`<h2><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h2>`)
-	snippetRe := regexp.MustCompile(`(?s)<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>`)
-	tagRe := regexp.MustCompile(`<[^>]*>`)
-
 	var results []searchResult
-	for _, match := range resultRe.FindAllStringSubmatch(html, -1) {
+	for _, match := range bingResultRe.FindAllStringSubmatch(html, -1) {
 		block := match[1]
-		titleMatch := titleRe.FindStringSubmatch(block)
+		titleMatch := bingTitleRe.FindStringSubmatch(block)
 		if titleMatch == nil {
 			continue
 		}
@@ -462,7 +476,7 @@ func bingSearch(ctx context.Context, query string, maxResults int) ([]searchResu
 
 		finalURL := decodeBingURL(rawURL)
 		snippet := ""
-		if sm := snippetRe.FindStringSubmatch(block); sm != nil {
+		if sm := bingSnippetRe.FindStringSubmatch(block); sm != nil {
 			snippet = strings.TrimSpace(tagRe.ReplaceAllString(sm[1], ""))
 		}
 
@@ -505,8 +519,7 @@ func duckDuckGoLite(ctx context.Context, query string, maxResults int) ([]search
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := webSearchClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -525,12 +538,8 @@ func duckDuckGoLite(ctx context.Context, query string, maxResults int) ([]search
 	}
 	html := string(body)
 
-	linkRe := regexp.MustCompile(`<a[^>]*rel="nofollow"[^>]*href="([^"]*)"[^>]*>(.*?)</a>`)
-	snippetRe := regexp.MustCompile(`(?s)<td[^>]*class="result-snippet"[^>]*>(.*?)</td>`)
-	tagRe := regexp.MustCompile(`<[^>]*>`)
-
-	links := linkRe.FindAllStringSubmatch(html, -1)
-	snippets := snippetRe.FindAllStringSubmatch(html, -1)
+	links := ddgLinkRe.FindAllStringSubmatch(html, -1)
+	snippets := ddgSnippetRe.FindAllStringSubmatch(html, -1)
 
 	var results []searchResult
 	for i, m := range links {
@@ -577,8 +586,7 @@ func braveSearch(ctx context.Context, query string, maxResults int) ([]searchRes
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := webSearchClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -597,13 +605,8 @@ func braveSearch(ctx context.Context, query string, maxResults int) ([]searchRes
 	}
 	html := string(body)
 
-	linkRe := regexp.MustCompile(`<a[^*]*href="(https?://[^"]*)"[^>]*>([\s\S]*?)</a>`)
-	snippetRe := regexp.MustCompile(`<p[^>]*class="[^"]*(?:snippet|desc|description)[^"]*"[^>]*>([\s\S]*?)</p>`)
-	titleEndRe := regexp.MustCompile(`</a>`)
-	tagRe := regexp.MustCompile(`<[^>]*>`)
-
-	links := linkRe.FindAllStringSubmatch(html, -1)
-	snippets := snippetRe.FindAllStringSubmatch(html, -1)
+	links := braveLinkRe.FindAllStringSubmatch(html, -1)
+	snippets := braveSnippetRe.FindAllStringSubmatch(html, -1)
 
 	var results []searchResult
 	snippetIdx := 0
@@ -617,7 +620,7 @@ func braveSearch(ctx context.Context, query string, maxResults int) ([]searchRes
 		}
 
 		titleBlock := m[2]
-		titleEnd := titleEndRe.FindStringIndex(titleBlock)
+		titleEnd := braveTitleEndRe.FindStringIndex(titleBlock)
 		if titleEnd != nil {
 			titleBlock = titleBlock[:titleEnd[0]]
 		}
@@ -657,8 +660,10 @@ func searXNGSearch(ctx context.Context, query string, maxResults int) ([]searchR
 	req.Header.Set("User-Agent", chromeUA)
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	searchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req = req.WithContext(searchCtx)
+	resp, err := webSearchClient.Do(req)
 	if err != nil {
 		inst.ConsecFails++
 		if inst.ConsecFails >= 2 {
@@ -737,8 +742,7 @@ func duckDuckGoInstant(ctx context.Context, query string, maxResults int) ([]sea
 	}
 	req.Header.Set("User-Agent", chromeUA)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := webSearchClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -815,23 +819,26 @@ func duckDuckGoInstant(ctx context.Context, query string, maxResults int) ([]sea
 }
 
 func cleanHTML(s string) string {
-	s = strings.ReplaceAll(s, "<b>", "")
-	s = strings.ReplaceAll(s, "</b>", "")
-	s = strings.ReplaceAll(s, "<em>", "")
-	s = strings.ReplaceAll(s, "</em>", "")
-	s = strings.ReplaceAll(s, "<wbr>", "")
-	s = strings.ReplaceAll(s, "&quot;", "\"")
-	s = strings.ReplaceAll(s, "&amp;", "&")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
-	s = strings.ReplaceAll(s, "&#39;", "'")
-	s = strings.ReplaceAll(s, "&apos;", "'")
-	s = strings.ReplaceAll(s, "&nbsp;", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
+	s = cleanHTMLReplacer.Replace(s)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	pendingSpace := false
+	for _, r := range s {
+		switch r {
+		case ' ', '\n', '\r', '	', '\u00a0':
+			if b.Len() > 0 {
+				pendingSpace = true
+			}
+			continue
+		}
+		if pendingSpace {
+			b.WriteByte(' ')
+			pendingSpace = false
+		}
+		b.WriteRune(r)
 	}
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(b.String())
 }
 
 func init() {

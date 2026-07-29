@@ -60,15 +60,10 @@ var Registry = []Entry{
 		KeyEnv:  []string{"OPENROUTER_API_KEY"}, BaseEnv: "OPENROUTER_BASE_URL",
 		Note: "one key, every model", KeyHint: "openrouter.ai/keys"},
 
-	{ID: "nous", Name: "Nous Portal", Auth: AuthDeviceCode, Flavor: FlavorOpenAI,
+	{ID: "nous", Name: "Nous Portal", Auth: AuthAPIKey, Flavor: FlavorOpenAI,
 		BaseURL: "https://inference-api.nousresearch.com/v1",
-		Note:    "sign in with your browser", KeyHint: "portal.nousresearch.com",
-		OAuth: &DeviceFlow{
-			DeviceAuthURL: "https://portal.nousresearch.com/api/auth/device/code",
-			TokenURL:      "https://portal.nousresearch.com/api/auth/device/token",
-			ClientID:      "nous-cli",
-			Scope:         "openid profile email offline_access",
-		}},
+		KeyEnv:  []string{"NOUS_API_KEY"},
+		Note:    "sk- API key from the Portal", KeyHint: "portal.nousresearch.com"},
 
 	{ID: "chatgpt", Name: "ChatGPT / Codex", Auth: AuthDeviceCode, Flavor: FlavorOpenAI,
 		BaseURL: "https://api.openai.com/v1",

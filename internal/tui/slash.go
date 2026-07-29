@@ -57,6 +57,14 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdThemes()
 	case "mcp":
 		return m.cmdMcpMenu()
+	case "sandbox":
+		return m.cmdSandbox(args)
+	case "yolo":
+		return m.cmdYolo(args)
+	case "jobs":
+		return m.cmdJobs()
+	case "agents", "agent":
+		return m.cmdAgents()
 	case "stats":
 		return m.cmdStats()
 	case "compact":

@@ -99,15 +99,15 @@ func ResumeSessions(styles *Styles) (string, error) {
 	gi.Width = 10
 
 	m := &resumeModel{
-		store:    store,
-		metas:    metas,
-		filtered: metas,
-		styles:   styles,
-		search:   si,
+		store:     store,
+		metas:     metas,
+		filtered:  metas,
+		styles:    styles,
+		search:    si,
 		gotoInput: gi,
-		favs:     favs,
-		favPath:  favPath,
-		sortMode: sortDate,
+		favs:      favs,
+		favPath:   favPath,
+		sortMode:  sortDate,
 	}
 
 	m.sort()

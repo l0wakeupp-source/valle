@@ -101,7 +101,7 @@ func (t *transcript) render(n, width int, renderOne func(i int) string) {
 	// append the live tail on its own.
 	if dirty {
 		var b strings.Builder
-		b.Grow(t.settledLen())
+		b.Grow(len(t.settled))
 		for _, blk := range t.blocks {
 			if blk == "" {
 				continue
@@ -128,17 +128,6 @@ func (t *transcript) render(n, width int, renderOne func(i int) string) {
 	b.WriteString(t.live)
 	b.WriteString("\n")
 	t.content = b.String()
-}
-
-// settledLen estimates the joined size so the builder allocates once.
-func (t *transcript) settledLen() int {
-	n := 0
-	for _, blk := range t.blocks {
-		if blk != "" {
-			n += len(blk) + 2
-		}
-	}
-	return n
 }
 
 // apply pushes the content into a viewport, honouring the scroll policy.

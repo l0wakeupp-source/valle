@@ -17,6 +17,7 @@ type Context struct {
 	Cwd       string // working directory (project root)
 	SessionID string
 	Agent     string
+	AgentID   string
 	CallID    string
 	Elicit    func(prompt string) (string, error) // optional interactive hook
 	Progress  func(string)                        // optional progress reporting

@@ -173,7 +173,7 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 
 	// Build the table body in plain text (no ANSI codes inside columns).
 	type row struct {
-		provider, model string
+		provider, model             string
 		input, output, cache, total int
 	}
 	var rows []row

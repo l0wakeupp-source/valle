@@ -32,7 +32,7 @@ func main() {
 	fmt.Println("== curated entries survive the merge ==")
 	check("anthropic still first", catalog.Registry[0].ID == "anthropic", catalog.Registry[0].ID)
 	check("openai still second", catalog.Registry[1].ID == "openai", catalog.Registry[1].ID)
-	for _, id := range []string{"nous", "chatgpt", "copilot"} {
+	for _, id := range []string{"chatgpt", "copilot"} {
 		e, _ := catalog.Get(id)
 		check(id+" keeps OAuth flow", e.OAuth != nil || e.Auth == catalog.AuthDeviceCode, e.Auth)
 	}

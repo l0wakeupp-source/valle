@@ -161,7 +161,6 @@ func (c *Credentials) ensureRotation() {
 	}
 }
 
-
 // IDs lists configured provider ids, sorted.
 func (c *Credentials) IDs() []string {
 	out := make([]string, 0, len(c.Providers))

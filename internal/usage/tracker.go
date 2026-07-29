@@ -4,12 +4,12 @@
 // Windows). Every agent turn appends its tokens under the active model id and
 // the current local day. The on-disk shape is:
 //
-//   {
-//     "2026-07-28": {
-//       "anthropic/claude-sonnet-4-5-20250929": {"input": 12345, "output": 6789, "cache_read": 50000, "cache_write": 3000},
-//       "openai/gpt-5":                         {"input": 9999,  "output": 1111, "cache_read": 0,      "cache_write": 0}
-//     }
-//   }
+//	{
+//	  "2026-07-28": {
+//	    "anthropic/claude-sonnet-4-5-20250929": {"input": 12345, "output": 6789, "cache_read": 50000, "cache_write": 3000},
+//	    "openai/gpt-5":                         {"input": 9999,  "output": 1111, "cache_read": 0,      "cache_write": 0}
+//	  }
+//	}
 package usage
 
 import (
@@ -44,10 +44,14 @@ func (d *Day) Add(o Day) {
 
 // Tracker is the in-memory usage store.
 type Tracker struct {
-	mu   sync.Mutex
-	dir  string
-	data map[string]map[string]ModelUsage // date -> model -> usage
+	mu          sync.Mutex
+	dir         string
+	data        map[string]map[string]ModelUsage // date -> model -> usage
+	lastPersist time.Time
+	dirty       bool
 }
+
+const persistInterval = 30 * time.Second
 
 // ModelUsage holds both the day breakdown and the running total.
 type ModelUsage struct {
@@ -75,7 +79,12 @@ func (t *Tracker) Load() error {
 		}
 		return err
 	}
-	return json.Unmarshal(raw, &t.data)
+	if err := json.Unmarshal(raw, &t.data); err != nil {
+		return err
+	}
+	t.dirty = false
+	t.lastPersist = time.Time{}
+	return nil
 }
 
 // path returns the on-disk file location.
@@ -94,7 +103,7 @@ func (t *Tracker) Record(modelID string, in, out, cacheRead, cacheWrite int) err
 }
 
 // RecordWithDay is the testable core: append tokens to a model on a specific
-// local day, then persist. Caller must hold t.mu.
+// local day, then persist periodically. Caller must hold t.mu.
 func (t *Tracker) recordLocked(modelID string, d Day) error {
 	if modelID == "" {
 		return nil
@@ -117,6 +126,21 @@ func (t *Tracker) recordLocked(modelID string, d Day) error {
 	mu.Total.Add(d)
 	t.data[date][modelID] = mu
 
+	t.dirty = true
+	if t.lastPersist.IsZero() || time.Since(t.lastPersist) >= persistInterval {
+		return t.persistLocked()
+	}
+	return nil
+}
+
+// Flush persists pending usage updates. It is safe to call at application
+// shutdown and is a no-op when all updates are already on disk.
+func (t *Tracker) Flush() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.dirty {
+		return nil
+	}
 	return t.persistLocked()
 }
 
@@ -133,7 +157,12 @@ func (t *Tracker) persistLocked() error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, t.path())
+	if err := os.Rename(tmp, t.path()); err != nil {
+		return err
+	}
+	t.dirty = false
+	t.lastPersist = time.Now()
+	return nil
 }
 
 // ModelDays returns every day a model was used, newest first.
@@ -269,18 +298,8 @@ func (t *Tracker) Clear() error {
 	defer t.mu.Unlock()
 
 	t.data = map[string]map[string]ModelUsage{}
-	if err := os.MkdirAll(t.dir, 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(t.data, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := t.path() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, t.path())
+	t.dirty = true
+	return t.persistLocked()
 }
 
 func sortStrings(s []string) {

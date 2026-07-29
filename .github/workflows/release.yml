@@ -48,7 +48,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o "${{ matrix.asset }}" ./cmd/rick
+        run: go build -trimpath -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME#v}" -o "${{ matrix.asset }}" ./cmd/rick
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

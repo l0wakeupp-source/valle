@@ -182,7 +182,7 @@ func testCatalog() {
 	check("ollama needs no key", !o.NeedsKey(), o.Auth)
 
 	n, _ := catalog.Get("nous")
-	check("nous is an oauth provider", n.Auth == catalog.AuthDeviceCode, n.Auth)
+	check("nous is an api-key provider", n.Auth == catalog.AuthAPIKey, n.Auth)
 
 	mm, _ := catalog.Get("minimax")
 	check("minimax is detected as anthropic-flavored", mm.Flavor == catalog.FlavorAnthropic)
@@ -564,7 +564,7 @@ func testAuthUI(tmp string) {
 
 	// --- an oauth provider explains itself instead of silently failing ---
 	m.AuthReset()
-	m = typeStr(m, "nous")
+	m = typeStr(m, "chatgpt")
 	m = key(m, "enter")
 	check("oauth provider shows the sign-in explainer",
 		m.AuthStageName() == "device-code", m.AuthStageName())

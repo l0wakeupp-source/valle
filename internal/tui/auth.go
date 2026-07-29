@@ -23,20 +23,20 @@ import (
 type authStage int
 
 const (
-	authList        authStage = iota // the provider list, awaiting a number / "add" / id
-	authEnterKey                     // pasting an API key
-	authEditMenu                     // chose a connected provider: what to change?
-	authAddName                      // custom: provider name
-	authAddURL                       // custom: base URL
-	authAddKey                       // custom: API key
-	authProbing                      // contacting the endpoint
-	authPickModel                    // choose the default model
-	authEnterModel                   // type a model id (endpoint has no list)
-	authDeviceCode                   // OAuth device-code instructions (fallback)
-	authOAuthWaiting                 // OAuth device-code flow in progress
-	authKeyMenu                      // multi-key management menu
-	authKeyAdd                       // pasting new keys
-	authKeyMode                      // choosing rotation mode
+	authList         authStage = iota // the provider list, awaiting a number / "add" / id
+	authEnterKey                      // pasting an API key
+	authEditMenu                      // chose a connected provider: what to change?
+	authAddName                       // custom: provider name
+	authAddURL                        // custom: base URL
+	authAddKey                        // custom: API key
+	authProbing                       // contacting the endpoint
+	authPickModel                     // choose the default model
+	authEnterModel                    // type a model id (endpoint has no list)
+	authDeviceCode                    // OAuth device-code instructions (fallback)
+	authOAuthWaiting                  // OAuth device-code flow in progress
+	authKeyMenu                       // multi-key management menu
+	authKeyAdd                        // pasting new keys
+	authKeyMode                       // choosing rotation mode
 )
 
 // authState holds everything the /auth flow needs.
@@ -841,6 +841,7 @@ func (m *Model) authKeyModeKey(key string) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
+
 // scheme typo, a full endpoint path — and returns something dialable, or an
 // error explaining precisely what is wrong.
 func normalizeURL(raw string) (string, error) {

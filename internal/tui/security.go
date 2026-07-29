@@ -14,7 +14,8 @@ import (
 
 // ---------- /yolo ----------
 
-// cmdYolo toggles permission prompting off (or back on).
+// cmdYolo enables permission-bypass mode by default, or changes it explicitly
+// with /yolo on|off. The separate toggle spelling is retained for power users.
 //
 // When yolo is turned on the sandbox is automatically turned off so the agent
 // can work unhindered; turning yolo off restores the sandbox to workspace-write.
@@ -25,13 +26,15 @@ func (m *Model) cmdYolo(args string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	want := !perms.Yolo()
+	want := true
 	switch strings.ToLower(strings.TrimSpace(args)) {
 	case "on", "yes", "true", "1":
 		want = true
 	case "off", "no", "false", "0":
 		want = false
-	case "", "toggle":
+	case "toggle":
+		want = !perms.Yolo()
+	case "":
 	default:
 		m.appendMsg(ChatMsg{Kind: MsgError,
 			Text: "usage: /yolo [on|off]", Time: time.Now()})

@@ -322,8 +322,25 @@ func (m *Model) cmdSessions() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// cmdAgents lists the primary agents inline.
+// cmdAgents lists registered agents and falls back to the primary agent picker
+// when no live hierarchy exists.
 func (m *Model) cmdAgents() (tea.Model, tea.Cmd) {
+	if m.deps.AgentRegistry != nil {
+		entries := m.deps.AgentRegistry.List()
+		if len(entries) > 0 {
+			opts := make([]choiceOption, 0, len(entries))
+			for _, entry := range entries {
+				indent := strings.Repeat("  ", entry.Depth)
+				label := fmt.Sprintf("%s[%d] %s", indent, entry.Depth, entry.Name)
+				if entry.Description != "" {
+					label += " \"" + truncate(entry.Description, 42) + "\""
+				}
+				opts = append(opts, choiceOption{value: entry.ID, label: label, detail: string(entry.Status) + " · " + entry.ID})
+			}
+			m.armChoice("active agents — choose one", pendingAgentManage, "", opts)
+			return m, nil
+		}
+	}
 	opts := []choiceOption{
 		{value: "build", label: "build", detail: "all tools allowed", active: m.agentName == "build"},
 		{value: "plan", label: "plan", detail: "edits and bash ask first", active: m.agentName == "plan"},
@@ -436,7 +453,8 @@ func (m *Model) doResume(id string) {
 		return
 	}
 	m.sess = sess
-	m.history = sess.Messages
+	m.history = capHistory(compactHistory(sess.Messages))
+	m.toolOutputs = toolOutputsFromHistory(sess.Messages)
 	m.resetStats()
 	m.usage = sess.Usage
 	if sess.Model != "" {
@@ -479,7 +497,7 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 			case "tool_result":
 				for i := len(out) - 1; i >= 0; i-- {
 					if out[i].Kind == MsgTool && out[i].CallID == b.ToolUseID {
-						out[i].ToolOutput = b.Content
+						out[i].ToolOutput = truncate(b.Content, toolOutputPreviewChars)
 						out[i].ToolErr = b.IsError
 						break
 					}
@@ -488,6 +506,32 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 		}
 	}
 	return out
+}
+
+func compactHistory(history []provider.Message) []provider.Message {
+	out := make([]provider.Message, len(history))
+	for i, msg := range history {
+		out[i] = msg
+		out[i].Content = append([]provider.ContentBlock(nil), msg.Content...)
+		for j, block := range out[i].Content {
+			if block.Type == "tool_result" {
+				out[i].Content[j].Content = compactToolOutput(block.Content, historyToolOutputChars)
+			}
+		}
+	}
+	return out
+}
+
+func toolOutputsFromHistory(history []provider.Message) map[string]string {
+	outputs := make(map[string]string)
+	for _, msg := range history {
+		for _, block := range msg.Content {
+			if block.Type == "tool_result" && block.ToolUseID != "" {
+				outputs[block.ToolUseID] = block.Content
+			}
+		}
+	}
+	return outputs
 }
 
 func (m *Model) saveSession() {
@@ -502,7 +546,9 @@ func (m *Model) saveSession() {
 		}
 		_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
 	}
-	m.sess.Messages = m.history
+	// Keep the complete transcript on disk for local expansion and export. The
+	// provider-facing m.history remains bounded by rebuildHistory.
+	m.sess.Messages = capHistory(m.buildHistory(0))
 	m.sess.Model = m.modelID
 	m.sess.Agent = m.agentName
 	m.sess.Usage = m.usage
@@ -510,7 +556,7 @@ func (m *Model) saveSession() {
 		m.sess.Snapshots = m.deps.Snapshots.History()
 	}
 	if m.sess.Title == "" {
-		m.sess.Title = session.Title(m.history)
+		m.sess.Title = session.Title(m.sess.Messages)
 	}
 	_ = m.deps.Store.Save(m.sess)
 }
