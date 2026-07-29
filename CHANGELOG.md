@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2 — 2026-07-29
+
+- Fixed the TUI splash version so release builds display the current Rick version.
+
 ## v0.1.2 — 2026-07-29
 
 ### Agent Changes
