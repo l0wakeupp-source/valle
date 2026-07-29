@@ -36,7 +36,7 @@ import (
 	"rick/internal/usage"
 )
 
-var Version = "1.0.2"
+var Version = "0.1.2"
 
 func main() {
 	var (
