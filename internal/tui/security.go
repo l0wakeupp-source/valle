@@ -214,7 +214,7 @@ func (m *Model) cmdPermission(args string) (tea.Model, tea.Cmd) {
 		{value: "4", label: "Profiles →", active: false},
 		{value: "5", label: "Show current policy", active: false},
 	}
-	m.armChoice("permissions (" + mode + ")", pendingPermission, "", opts)
+	m.armChoice("permissions ("+mode+")", pendingPermission, "", opts)
 	return m, nil
 }
 
@@ -259,6 +259,13 @@ func (m *Model) setPermissionMode(mode string) (tea.Model, tea.Cmd) {
 		perms.SetYolo(false)
 	case "smart":
 		perms.SetYolo(false)
+		perms.ClearSessionGrants()
+		for _, command := range []string{
+			"ls", "pwd", "cat", "git status", "git log", "git diff",
+			"grep", "rg", "find", "echo", "head", "tail", "wc", "which", "env",
+		} {
+			perms.GrantSession("bash:" + command)
+		}
 	case "off":
 		perms.SetYolo(true)
 	}

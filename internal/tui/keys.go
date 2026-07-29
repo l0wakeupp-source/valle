@@ -8,22 +8,22 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"rick/internal/agent"
+	"rick/internal/permission"
 	"rick/internal/provider"
 )
 
 func (m *Model) syncInputHeight() bool {
-	lines := strings.Count(m.input.Value(), "\n") + 1
-	if lines < 1 {
-		lines = 1
-	}
-	if lines > 8 {
-		lines = 8
-	}
+	lines := m.inputVisualLines()
 	if m.input.Height() == lines {
 		return false
 	}
 	m.input.SetHeight(lines)
 	return true
+}
+
+func (m *Model) resizeAfterInputEdit() {
+	m.handleResize(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+	m.syncInputHeight()
 }
 
 // handleKey routes a keypress through modals, picker, leader, then the input.
@@ -73,8 +73,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Any other key disarms the pending quit.
 	m.quitArmed = false
 
-	// Modal permission is rendered inline via permissionView + pending input.
-	// We don't capture keys here so the textarea can receive them.
+	if m.modal == modalPermission {
+		return m.handlePermissionKey(key)
+	}
 
 	// Leader sequence.
 	if m.leaderActive {
@@ -125,15 +126,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		val := m.input.Value()
 		m.input.SetValue(val + "\n")
 		m.input.CursorEnd()
-		lines := strings.Count(m.input.Value(), "\n") + 1
-		if lines > 8 {
-			lines = 8
-		}
-		if lines < 1 {
-			lines = 1
-		}
-		m.input.SetHeight(lines)
-		m.handleResize(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		m.resizeAfterInputEdit()
 		return m, nil
 
 	case "enter":
@@ -223,11 +216,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 
-	// Keep the input bar synchronized in both directions. Deletions can reduce
-	// the logical line count without triggering the old grow-only path.
-	if m.syncInputHeight() {
-		m.handleResize(tea.WindowSizeMsg{Width: m.width, Height: m.height})
-	}
+	m.resizeAfterInputEdit()
 	if m.input.LineCount() > prevLines {
 		return m, cmd
 	}
@@ -238,10 +227,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openPicker()
 	} else if m.picker.active {
 		m.updatePickerQuery()
-	}
-
-	if m.input.LineCount() != prevLines {
-		m.handleResize(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 	}
 	return m, cmd
 }
@@ -274,7 +259,7 @@ func (m *Model) handleClipboardPaste() {
 		}
 		m.input.SetValue(m.input.Value() + fmt.Sprintf("[%s #%d]", kind, len(m.attachments)))
 	}
-	m.input.CursorEnd()
+	m.resizeAfterInputEdit()
 }
 
 func (m *Model) handleLeaderKey(key string) (tea.Model, tea.Cmd) {
@@ -395,7 +380,7 @@ func (m *Model) historyUp() {
 		m.histIdx--
 	}
 	m.input.SetValue(m.inputHist[m.histIdx])
-	m.input.CursorEnd()
+	m.resizeAfterInputEdit()
 }
 
 func (m *Model) historyDown() {
@@ -409,7 +394,7 @@ func (m *Model) historyDown() {
 		m.histIdx = -1
 		m.input.SetValue(m.histDraft)
 	}
-	m.input.CursorEnd()
+	m.resizeAfterInputEdit()
 }
 
 // ---------- submit ----------
@@ -492,6 +477,43 @@ func (m *Model) runShell(cmdline string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handlePermissionKey navigates the compact approval panel.
+func (m *Model) handlePermissionKey(key string) (tea.Model, tea.Cmd) {
+	const optionCount = 3
+
+	switch key {
+	case "up", "ctrl+p":
+		if m.permCursor > 0 {
+			m.permCursor--
+		}
+	case "down", "ctrl+n":
+		if m.permCursor < optionCount-1 {
+			m.permCursor++
+		}
+	case "enter":
+		decision := []agent.PermissionDecision{
+			agent.DecideAccept,
+			agent.DecideAlways,
+			agent.DecideReject,
+		}[m.permCursor]
+		m.answerPermission(decision)
+		m.modal = modalNone
+		switch decision {
+		case agent.DecideAccept:
+			m.setStatus("permission granted once")
+		case agent.DecideAlways:
+			m.setStatus("always allowed: " + permission.SessionKey(m.permReq))
+		default:
+			m.setStatus("permission denied")
+		}
+	case "esc":
+		m.answerPermission(agent.DecideReject)
+		m.modal = modalNone
+		m.setStatus("permission denied")
+	}
+	return m, nil
+}
+
 // answerPermission delivers the user's decision to a waiting permission prompt.
 func (m *Model) answerPermission(decision agent.PermissionDecision) {
 	if m.permReply != nil {
@@ -500,10 +522,43 @@ func (m *Model) answerPermission(decision agent.PermissionDecision) {
 	}
 }
 
-// permissionView renders the inline permission prompt.
+// permissionView renders the compact permission selector.
 func (m *Model) permissionView() string {
-	// This is a placeholder - the actual permission view is rendered inline.
-	return ""
+	s := m.styles
+	var b strings.Builder
+	req := m.permReq
+	panelWidth := m.width - 8
+	if panelWidth < 44 {
+		panelWidth = 44
+	}
+	if panelWidth > 76 {
+		panelWidth = 76
+	}
+
+	title := req.Title
+	if title == "" {
+		title = req.Tool
+	}
+	b.WriteString(s.Warning.Render("? ") + s.Accent.Render("Permission required") + "\n")
+	b.WriteString(s.Base.Render(truncate(title, panelWidth-4)) + "\n")
+
+	if req.Body != "" {
+		body := strings.ReplaceAll(strings.ReplaceAll(req.Body, "\r", " "), "\n", " ")
+		b.WriteString(s.Muted.Render(truncate(body, panelWidth-4)) + "\n")
+	}
+
+	options := []string{"Allow once", "Always allow", "Deny"}
+	for i, option := range options {
+		marker := "  "
+		label := s.Muted
+		if i == m.permCursor {
+			marker = s.Primary.Render("❯ ")
+			label = s.Base
+		}
+		b.WriteString(marker + label.Render(option) + "\n")
+	}
+	b.WriteString("\n" + s.Faint.Render("↑↓ select · enter confirm · esc deny"))
+	return s.OverlayWarn.Width(panelWidth).Render(b.String())
 }
 
 // shellDoneMsg is delivered when a shell command finishes.

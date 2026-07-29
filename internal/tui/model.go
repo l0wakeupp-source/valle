@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -14,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/rivo/uniseg"
 	"golang.org/x/term"
 
 	"rick/internal/agent"
@@ -100,7 +102,8 @@ type Model struct {
 	agentCancel  context.CancelFunc
 	streamBuf    strings.Builder
 	thinkBuf     strings.Builder
-	pendingTools map[string]int // callID -> index into msgs
+	pendingTools map[string]int    // callID -> index into msgs
+	toolOutputs  map[string]string // full tool output, kept out of render entries
 	spinnerTick  int
 
 	// permission prompt
@@ -138,11 +141,13 @@ type Model struct {
 	histDraft string
 
 	// status
-	status     string
-	statusTime time.Time
-	usage      session.Usage
-	ctxWindow  int
-	quitting   bool
+	status             string
+	statusTime         time.Time
+	usage              session.Usage
+	ctxWindow          int
+	lastAutoCompact    time.Time
+	autoCompactPending bool
+	quitting           bool
 
 	// provider auth flow
 	auth  authState
@@ -661,6 +666,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 	widthChanged := msg.Width != m.width
+	heightChanged := msg.Height != m.height
 	m.width, m.height = msg.Width, msg.Height
 
 	inputH := m.inputHeight()
@@ -692,6 +698,11 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 		// Wrapping changed, so every cached block is stale.
 		m.rebuildMarkdown(m.contentWidth())
 		m.tx.invalidateAll(m.contentWidth())
+	} else if heightChanged {
+		// Height changed but width didn't: cached renders are still valid,
+		// but the viewport layout must be rebuilt so scroll position and
+		// line clipping stay consistent.
+		m.tx.invalidateAll(m.contentWidth())
 	}
 	m.refresh()
 
@@ -712,8 +723,70 @@ func (m *Model) contentWidth() int {
 	return w
 }
 
+func (m *Model) inputVisualLines() int {
+	width := m.width - 4
+	if width < 1 {
+		width = 1
+	}
+
+	lines := 0
+	for _, logicalLine := range strings.Split(m.input.Value(), "\n") {
+		lines += wrappedInputLineCount([]rune(logicalLine), width)
+	}
+	if lines < 1 {
+		return 1
+	}
+	if lines > 8 {
+		return 8
+	}
+	return lines
+}
+
+// wrappedInputLineCount mirrors bubbles/textarea's word-wrap behavior so the
+// outer layout reserves the same number of rows that the textarea renders.
+func wrappedInputLineCount(runes []rune, width int) int {
+	lines := [][]rune{{}}
+	word := []rune{}
+	row := 0
+	spaces := 0
+
+	for _, r := range runes {
+		if unicode.IsSpace(r) {
+			spaces++
+		} else {
+			word = append(word, r)
+		}
+		if spaces > 0 {
+			if uniseg.StringWidth(string(lines[row]))+uniseg.StringWidth(string(word))+spaces > width {
+				row++
+				lines = append(lines, append(append([]rune{}, word...), []rune(strings.Repeat(" ", spaces))...))
+			} else {
+				lines[row] = append(lines[row], word...)
+				lines[row] = append(lines[row], []rune(strings.Repeat(" ", spaces))...)
+			}
+			spaces = 0
+			word = nil
+		} else if len(word) > 0 {
+			lastCharWidth := uniseg.StringWidth(string(word[len(word)-1]))
+			if uniseg.StringWidth(string(word))+lastCharWidth > width {
+				if len(lines[row]) > 0 {
+					row++
+					lines = append(lines, []rune{})
+				}
+				lines[row] = append(lines[row], word...)
+				word = nil
+			}
+		}
+	}
+
+	if uniseg.StringWidth(string(lines[row]))+uniseg.StringWidth(string(word))+spaces >= width {
+		row++
+	}
+	return row + 1
+}
+
 func (m *Model) inputHeight() int {
-	lines := m.input.LineCount()
+	lines := m.inputVisualLines()
 	if lines < 1 {
 		lines = 1
 	}
@@ -792,6 +865,16 @@ func (m *Model) setStatus(s string) {
 	m.statusTime = time.Now()
 }
 
+const maxTranscriptMessages = 500
+
+func (m *Model) trimTranscript() {
+	if len(m.msgs) <= maxTranscriptMessages {
+		return
+	}
+	remove := len(m.msgs) - maxTranscriptMessages
+	m.msgs = append([]ChatMsg{{Kind: MsgSystem, Text: fmt.Sprintf("... %d earlier messages omitted to limit RAM", remove), Time: time.Now()}}, m.msgs[remove:]...)
+}
+
 func (m *Model) appendMsg(msg ChatMsg) {
 	m.msgs = append(m.msgs, msg)
 	m.tx.noteAppend()
@@ -804,6 +887,7 @@ func (m *Model) appendMsg(msg ChatMsg) {
 // line instead of the whole history — that full re-layout was the cause of
 // the flicker and the scroll snapping.
 func (m *Model) refresh() {
+	m.trimTranscript()
 	if !m.ready {
 		return
 	}
@@ -954,10 +1038,12 @@ func (m *Model) View() string {
 
 	switch m.modal {
 	case modalPermission:
-		// Rendered inline above the input, not as a centered overlay: the
-		// conversation stays visible and the prompt reads as part of the flow.
-		return main + "\n" + m.permissionView() + "\n" + m.footer()
+		return m.overlay(body, m.permissionView())
 	}
+
+	// Pad to exactly m.height lines so alt-screen mode doesn't leave
+	// ghost content from a previous taller frame.
+	body = padHeight(body, m.height)
 	return body
 }
 

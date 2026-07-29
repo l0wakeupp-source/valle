@@ -552,13 +552,13 @@ func (m *Model) maybeAutoCompact() {
 	if cfg.AutoCompact != nil && !*cfg.AutoCompact {
 		return
 	}
-	reserve := cfg.ContextReserve
-	if reserve <= 0 {
-		reserve = 24000
+	if m.ctxWindow <= 0 || len(m.history) <= 6 || m.autoCompactPending || !m.lastAutoCompact.IsZero() {
+		return
 	}
 	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
-	if m.ctxWindow > 0 && used > m.ctxWindow-reserve && len(m.history) > 6 {
-		m.setStatus("context nearly full — run /compact")
+	if used > m.ctxWindow*70/100 {
+		m.autoCompactPending = true
+		m.setStatus("context above 70% — compacting after this turn")
 	}
 }
 

@@ -138,10 +138,10 @@ func (p *SwarmProcess) Start(ctx context.Context) (string, error) {
 		}(name, runner)
 	}
 
-	workersDone := make(chan struct{})
+	workersDone := make(chan struct{}, 1)
 	go func() {
 		wg.Wait()
-		close(workersDone)
+		workersDone <- struct{}{}
 	}()
 	select {
 	case <-workersDone:

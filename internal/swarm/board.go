@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const boardEntryTTL = time.Hour
+
 // BoardEntry is a single item on the shared scratch board.
 type BoardEntry struct {
 	Key    string    `json:"key"`
@@ -29,6 +31,12 @@ func NewBoard() *Board {
 func (b *Board) Put(key, value, author string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	cutoff := time.Now().Add(-boardEntryTTL)
+	for existingKey, entry := range b.entries {
+		if entry.Time.Before(cutoff) {
+			delete(b.entries, existingKey)
+		}
+	}
 	b.entries[key] = BoardEntry{
 		Key:    key,
 		Value:  value,

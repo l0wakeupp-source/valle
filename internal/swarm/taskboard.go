@@ -64,6 +64,8 @@ type TaskBoard struct {
 	tasks map[string]*Task
 }
 
+const maxCompletedTasks = 200
+
 func NewTaskBoard() *TaskBoard {
 	return &TaskBoard{tasks: map[string]*Task{}}
 }
@@ -256,6 +258,7 @@ func (b *TaskBoard) finish(id, agent string, status TaskStatus, result, reason s
 	task.Result = result
 	task.Error = reason
 	task.UpdatedAt = time.Now()
+	b.trimCompletedLocked()
 	return nil
 }
 
@@ -379,6 +382,39 @@ func (b *TaskBoard) isBlockedTaskLocked(task *Task, visiting map[string]bool) bo
 		}
 	}
 	return false
+}
+
+func (b *TaskBoard) trimCompletedLocked() {
+	completed := 0
+	for _, task := range b.tasks {
+		if isTaskTerminal(task.Status) {
+			completed++
+		}
+	}
+	for completed > maxCompletedTasks {
+		oldestID := ""
+		var oldest time.Time
+		for _, id := range b.order {
+			task := b.tasks[id]
+			if task == nil || !isTaskTerminal(task.Status) {
+				continue
+			}
+			if oldestID == "" || task.UpdatedAt.Before(oldest) {
+				oldestID, oldest = id, task.UpdatedAt
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(b.tasks, oldestID)
+		for i, id := range b.order {
+			if id == oldestID {
+				b.order = append(b.order[:i], b.order[i+1:]...)
+				break
+			}
+		}
+		completed--
+	}
 }
 
 func cloneTask(task *Task) Task {

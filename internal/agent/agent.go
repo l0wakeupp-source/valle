@@ -346,6 +346,17 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 		}
 	}
 
+	emitStart := func(i int) {
+		emit(Event{Kind: EvToolStart, Tool: &ToolEvent{
+			CallID: calls[i].ID, Name: calls[i].Name, Title: calls[i].Name, Input: calls[i].Input,
+		}})
+	}
+	emitEnd := func(i int) {
+		if events[i] != nil {
+			emit(Event{Kind: EvToolEnd, Tool: events[i]})
+		}
+	}
+
 	run := func(i int) {
 		res, ev := r.execOne(ctx, calls[i])
 		results[i] = res
@@ -357,6 +368,7 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 		sem := make(chan struct{}, 4)
 		for _, i := range parallelIdx {
 			wg.Add(1)
+			emitStart(i)
 			go func(i int) {
 				defer wg.Done()
 				sem <- struct{}{}
@@ -365,9 +377,14 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 			}(i)
 		}
 		wg.Wait()
+		for _, i := range parallelIdx {
+			emitEnd(i)
+		}
 	} else {
 		for _, i := range parallelIdx {
+			emitStart(i)
 			run(i)
+			emitEnd(i)
 		}
 	}
 	for _, i := range serialIdx {
@@ -375,18 +392,11 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 			results[i] = provider.ToolResultBlock(calls[i].ID, "cancelled by user", true)
 			continue
 		}
+		emitStart(i)
 		run(i)
+		emitEnd(i)
 	}
 
-	for i, ev := range events {
-		if ev == nil {
-			continue
-		}
-		emit(Event{Kind: EvToolStart, Tool: &ToolEvent{
-			CallID: calls[i].ID, Name: calls[i].Name, Title: ev.Title, Input: calls[i].Input,
-		}})
-		emit(Event{Kind: EvToolEnd, Tool: ev})
-	}
 	return results
 }
 

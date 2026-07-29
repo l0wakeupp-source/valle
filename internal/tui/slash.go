@@ -59,6 +59,12 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdMcpMenu()
 	case "stats":
 		return m.cmdStats()
+	case "compact":
+		return m.cmdCompact()
+	case "ram":
+		return m.cmdRAM()
+	case "goal":
+		return m.cmdGoal(args)
 	case "update":
 		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "updating Rick from the latest GitHub release…", Time: nowFn()})
 		return m, runUpdate()

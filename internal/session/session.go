@@ -56,7 +56,9 @@ type Meta struct {
 	Parent   string    `json:"parent,omitempty"`
 	Favorite bool      `json:"favorite,omitempty"`
 	Messages int       `json:"messages"`
+	Created  time.Time `json:"created"`
 	Updated  time.Time `json:"updated"`
+	ByteSize int64     `json:"byte_size"`
 }
 
 // Store is a directory of session files.
@@ -84,6 +86,8 @@ func NewID() string {
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
 
+func (s *Store) metaPath(id string) string { return filepath.Join(s.dir, id+".meta.json") }
+
 // Save atomically writes a session.
 func (s *Store) Save(sess *Session) error {
 	s.mu.Lock()
@@ -95,7 +99,7 @@ func (s *Store) Save(sess *Session) error {
 	if sess.Created.IsZero() {
 		sess.Created = sess.Updated
 	}
-	data, err := json.MarshalIndent(sess, "", "  ")
+	data, err := json.Marshal(sess)
 	if err != nil {
 		return err
 	}
@@ -104,7 +108,20 @@ func (s *Store) Save(sess *Session) error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, final)
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	meta := metaFrom(sess)
+	meta.ByteSize = int64(len(data))
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	metaTmp := s.metaPath(sess.ID) + ".tmp"
+	if err := os.WriteFile(metaTmp, metaData, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(metaTmp, s.metaPath(sess.ID))
 }
 
 // Load reads a session by id.
@@ -131,7 +148,44 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 	}
 	var out []Meta
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".meta.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var meta Meta
+		if json.Unmarshal(data, &meta) != nil {
+			continue
+		}
+		if cwd != "" && meta.Cwd != cwd {
+			continue
+		}
+		out = append(out, meta)
+	}
+	legacy := s.listLegacy(cwd)
+	known := make(map[string]struct{}, len(out))
+	for _, meta := range out {
+		known[meta.ID] = struct{}{}
+	}
+	for _, meta := range legacy {
+		if _, ok := known[meta.ID]; !ok {
+			out = append(out, meta)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Updated.After(out[j].Updated) })
+	return out, nil
+}
+
+func (s *Store) listLegacy(cwd string) []Meta {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil
+	}
+	var out []Meta
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".meta.json") || e.Name() == "current.json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
@@ -139,22 +193,13 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 			continue
 		}
 		var sess Session
-		if json.Unmarshal(data, &sess) != nil {
+		if json.Unmarshal(data, &sess) != nil || (cwd != "" && sess.Cwd != cwd) {
 			continue
 		}
-		if cwd != "" && sess.Cwd != cwd {
-			continue
-		}
-		out = append(out, Meta{
-			ID: sess.ID, Title: sess.Title, Cwd: sess.Cwd, Model: sess.Model,
-			Parent: sess.Parent, Messages: len(sess.Messages), Updated: sess.Updated,
-		})
+		out = append(out, metaFrom(&sess))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Updated.After(out[j].Updated) })
-	return out, nil
+	return out
 }
-
-// SetCurrent records the last-active session for a working directory.
 func (s *Store) SetCurrent(cwd, id string) error {
 	m, _ := s.currentMap()
 	if m == nil {
@@ -245,30 +290,23 @@ func (s *Store) Fork(id string) (*Session, error) {
 // (case-insensitive substring match), newest first.
 func (s *Store) Search(query string) ([]Meta, error) {
 	q := strings.ToLower(query)
-	entries, err := os.ReadDir(s.dir)
+	metas, err := s.List("")
 	if err != nil {
 		return nil, err
 	}
 	var out []Meta
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == "current.json" {
+	for _, meta := range metas {
+		if strings.Contains(strings.ToLower(meta.Title), q) {
+			out = append(out, meta)
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+		sess, err := s.Load(meta.ID)
 		if err != nil {
-			continue
-		}
-		var sess Session
-		if json.Unmarshal(data, &sess) != nil {
-			continue
-		}
-		if strings.Contains(strings.ToLower(sess.Title), q) {
-			out = append(out, metaFrom(&sess))
 			continue
 		}
 		for _, m := range sess.Messages {
 			if strings.Contains(strings.ToLower(m.Text()), q) {
-				out = append(out, metaFrom(&sess))
+				out = append(out, meta)
 				break
 			}
 		}
@@ -299,7 +337,7 @@ func (s *Store) SetFavorite(id string, fav bool) error {
 func metaFrom(s *Session) Meta {
 	return Meta{
 		ID: s.ID, Title: s.Title, Cwd: s.Cwd, Model: s.Model,
-		Parent: s.Parent, Messages: len(s.Messages), Updated: s.Updated,
+		Parent: s.Parent, Messages: len(s.Messages), Created: s.Created, Updated: s.Updated,
 		Favorite: s.Favorite,
 	}
 }

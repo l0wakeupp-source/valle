@@ -145,6 +145,26 @@ func firstWords(s string, n int) string {
 	return strings.Join(f, " ")
 }
 
+func sessionGrantKey(grants map[string]bool, r Request) (string, bool) {
+	key := SessionKey(r)
+	if grants[key] {
+		return key, true
+	}
+	if r.Tool != "bash" {
+		return "", false
+	}
+	for grant, enabled := range grants {
+		if !enabled || !strings.HasPrefix(grant, "bash:") {
+			continue
+		}
+		command := strings.TrimPrefix(grant, "bash:")
+		if command == firstWords(r.Command, 1) || command == firstWords(r.Command, 2) {
+			return grant, true
+		}
+	}
+	return "", false
+}
+
 // Check resolves the level for a request.
 func (e *Engine) Check(r Request) Level { return e.Resolve(r).Level }
 
@@ -152,8 +172,8 @@ func (e *Engine) Check(r Request) Level { return e.Resolve(r).Level }
 //
 // Precedence, strongest first:
 //  1. yolo
-//  2. session grants
-//  3. an explicit deny anywhere (path, host, tool or bash rule)
+//  2. an explicit deny anywhere (path, host, tool or bash rule)
+//  3. session grants
 //  4. the most specific matching rule for the tool's own dimension
 //  5. the coarse per-tool level
 //  6. the policy default
@@ -167,16 +187,16 @@ func (e *Engine) Resolve(r Request) Decision {
 	if e.yolo {
 		return Decision{Level: Allow, Rule: "yolo", Source: "yolo"}
 	}
-	if e.sessionOK[SessionKey(r)] {
-		return Decision{Level: Allow, Rule: SessionKey(r), Source: "session"}
-	}
-
 	p := e.perm
 	def := Level(orDefault(p.Default, config.PermAsk))
 
-	// A deny from any dimension wins outright.
+	// A deny from any dimension wins over session grants.
 	if d, ok := e.denyScan(p, r); ok {
 		return d
+	}
+
+	if key, ok := sessionGrantKey(e.sessionOK, r); ok {
+		return Decision{Level: Allow, Rule: key, Source: "session"}
 	}
 
 	switch r.Tool {
@@ -250,6 +270,11 @@ func (e *Engine) denyScan(p *config.Permission, r Request) (Decision, bool) {
 	if r.Host != "" {
 		if d, ok := matchHostRule(p.Hosts, r.Host); ok && d.Level == Deny {
 			return d, true
+		}
+	}
+	if r.Tool == "bash" {
+		if d, pat, ok := matchBash(p.Bash, r.Command); ok && d == Deny {
+			return Decision{Level: d, Rule: "bash:" + pat, Source: "policy"}, true
 		}
 	}
 	if d, ok := matchToolRule(p.Tools, r.Tool); ok && d.Level == Deny {

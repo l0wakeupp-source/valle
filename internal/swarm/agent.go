@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+const (
+	maxAgentMessages = 500
+	maxOutputEntries = 500
+)
+
 // AgentStatus tracks where an agent is in its lifecycle.
 type AgentStatus string
 
@@ -78,6 +83,9 @@ func (o *AgentOutput) Add(kind, content string) {
 		Kind:    kind,
 		Content: content,
 	})
+	if len(o.entries) > maxOutputEntries {
+		o.entries = append([]OutputEntry(nil), o.entries[len(o.entries)-maxOutputEntries:]...)
+	}
 }
 
 // List returns all entries.
@@ -111,6 +119,10 @@ func (a *Agent) AddMessage(m Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.Messages = append(a.Messages, m)
+	if len(a.Messages) > maxAgentMessages {
+		remove := maxAgentMessages / 4
+		a.Messages = append([]Message(nil), a.Messages[remove:]...)
+	}
 }
 
 // GetMessages returns a copy of the agent's message history.

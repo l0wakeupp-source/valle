@@ -54,6 +54,9 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"/mcp", "manage MCP servers"},
 		{"/plugins", "loaded plugins"},
 		{"/stats", "token usage summary"},
+		{"/compact", "summarise history to free context"},
+		{"/ram", "current Rick terminal RAM usage"},
+		{"/goal <task>", "start an autonomous tracked goal"},
 		{"/refreshmodellist", "refresh model list from providers"},
 		{"/init", "write a project brief"},
 	})

@@ -26,6 +26,8 @@ type Snapshotter struct {
 	cursor   int // index into history for undo/redo; len(history) == "present"
 }
 
+const maxSnapshotHistory = 100
+
 // NewSnapshotter prepares a shadow repo for a project directory.
 func NewSnapshotter(workTree, dataDir string) (*Snapshotter, error) {
 	s := &Snapshotter{workTree: workTree}
@@ -151,6 +153,10 @@ func (s *Snapshotter) snapshotLocked(label string) (string, error) {
 		s.history = s.history[:s.cursor]
 	}
 	s.history = append(s.history, Snapshot{ID: hash, Label: label, Created: time.Now()})
+	if len(s.history) > maxSnapshotHistory {
+		s.history = append([]Snapshot(nil), s.history[len(s.history)-maxSnapshotHistory:]...)
+		_, _ = s.git("gc", "--auto")
+	}
 	s.cursor = len(s.history)
 	return hash, nil
 }

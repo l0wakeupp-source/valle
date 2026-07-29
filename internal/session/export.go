@@ -43,15 +43,9 @@ func Export(sess *Session, w io.Writer) error {
 	if sess == nil {
 		return errors.New("session: export nil session")
 	}
-	data, err := json.MarshalIndent(sess, "", "  ")
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write(data); err != nil {
-		return err
-	}
-	_, err = w.Write([]byte("\n"))
-	return err
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(sess)
 }
 
 // Import reads a session from r and normalizes it into rick's format. When

@@ -60,18 +60,20 @@ type cacheEntry struct {
 }
 
 var (
-	cacheMu    sync.RWMutex
-	cacheLRU   = list.New()
-	cacheMap   = map[cacheKey]*list.Element{}
-	cacheTTL   = map[string]time.Duration{
-		"searxng":   60 * time.Second,
+	cacheMu  sync.RWMutex
+	cacheLRU = list.New()
+	cacheMap = map[cacheKey]*list.Element{}
+	cacheTTL = map[string]time.Duration{
+		"searxng":    60 * time.Second,
 		"ddginstant": 60 * time.Second,
-		"bing":      300 * time.Second,
-		"ddglite":   300 * time.Second,
-		"brave":     300 * time.Second,
+		"bing":       300 * time.Second,
+		"ddglite":    300 * time.Second,
+		"brave":      300 * time.Second,
 	}
 	cacheMaxLen = 100
 )
+
+const maxSearchResponseBytes = 4 << 20
 
 func cacheGet(provider string, query string, maxResults int) ([]searchResult, bool) {
 	cacheMu.RLock()
@@ -437,7 +439,7 @@ func bingSearch(ctx context.Context, query string, maxResults int) ([]searchResu
 		return nil, fmt.Errorf("bing: HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchResponseBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +519,7 @@ func duckDuckGoLite(ctx context.Context, query string, maxResults int) ([]search
 		return nil, fmt.Errorf("ddg-lite: HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchResponseBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +591,7 @@ func braveSearch(ctx context.Context, query string, maxResults int) ([]searchRes
 		return nil, fmt.Errorf("brave: HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchResponseBytes))
 	if err != nil {
 		return nil, err
 	}

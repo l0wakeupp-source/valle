@@ -158,6 +158,10 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvToolEnd:
 		if ev.Tool != nil {
+			if m.toolOutputs == nil {
+				m.toolOutputs = make(map[string]string)
+			}
+			m.toolOutputs[ev.Tool.CallID] = ev.Tool.Output
 			if idx, ok := m.pendingTools[ev.Tool.CallID]; ok && idx < len(m.msgs) {
 				m.msgs[idx] = toolMsgFromEvent(ev.Tool, false)
 				m.touch(idx)
@@ -257,6 +261,12 @@ func (m *Model) finishRun(err error) tea.Cmd {
 	if err != nil {
 		m.setStatus("error: " + truncate(err.Error(), 60))
 	}
+	if m.autoCompactPending {
+		m.autoCompactPending = false
+		m.lastAutoCompact = time.Now()
+		_, compactCmd := m.cmdCompact()
+		return compactCmd
+	}
 	return nil
 }
 
@@ -311,12 +321,23 @@ func (m *Model) rebuildHistory() {
 				Type: "tool_use", ID: msg.CallID, Name: msg.ToolName, Input: input,
 			})
 			pendingResults = append(pendingResults,
-				provider.ToolResultBlock(msg.CallID, msg.ToolOutput, msg.ToolErr))
+				provider.ToolResultBlock(msg.CallID, m.fullToolOutput(msg), msg.ToolErr))
 		}
 	}
 	flushAssistant()
 	flushResults()
-	m.history = out
+	m.history = capHistory(out)
+}
+
+const maxHistoryMessages = 500
+
+func capHistory(history []provider.Message) []provider.Message {
+	if len(history) <= maxHistoryMessages {
+		return history
+	}
+	removed := len(history) - maxHistoryMessages + 1
+	summary := provider.Message{Role: provider.RoleSystem, Content: []provider.ContentBlock{{Type: "text", Text: fmt.Sprintf("Earlier conversation compacted: %d messages omitted.", removed)}}}
+	return append([]provider.Message{summary}, history[removed:]...)
 }
 
 func (m *Model) interrupt() {

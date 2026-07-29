@@ -136,6 +136,15 @@ func (m *Model) renderMsg(msg ChatMsg, width int) string {
 	return ""
 }
 
+func (m *Model) fullToolOutput(msg ChatMsg) string {
+	if m.toolOutputs != nil {
+		if output, ok := m.toolOutputs[msg.CallID]; ok {
+			return output
+		}
+	}
+	return msg.ToolOutput
+}
+
 func (m *Model) renderTool(msg ChatMsg, width int) string {
 	s := m.styles
 
@@ -174,7 +183,7 @@ func (m *Model) renderTool(msg ChatMsg, width int) string {
 		return head
 	}
 
-	out := strings.TrimRight(msg.ToolOutput, "\n")
+	out := strings.TrimRight(m.fullToolOutput(msg), "\n")
 	if out == "" {
 		return head
 	}
@@ -272,7 +281,7 @@ func toolMsgFromEvent(ev *agent.ToolEvent, running bool) ChatMsg {
 		ToolName:    ev.Name,
 		ToolTitle:   ev.Title,
 		ToolInput:   ev.Input,
-		ToolOutput:  ev.Output,
+		ToolOutput:  truncate(ev.Output, 200),
 		ToolErr:     ev.IsError,
 		ToolRunning: running,
 		ToolElapsed: ev.Elapsed,

@@ -64,61 +64,109 @@ func splitLines(s string) []string {
 	return lines
 }
 
-// lcsDiff runs a standard LCS dynamic program. Guards against pathological
-// sizes by falling back to a wholesale replace.
+// lcsDiff computes an LCS diff with Hirschberg's algorithm. It keeps only
+// rolling score rows, so memory is O(min(n, m)) instead of O(n*m).
 func lcsDiff(a, b []string, offset int) []DiffOp {
-	const maxCells = 4_000_000
-	if len(a)*len(b) > maxCells {
-		var ops []DiffOp
-		for i, l := range a {
-			ops = append(ops, DiffOp{Kind: '-', Text: l, OldLine: offset + i + 1})
-		}
-		for i, l := range b {
-			ops = append(ops, DiffOp{Kind: '+', Text: l, NewLine: offset + i + 1})
+	return hirschbergDiff(a, b, offset, offset)
+}
+
+func hirschbergDiff(a, b []string, oldOffset, newOffset int) []DiffOp {
+	if len(a) == 0 {
+		ops := make([]DiffOp, 0, len(b))
+		for i, line := range b {
+			ops = append(ops, DiffOp{Kind: '+', Text: line, NewLine: newOffset + i + 1})
 		}
 		return ops
 	}
-
-	n, m := len(a), len(b)
-	table := make([][]int, n+1)
-	for i := range table {
-		table[i] = make([]int, m+1)
+	if len(b) == 0 {
+		ops := make([]DiffOp, 0, len(a))
+		for i, line := range a {
+			ops = append(ops, DiffOp{Kind: '-', Text: line, OldLine: oldOffset + i + 1})
+		}
+		return ops
 	}
-	for i := n - 1; i >= 0; i-- {
-		for j := m - 1; j >= 0; j-- {
-			if a[i] == b[j] {
-				table[i][j] = table[i+1][j+1] + 1
-			} else if table[i+1][j] >= table[i][j+1] {
-				table[i][j] = table[i+1][j]
-			} else {
-				table[i][j] = table[i][j+1]
+	if len(a) == 1 {
+		for j, line := range b {
+			if a[0] == line {
+				ops := make([]DiffOp, 0, len(b))
+				for k := 0; k < j; k++ {
+					ops = append(ops, DiffOp{Kind: '+', Text: b[k], NewLine: newOffset + k + 1})
+				}
+				ops = append(ops, DiffOp{Kind: ' ', Text: a[0], OldLine: oldOffset + 1, NewLine: newOffset + j + 1})
+				for k := j + 1; k < len(b); k++ {
+					ops = append(ops, DiffOp{Kind: '+', Text: b[k], NewLine: newOffset + k + 1})
+				}
+				return ops
 			}
 		}
+		ops := []DiffOp{{Kind: '-', Text: a[0], OldLine: oldOffset + 1}}
+		for j, line := range b {
+			ops = append(ops, DiffOp{Kind: '+', Text: line, NewLine: newOffset + j + 1})
+		}
+		return ops
+	}
+	if len(b) == 1 {
+		for i, line := range a {
+			if b[0] == line {
+				ops := make([]DiffOp, 0, len(a))
+				for k := 0; k < i; k++ {
+					ops = append(ops, DiffOp{Kind: '-', Text: a[k], OldLine: oldOffset + k + 1})
+				}
+				ops = append(ops, DiffOp{Kind: ' ', Text: b[0], OldLine: oldOffset + i + 1, NewLine: newOffset + 1})
+				for k := i + 1; k < len(a); k++ {
+					ops = append(ops, DiffOp{Kind: '-', Text: a[k], OldLine: oldOffset + k + 1})
+				}
+				return ops
+			}
+		}
+		ops := make([]DiffOp, 0, len(a)+1)
+		for i, line := range a {
+			ops = append(ops, DiffOp{Kind: '-', Text: line, OldLine: oldOffset + i + 1})
+		}
+		ops = append(ops, DiffOp{Kind: '+', Text: b[0], NewLine: newOffset + 1})
+		return ops
 	}
 
-	var ops []DiffOp
-	i, j := 0, 0
-	for i < n && j < m {
-		switch {
-		case a[i] == b[j]:
-			ops = append(ops, DiffOp{Kind: ' ', Text: a[i], OldLine: offset + i + 1, NewLine: offset + j + 1})
-			i++
-			j++
-		case table[i+1][j] >= table[i][j+1]:
-			ops = append(ops, DiffOp{Kind: '-', Text: a[i], OldLine: offset + i + 1})
-			i++
-		default:
-			ops = append(ops, DiffOp{Kind: '+', Text: b[j], NewLine: offset + j + 1})
-			j++
+	mid := len(a) / 2
+	left := lcsLengths(a[:mid], b)
+	reversedA := reverseStrings(a[mid:])
+	reversedB := reverseStrings(b)
+	right := lcsLengths(reversedA, reversedB)
+	split := 0
+	best := -1
+	for j := 0; j <= len(b); j++ {
+		score := left[j] + right[len(b)-j]
+		if score > best {
+			best, split = score, j
 		}
 	}
-	for ; i < n; i++ {
-		ops = append(ops, DiffOp{Kind: '-', Text: a[i], OldLine: offset + i + 1})
+	return append(hirschbergDiff(a[:mid], b[:split], oldOffset, newOffset), hirschbergDiff(a[mid:], b[split:], oldOffset+mid, newOffset+split)...)
+}
+
+func lcsLengths(a, b []string) []int {
+	previous := make([]int, len(b)+1)
+	for i := len(a) - 1; i >= 0; i-- {
+		current := make([]int, len(b)+1)
+		for j := len(b) - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				current[j] = previous[j+1] + 1
+			} else if previous[j] >= current[j+1] {
+				current[j] = previous[j]
+			} else {
+				current[j] = current[j+1]
+			}
+		}
+		previous = current
 	}
-	for ; j < m; j++ {
-		ops = append(ops, DiffOp{Kind: '+', Text: b[j], NewLine: offset + j + 1})
+	return previous
+}
+
+func reverseStrings(lines []string) []string {
+	reversed := make([]string, len(lines))
+	for i, line := range lines {
+		reversed[len(lines)-1-i] = line
 	}
-	return ops
+	return reversed
 }
 
 // Hunks groups diff ops into hunks with `contextLines` of surrounding context.
