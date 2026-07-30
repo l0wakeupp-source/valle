@@ -6,9 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
+	"rick/internal/provider"
 	"rick/internal/provider/catalog"
 )
+
+var credentialsFileMu sync.Mutex
 
 // Credentials is the on-disk auth store: ~/.config/rick/auth.json.
 //
@@ -19,6 +23,7 @@ type Credentials struct {
 	// rotationIndex tracks round-robin/failover key position per provider.
 	// Not persisted — reset on each session.
 	rotationIndex map[string]int `json:"-"`
+	mu            sync.RWMutex
 }
 
 // Credential is one saved provider login.
@@ -30,12 +35,13 @@ type Credential struct {
 	Models  []string `json:"models,omitempty"`
 	// ContextWindows maps model id -> window size, as reported by the
 	// endpoint or inferred at connect time.
-	ContextWindows  map[string]int `json:"context_windows,omitempty"` // last fetched model ids
-	VisionModels    []string       `json:"vision_models,omitempty"`
-	ModalitiesKnown bool           `json:"modalities_known,omitempty"`
-	Default         string         `json:"default,omitempty"` // preferred model id
-	Custom          bool           `json:"custom,omitempty"`  // user-added, not in the catalog
-	Disabled        bool           `json:"disabled,omitempty"`
+	ContextWindows  map[string]int                    `json:"context_windows,omitempty"` // last fetched model ids
+	ContextSources  map[string]provider.ContextSource `json:"context_sources,omitempty"`
+	VisionModels    []string                          `json:"vision_models,omitempty"`
+	ModalitiesKnown bool                              `json:"modalities_known,omitempty"`
+	Default         string                            `json:"default,omitempty"` // preferred model id
+	Custom          bool                              `json:"custom,omitempty"`  // user-added, not in the catalog
+	Disabled        bool                              `json:"disabled,omitempty"`
 	// OnlyFree filters model listings to zero-cost / :free models only.
 	OnlyFree bool `json:"only_free,omitempty"`
 	// APIKeys holds multiple API keys for key rotation. When APIKey is set
@@ -67,16 +73,19 @@ func LoadCredentials() (*Credentials, error) {
 	if c.Providers == nil {
 		c.Providers = map[string]Credential{}
 	}
-	for id, p := range c.Providers {
-		p.APIKey = catalog.CleanSecret(p.APIKey)
-		p.BaseURL = catalog.CleanSecret(p.BaseURL)
-		c.Providers[id] = p
-	}
 	return c, nil
 }
 
 // Save atomically writes the auth store with owner-only permissions.
 func (c *Credentials) Save() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.saveLocked()
+}
+
+func (c *Credentials) saveLocked() error {
+	credentialsFileMu.Lock()
+	defer credentialsFileMu.Unlock()
 	if c.Providers == nil {
 		c.Providers = map[string]Credential{}
 	}
@@ -102,6 +111,8 @@ func (c *Credentials) Save() error {
 
 // Set upserts a credential.
 func (c *Credentials) Set(id string, cred Credential) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.Providers == nil {
 		c.Providers = map[string]Credential{}
 	}
@@ -109,17 +120,27 @@ func (c *Credentials) Set(id string, cred Credential) {
 }
 
 // Remove deletes a credential.
-func (c *Credentials) Remove(id string) { delete(c.Providers, id) }
+func (c *Credentials) Remove(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.Providers, id)
+}
 
 // AllKeys returns the effective list of API keys for a credential.
 // When APIKey is set and APIKeys is empty, it returns [APIKey].
 func (c *Credentials) AllKeys(id string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.allKeysLocked(id)
+}
+
+func (c *Credentials) allKeysLocked(id string) []string {
 	cred, ok := c.Providers[id]
 	if !ok {
 		return nil
 	}
 	if len(cred.APIKeys) > 0 {
-		return cred.APIKeys
+		return append([]string(nil), cred.APIKeys...)
 	}
 	if cred.APIKey != "" {
 		return []string{cred.APIKey}
@@ -129,7 +150,13 @@ func (c *Credentials) AllKeys(id string) []string {
 
 // CurrentKey returns the active key based on mode and rotation state.
 func (c *Credentials) CurrentKey(id string) string {
-	keys := c.AllKeys(id)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentKeyLocked(id)
+}
+
+func (c *Credentials) currentKeyLocked(id string) string {
+	keys := c.allKeysLocked(id)
 	if len(keys) == 0 {
 		return ""
 	}
@@ -138,20 +165,44 @@ func (c *Credentials) CurrentKey(id string) string {
 		mode = "single"
 	}
 	if mode == "round-robin" || mode == "failover" {
-		// Use the key index based on rotation counter.
 		idx := c.rotationIndex[id] % len(keys)
 		return keys[idx]
 	}
-	return keys[0]
+	return catalog.CleanSecret(keys[0])
 }
 
 // RotateKey advances the rotation counter and returns the next key.
 func (c *Credentials) RotateKey(id string) string {
-	if c.rotationIndex == nil {
-		c.rotationIndex = map[string]int{}
-	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureRotation()
 	c.rotationIndex[id]++
-	return c.CurrentKey(id)
+	return c.currentKeyLocked(id)
+}
+
+// RotateKeyAndSave advances key rotation, updates the active API key, and
+// persists the complete operation under one lock. This prevents concurrent
+// rate-limit retries from overwriting one another's credential state.
+func (c *Credentials) RotateKeyAndSave(id string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cred, ok := c.Providers[id]
+	if !ok || (cred.APIKeyMode != "failover" && cred.APIKeyMode != "round-robin") {
+		return "", nil
+	}
+	keys := c.allKeysLocked(id)
+	if len(keys) < 2 {
+		return "", nil
+	}
+	c.ensureRotation()
+	c.rotationIndex[id]++
+	newKey := c.currentKeyLocked(id)
+	if newKey == "" {
+		return "", nil
+	}
+	cred.APIKey = newKey
+	c.Providers[id] = cred
+	return newKey, c.saveLocked()
 }
 
 // rotationIndex tracks round-robin/failover key position per provider.

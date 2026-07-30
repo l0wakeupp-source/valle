@@ -127,7 +127,10 @@ func (r *Registry) MaxBackground() int {
 
 // Register adds an entry and links it to its parent. The returned ID is stable
 // for the lifetime of this registry.
-func (r *Registry) Register(entry AgentEntry) (string, error) {
+func (r *Registry) Register(entry *AgentEntry) (string, error) {
+	if entry == nil {
+		return "", fmt.Errorf("agent entry is nil")
+	}
 	if entry.Depth < 0 || entry.Depth > r.MaxDepth() {
 		return "", fmt.Errorf("agent depth %d exceeds configured limit %d", entry.Depth, r.MaxDepth())
 	}
@@ -164,7 +167,7 @@ func (r *Registry) Register(entry AgentEntry) (string, error) {
 		parent.Children = append(parent.Children, entry.ID)
 		parent.mu.Unlock()
 	}
-	r.entries[entry.ID] = &entry
+	r.entries[entry.ID] = entry
 	return entry.ID, nil
 }
 

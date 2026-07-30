@@ -15,6 +15,7 @@ import (
 type slashCmd struct{ cmd, desc string }
 
 var slashCommands = []slashCmd{
+	{"/stop", "interrupt the active run"},
 	{"/help", "show keybindings and commands"},
 	{"/new", "start a fresh session"},
 	{"/sessions", "browse, resume, fork, rename sessions"},
@@ -32,13 +33,10 @@ var slashCommands = []slashCmd{
 	{"/redo", "reapply reverted changes"},
 	{"/details", "toggle full tool output"},
 	{"/thinking", "toggle reasoning display"},
-	{"/init", "write a RICK.md project brief"},
 	{"/tools", "enable/disable tools"},
 	{"/mcp", "manage MCP servers"},
 	{"/plugins", "manage plugins (on/off/add/remove)"},
 	{"/skills", "list, view, and add skills"},
-	{"/swarms", "multi-agent swarm status"},
-	{"/permissions", "approval modes & profiles"},
 	{"/sandbox", "show or change command confinement"},
 	{"/yolo", "bypass every permission prompt (dangerous)"},
 	{"/edit", "edit a skill, agent, or mcp config"},
@@ -104,11 +102,17 @@ func (m *Model) autocompleteView() string {
 	if len(matches) > 6 {
 		matches = matches[:6]
 	}
+	if m.slashCursor >= len(matches) {
+		m.slashCursor = len(matches) - 1
+	}
+	if m.slashCursor < 0 {
+		m.slashCursor = 0
+	}
 	var b strings.Builder
 	for i, sc := range matches {
 		marker := "  "
 		nameStyle := s.Muted
-		if i == 0 {
+		if i == m.slashCursor {
 			marker = s.Primary.Render("❯ ")
 			nameStyle = s.PillActive
 		}
@@ -116,6 +120,41 @@ func (m *Model) autocompleteView() string {
 			s.Faint.Render(sc.desc) + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *Model) slashSelection() (string, bool) {
+	value := m.input.Value()
+	if !strings.HasPrefix(value, "/") || strings.Contains(value, " ") {
+		return "", false
+	}
+	matches := matchingSlash(value)
+	if len(matches) == 0 {
+		return "", false
+	}
+	if m.slashCursor >= len(matches) {
+		m.slashCursor = len(matches) - 1
+	}
+	if m.slashCursor < 0 {
+		m.slashCursor = 0
+	}
+	return matches[m.slashCursor].cmd, true
+}
+
+func (m *Model) moveSlashCursor(delta int) bool {
+	value := m.input.Value()
+	if !strings.HasPrefix(value, "/") || strings.Contains(value, " ") {
+		return false
+	}
+	matches := matchingSlash(value)
+	if len(matches) == 0 {
+		return false
+	}
+	m.slashCursor = (m.slashCursor + delta) % len(matches)
+	if m.slashCursor < 0 {
+		m.slashCursor += len(matches)
+	}
+	m.refresh()
+	return true
 }
 
 // ---------- @ file picker ----------

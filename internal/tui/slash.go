@@ -27,6 +27,12 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 	switch name {
 	case "help", "h":
 		return m.cmdHelp()
+	case "stop", "interrupt":
+		m.interrupt()
+		return m, nil
+	case "exit", "quit":
+		m.quitting = true
+		return m, tea.Quit
 	case "new":
 		return m.cmdNew()
 	case "sessions", "session":
@@ -55,6 +61,23 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdConfig()
 	case "theme", "themes":
 		return m.cmdThemes()
+	case "undo":
+		return m.cmdUndo()
+	case "redo":
+		return m.cmdRedo()
+	case "details":
+		m.toolDetails = !m.toolDetails
+		return m, nil
+	case "tools":
+		return m.cmdToolsMenu()
+	case "plugins":
+		return m.cmdPlugins(args)
+	case "skills":
+		return m.cmdSkills(args)
+	case "edit":
+		return m.cmdEdit(args)
+	case "refreshmodellist":
+		return m.cmdRefreshModelList()
 	case "mcp":
 		return m.cmdMcpMenu()
 	case "sandbox":

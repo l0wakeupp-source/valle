@@ -89,13 +89,45 @@ func (m *Model) cmdJobs() (tea.Model, tea.Cmd) {
 		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no tracked background jobs", Time: time.Now()})
 		return m, nil
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "jobs: %d total · %d active\n", total, active)
+	options := make([]choiceOption, 0, total)
 	for _, job := range m.jobs.Recent(20) {
 		job.mu.RLock()
-		fmt.Fprintf(&b, "%s %s [%s] %s\n", job.ID, job.Kind, job.Status, job.Label)
+		label := job.Label
+		if label == "" {
+			label = job.Kind
+		}
+		options = append(options, choiceOption{
+			value:  job.ID,
+			label:  truncate(label, 48),
+			detail: string(job.Status) + " · " + job.ID,
+		})
 		job.mu.RUnlock()
 	}
-	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: b.String(), Time: time.Now()})
+	m.armChoice(fmt.Sprintf("jobs · %d total · %d active", total, active), pendingJobManage, "", options)
+	return m, nil
+}
+
+func (m *Model) showJobDetail(id string) (tea.Model, tea.Cmd) {
+	for _, job := range m.jobs.Recent(0) {
+		if job.ID != id {
+			continue
+		}
+		job.mu.RLock()
+		label := job.Label
+		if label == "" {
+			label = job.Kind
+		}
+		text := fmt.Sprintf("job %s\nstatus: %s\nkind: %s\nlabel: %s", job.ID, job.Status, job.Kind, label)
+		if job.Error != "" {
+			text += "\nerror: " + job.Error
+		}
+		if job.Output != "" {
+			text += "\n\n" + truncate(job.Output, 4000)
+		}
+		job.mu.RUnlock()
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: text, Time: time.Now()})
+		return m, nil
+	}
+	m.appendMsg(ChatMsg{Kind: MsgError, Text: "job no longer exists: " + id, Time: time.Now()})
 	return m, nil
 }

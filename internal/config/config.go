@@ -249,6 +249,7 @@ func Defaults() (Config, TUI) {
 		DiffMode:      "auto",
 		DiffThreshold: 120,
 		ScrollSpeed:   3,
+		Mouse:         true,
 		ShowThinking:  &yes,
 		Keybinds: Keybinds{
 			Leader:           "ctrl+x",

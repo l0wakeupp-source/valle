@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,7 +46,7 @@ func New(id, apiKey, baseURL string) *Client {
 		ID:      id,
 		APIKey:  catalog.CleanSecret(apiKey),
 		BaseURL: strings.TrimRight(strings.ReplaceAll(baseURL, "\x00", ""), "/"),
-		HTTP:    &http.Client{},
+		HTTP:    &http.Client{Timeout: 15 * time.Minute},
 		Headers: map[string]string{},
 	}
 	if id == "openrouter" {
@@ -338,17 +339,20 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 	stopReason := ""
 
 	flushCalls := func() bool {
-		// Emit in index order for determinism.
-		for i := 0; i < len(calls)+8; i++ {
-			acc, ok := calls[i]
-			if !ok {
-				continue
-			}
+		// Emit in index order for determinism without assuming call indexes are
+		// contiguous or bounded by the number of accumulated calls.
+		indices := make([]int, 0, len(calls))
+		for index := range calls {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		for _, index := range indices {
+			acc := calls[index]
 			args := strings.TrimSpace(acc.args.String())
 			if args == "" {
 				args = "{}"
 			}
-			delete(calls, i)
+			delete(calls, index)
 			if !emit(provider.Event{Kind: provider.EventToolCall,
 				ToolCall: &provider.ToolCall{ID: acc.id, Name: acc.name, Input: json.RawMessage(args)}}) {
 				return false
@@ -478,27 +482,27 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.ModelInfo, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s: models http %d", c.ID, resp.StatusCode)
 	}
-	var out struct {
-		Data []struct {
-			ID            string `json:"id"`
-			Name          string `json:"name"`
-			ContextLength int    `json:"context_length"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
 		return nil, err
 	}
-	models := make([]provider.ModelInfo, 0, len(out.Data))
-	for _, m := range out.Data {
-		ctxLen := m.ContextLength
-		if ctxLen == 0 {
-			ctxLen = 128000
-		}
-		name := m.Name
-		if name == "" {
-			name = m.ID
-		}
-		models = append(models, provider.ModelInfo{ID: m.ID, Name: name, ContextWindow: ctxLen})
+	models, _, err := catalog.ParseModels(body)
+	if err != nil {
+		return nil, err
 	}
-	return models, nil
+	infos := make([]provider.ModelInfo, 0, len(models))
+	for _, model := range catalog.FilterChatModels(models) {
+		contextWindow := model.Context
+		contextSource := model.ContextSource
+		if override, ok := provider.ProviderContextWindow(c.ID, model.ID); ok {
+			contextWindow = override
+			contextSource = provider.ContextSourceCatalog
+		}
+		infos = append(infos, provider.ModelInfo{
+			ID: model.ID, Name: model.Name, ContextWindow: contextWindow,
+			ContextSource: contextSource, SupportsImages: model.SupportsImages,
+			CapabilitiesKnown: model.CapabilitiesKnown, ChatCapable: model.ChatCapable,
+		})
+	}
+	return infos, nil
 }

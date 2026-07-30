@@ -8,11 +8,11 @@ import (
 
 func TestRegistryTracksHierarchyAndLifecycle(t *testing.T) {
 	registry := NewRegistry(10, 8)
-	rootID, err := registry.Register(AgentEntry{ID: "orchestrator", Name: "orchestrator", Depth: 0})
+	rootID, err := registry.Register(&AgentEntry{ID: "orchestrator", Name: "orchestrator", Depth: 0})
 	if err != nil || rootID != "orchestrator" {
 		t.Fatalf("register root: %q %v", rootID, err)
 	}
-	childID, err := registry.Register(AgentEntry{Name: "general", ParentID: rootID, Depth: 1})
+	childID, err := registry.Register(&AgentEntry{Name: "general", ParentID: rootID, Depth: 1})
 	if err != nil {
 		t.Fatalf("register child: %v", err)
 	}
@@ -39,10 +39,10 @@ func TestRegistryTracksHierarchyAndLifecycle(t *testing.T) {
 
 func TestRegistryRejectsInvalidDepthAndMissingParent(t *testing.T) {
 	registry := NewRegistry(10, 8)
-	if _, err := registry.Register(AgentEntry{Name: "bad", Depth: 11}); err == nil {
+	if _, err := registry.Register(&AgentEntry{Name: "bad", Depth: 11}); err == nil {
 		t.Fatal("expected depth error")
 	}
-	if _, err := registry.Register(AgentEntry{Name: "child", ParentID: "missing", Depth: 1}); err == nil {
+	if _, err := registry.Register(&AgentEntry{Name: "child", ParentID: "missing", Depth: 1}); err == nil {
 		t.Fatal("expected missing parent error")
 	}
 	if err := ValidateDepth(0); err == nil || !strings.Contains(err.Error(), "1..10") {
@@ -52,8 +52,8 @@ func TestRegistryRejectsInvalidDepthAndMissingParent(t *testing.T) {
 
 func TestRegistryRoutesChatSteerAndKill(t *testing.T) {
 	registry := NewRegistry(10, 8)
-	rootID, _ := registry.Register(AgentEntry{ID: "root", Name: "root", Depth: 0})
-	childID, _ := registry.Register(AgentEntry{Name: "child", ParentID: rootID, Depth: 1})
+	rootID, _ := registry.Register(&AgentEntry{ID: "root", Name: "root", Depth: 0})
+	childID, _ := registry.Register(&AgentEntry{Name: "child", ParentID: rootID, Depth: 1})
 	input, ok := registry.Input(childID)
 	if !ok {
 		t.Fatal("missing input channel")

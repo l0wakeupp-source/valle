@@ -8,7 +8,7 @@
 
 package catalog
 
-func init() { Registry = append(Registry, Generated...) }
+func init() { Registry = appendUnique(Registry, Generated) }
 
 // Generated is the models.dev slice appended to Registry at init.
 var Generated = []Entry{

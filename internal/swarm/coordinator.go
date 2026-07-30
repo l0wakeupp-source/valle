@@ -105,21 +105,25 @@ func (p *SwarmProcess) Start(ctx context.Context) (string, error) {
 	}
 	p.mu.Unlock()
 
-	var wg sync.WaitGroup
+	var workersDone chan struct{}
+	if len(runners) > 0 {
+		workersDone = make(chan struct{}, len(runners))
+	}
 	for name, runner := range runners {
-		wg.Add(1)
 		go func(agentName string, agentRunner Runner) {
-			defer wg.Done()
-			agentState, err := p.swarm.GetAgent(agentName)
-			if err != nil {
-				return
-			}
+			var agentState *Agent
+			var err error
+			defer func() { workersDone <- struct{}{} }()
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					agentState.SetStatus(StatusFailed)
 					p.swarm.Emit(Event{Kind: EventAgentFailed, Agent: agentName, Detail: fmt.Sprintf("runner panicked: %v", recovered)})
 				}
 			}()
+			agentState, err = p.swarm.GetAgent(agentName)
+			if err != nil {
+				return
+			}
 			agentState.SetStatus(StatusWorking)
 			p.swarm.Emit(Event{Kind: EventAgentStart, Agent: agentName, Detail: "started"})
 			if agentRunner == nil {
@@ -138,18 +142,17 @@ func (p *SwarmProcess) Start(ctx context.Context) (string, error) {
 		}(name, runner)
 	}
 
-	workersDone := make(chan struct{}, 1)
-	go func() {
-		wg.Wait()
-		workersDone <- struct{}{}
-	}()
-	select {
-	case <-workersDone:
-	case <-runCtx.Done():
-		p.mu.Lock()
-		p.err = runCtx.Err()
-		p.mu.Unlock()
-		return "", runCtx.Err()
+	finishedWorkers := 0
+	for finishedWorkers < len(runners) {
+		select {
+		case <-workersDone:
+			finishedWorkers++
+		case <-runCtx.Done():
+			p.mu.Lock()
+			p.err = runCtx.Err()
+			p.mu.Unlock()
+			return "", runCtx.Err()
+		}
 	}
 
 	p.swarm.Emit(Event{Kind: EventComplete, Detail: "all agents finished"})

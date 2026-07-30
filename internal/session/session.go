@@ -23,6 +23,7 @@ type Session struct {
 	Model     string             `json:"model"`
 	Agent     string             `json:"agent"`
 	Parent    string             `json:"parent,omitempty"`
+	Category  string             `json:"category,omitempty"`
 	Favorite  bool               `json:"favorite,omitempty"`
 	Created   time.Time          `json:"created"`
 	Updated   time.Time          `json:"updated"`
@@ -54,6 +55,7 @@ type Meta struct {
 	Cwd      string    `json:"cwd"`
 	Model    string    `json:"model"`
 	Parent   string    `json:"parent,omitempty"`
+	Category string    `json:"category,omitempty"`
 	Favorite bool      `json:"favorite,omitempty"`
 	Messages int       `json:"messages"`
 	Created  time.Time `json:"created"`
@@ -137,8 +139,18 @@ func (s *Store) Load(id string) (*Session, error) {
 	return &sess, nil
 }
 
-// Delete removes a session file.
-func (s *Store) Delete(id string) error { return os.Remove(s.path(id)) }
+// Delete removes a session file and its lightweight metadata companion.
+func (s *Store) Delete(id string) error {
+	sessionErr := os.Remove(s.path(id))
+	if sessionErr != nil && !os.IsNotExist(sessionErr) {
+		return sessionErr
+	}
+	metaErr := os.Remove(s.metaPath(id))
+	if metaErr != nil && !os.IsNotExist(metaErr) {
+		return metaErr
+	}
+	return nil
+}
 
 // List returns session metadata, newest first, optionally filtered by cwd.
 func (s *Store) List(cwd string) ([]Meta, error) {
@@ -195,18 +207,123 @@ func (s *Store) listLegacy(cwd string, known map[string]struct{}, entries []os.D
 		if _, ok := known[id]; ok {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
-		if err != nil {
+		meta, err := legacyMetaFromFile(filepath.Join(s.dir, e.Name()))
+		if err != nil || (cwd != "" && meta.Cwd != cwd) {
 			continue
 		}
-		var sess Session
-		if json.Unmarshal(data, &sess) != nil || (cwd != "" && sess.Cwd != cwd) {
-			continue
+		if meta.ID == "" {
+			meta.ID = id
 		}
-		out = append(out, metaFrom(&sess))
+		if meta.Created.IsZero() {
+			meta.Created = meta.Updated
+		}
+		if meta.Updated.IsZero() {
+			if info, statErr := e.Info(); statErr == nil {
+				meta.Updated = info.ModTime()
+				if meta.Created.IsZero() {
+					meta.Created = meta.Updated
+				}
+			}
+		}
+		out = append(out, meta)
 	}
 	return out
 }
+func legacyMetaFromFile(path string) (Meta, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	start, err := decoder.Token()
+	if err != nil {
+		return Meta{}, err
+	}
+	if delim, ok := start.(json.Delim); !ok || delim != '{' {
+		return Meta{}, fmt.Errorf("session file is not a JSON object")
+	}
+	var meta Meta
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return Meta{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return Meta{}, fmt.Errorf("session field name is not a string")
+		}
+		switch key {
+		case "id":
+			err = decoder.Decode(&meta.ID)
+		case "title":
+			err = decoder.Decode(&meta.Title)
+		case "cwd":
+			err = decoder.Decode(&meta.Cwd)
+		case "model":
+			err = decoder.Decode(&meta.Model)
+		case "parent":
+			err = decoder.Decode(&meta.Parent)
+		case "category":
+			err = decoder.Decode(&meta.Category)
+		case "favorite":
+			err = decoder.Decode(&meta.Favorite)
+		case "created":
+			err = decoder.Decode(&meta.Created)
+		case "updated":
+			err = decoder.Decode(&meta.Updated)
+		case "messages":
+			meta.Messages, err = skipJSONValue(decoder)
+		default:
+			_, err = skipJSONValue(decoder)
+		}
+		if err != nil {
+			return Meta{}, err
+		}
+	}
+	_, err = decoder.Token()
+	return meta, err
+}
+
+// skipJSONValue consumes one JSON value without materializing it. It returns
+// the number of elements when the value is an array, which lets legacy session
+// listings retain their message count without loading message bodies.
+func skipJSONValue(decoder *json.Decoder) (int, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return 0, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return 0, nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return 0, err
+			}
+			if _, err := skipJSONValue(decoder); err != nil {
+				return 0, err
+			}
+		}
+		_, err := decoder.Token()
+		return 0, err
+	case '[':
+		count := 0
+		for decoder.More() {
+			if _, err := skipJSONValue(decoder); err != nil {
+				return 0, err
+			}
+			count++
+		}
+		_, err := decoder.Token()
+		return count, err
+	default:
+		return 0, nil
+	}
+}
+
 func (s *Store) SetCurrent(cwd, id string) error {
 	m, _ := s.currentMap()
 	if m == nil {
@@ -341,10 +458,22 @@ func (s *Store) SetFavorite(id string, fav bool) error {
 	sess.Favorite = fav
 	return s.Save(sess)
 }
+
+// SetCategory assigns a human-readable category to a session. An empty
+// category intentionally means uncategorized.
+func (s *Store) SetCategory(id, category string) error {
+	sess, err := s.Load(id)
+	if err != nil {
+		return err
+	}
+	sess.Category = strings.TrimSpace(category)
+	return s.Save(sess)
+}
+
 func metaFrom(s *Session) Meta {
 	return Meta{
 		ID: s.ID, Title: s.Title, Cwd: s.Cwd, Model: s.Model,
-		Parent: s.Parent, Messages: len(s.Messages), Created: s.Created, Updated: s.Updated,
+		Parent: s.Parent, Category: s.Category, Messages: len(s.Messages), Created: s.Created, Updated: s.Updated,
 		Favorite: s.Favorite,
 	}
 }

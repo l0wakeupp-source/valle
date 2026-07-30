@@ -18,8 +18,14 @@ var (
 )
 
 type photoTickMsg struct{}
-type photoDrawnMsg struct{ box photoKey }
-type photoClearedMsg struct{ box photoKey }
+type photoDrawnMsg struct {
+	box        photoKey
+	generation uint64
+}
+type photoClearedMsg struct {
+	box        photoKey
+	generation uint64
+}
 
 func photoTick() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return photoTickMsg{} })
@@ -28,20 +34,26 @@ func photoTick() tea.Cmd {
 func (m *Model) syncPhoto() tea.Cmd {
 	box := m.photoBox
 	drawn := m.photoDrawn
-	width := m.width
-	row := m.photoRow
-	if box == drawn {
+	if box == drawn && m.photoPending == (photoKey{}) {
 		return nil
 	}
+	if box == m.photoPending {
+		return nil
+	}
+	m.photoPending = box
+	m.photoGeneration++
+	generation := m.photoGeneration
 	if box == (photoKey{}) {
 		return func() tea.Msg {
 			clearPhoto(os.Stdout, drawn)
-			return photoClearedMsg{box: drawn}
+			return photoClearedMsg{box: drawn, generation: generation}
 		}
 	}
+	width := m.width
+	row := m.photoRow
 	return func() tea.Msg {
 		drawPhoto(os.Stdout, box, width, row)
-		return photoDrawnMsg{box: box}
+		return photoDrawnMsg{box: box, generation: generation}
 	}
 }
 

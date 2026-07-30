@@ -83,12 +83,10 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		b.WriteString("  " + s.Base.Render(padRight(r[0], 22)) +
 			s.Faint.Render(r[1]) + "\n")
 	}
-	if m.deps.Loaded.TUI.Mouse {
-		b.WriteString("\n" + s.Accent.Render("mouse") + "\n")
-		b.WriteString("  " + s.Base.Render(padRight("scroll wheel", 22)) + s.Faint.Render("scroll the transcript") + "\n")
-		b.WriteString("  " + s.Base.Render(padRight("click tool line", 22)) + s.Faint.Render("expand / collapse tool output") + "\n")
-		b.WriteString("  " + s.Base.Render(padRight("double-click path", 22)) + s.Faint.Render("copy file path to clipboard") + "\n")
-	}
+	b.WriteString("\n" + s.Accent.Render("mouse") + "\n")
+	b.WriteString("  " + s.Base.Render(padRight("scroll wheel", 22)) + s.Faint.Render("scroll the transcript") + "\n")
+	b.WriteString("  " + s.Base.Render(padRight("click tool line", 22)) + s.Faint.Render("expand / collapse tool output") + "\n")
+	b.WriteString("  " + s.Base.Render(padRight("double-click path", 22)) + s.Faint.Render("copy file path to clipboard") + "\n")
 
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: strings.TrimRight(b.String(), "\n"), Time: time.Now()})
 	return m, nil
@@ -103,7 +101,7 @@ func (m *Model) cmdConfig() (tea.Model, tea.Cmd) {
 	row := func(k, v string) {
 		b.WriteString("  " + s.Faint.Render(padRight(k, 16)) + s.Base.Render(v) + "\n")
 	}
-	row("model", m.modelID)
+	row("model", m.displayModel())
 	row("agent", m.agentName)
 	row("theme", m.themeName)
 	row("cwd", prettyPath(m.deps.Cwd))

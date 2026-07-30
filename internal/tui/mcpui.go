@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"rick/internal/config"
+	"rick/internal/provider"
 	"rick/internal/provider/catalog"
 )
 
@@ -125,17 +126,25 @@ func (m *Model) cmdRefreshModelList() (tea.Model, tea.Cmd) {
 			if cred.BaseURL == "" {
 				continue
 			}
-			res := catalog.Probe(context.Background(), cred.BaseURL, cred.APIKey)
+			res := catalog.Probe(context.Background(), cred.BaseURL, creds.CurrentKey(id))
 			if res.Err != nil || len(res.Models) == 0 {
+				continue
+			}
+			models := catalog.FilterChatModels(res.Models)
+			if len(models) == 0 {
 				continue
 			}
 			cred.Models = nil
 			cred.ContextWindows = map[string]int{}
+			cred.ContextSources = map[string]provider.ContextSource{}
 			cred.VisionModels = nil
-			for _, mm := range res.Models {
+			for _, mm := range models {
 				cred.Models = append(cred.Models, mm.ID)
 				if mm.Context > 0 {
 					cred.ContextWindows[mm.ID] = mm.Context
+				}
+				if mm.ContextSource != provider.ContextSourceUnknown {
+					cred.ContextSources[mm.ID] = mm.ContextSource
 				}
 				if mm.SupportsImages {
 					cred.VisionModels = append(cred.VisionModels, mm.ID)

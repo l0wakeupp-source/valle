@@ -57,7 +57,7 @@ func (m *Model) splash() string {
 		m.photoBox = photoKey{}
 		return left
 	}
-	out := joinSplash(left, art, m.contentWidth(), m.viewport.Height)
+	out, artTop := joinSplash(left, art, m.contentWidth(), m.viewport.Height)
 	m.photoRow = artTop
 	return out
 }
@@ -161,12 +161,8 @@ type photoKey struct {
 
 // joinSplash places the art to the right of the text, each block centred
 // vertically within the available height.
-// artTop is the row within the joined splash where the art block starts.
-// joinSplash is a free function, so it reports the offset this way rather
-// than threading a pointer through for one integer.
-var artTop int
-
-func joinSplash(left string, art []string, width, height int) string {
+// joinSplash returns the composed splash and the image's top row.
+func joinSplash(left string, art []string, width, height int) (string, int) {
 	leftLines := strings.Split(left, "\n")
 	artW := 0
 	for _, l := range art {
@@ -175,7 +171,7 @@ func joinSplash(left string, art []string, width, height int) string {
 		}
 	}
 	if width-artW-3 < 1 {
-		return left
+		return left, 0
 	}
 
 	// Centre the shorter block against the taller one.
@@ -188,7 +184,6 @@ func joinSplash(left string, art []string, width, height int) string {
 	}
 	lPad := (rows - len(leftLines)) / 2
 	aPad := (rows - len(art)) / 2
-	artTop = aPad
 
 	// The art starts at a fixed column so its right edge lands inside the
 	// terminal regardless of how long each text line happens to be.
@@ -219,7 +214,7 @@ func joinSplash(left string, art []string, width, height int) string {
 		}
 		b.WriteString(lt + strings.Repeat(" ", gap) + rt + "\n")
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return strings.TrimRight(b.String(), "\n"), aPad
 }
 
 // splashText renders the left-hand block: logo, tagline, context and tip.
@@ -263,7 +258,7 @@ func (m *Model) splashText(w int) string {
 	}
 	ctx := []string{
 		label("", m.deps.Version),
-		label("model", shortModel(m.modelID)),
+		label("model", m.displayModel()),
 		label("dir", prettyPath(m.deps.Cwd)),
 	}
 	if br := cachedGitBranch(m.deps.Cwd); br != "" {
@@ -592,7 +587,7 @@ func (m *Model) statusBar() string {
 	case m.running:
 		left = s.Muted.Render(m.spinnerFrame()+" working") + s.Faint.Render("  esc to interrupt")
 	default:
-		segs := []string{shortModel(m.modelID), prettyPath(m.deps.Cwd)}
+		segs := []string{m.displayModel(), prettyPath(m.deps.Cwd)}
 		if br := cachedGitBranch(m.deps.Cwd); br != "" {
 			segs = append(segs, br)
 		}

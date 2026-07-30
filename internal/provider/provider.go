@@ -143,13 +143,30 @@ type Event struct {
 	Err        error
 }
 
+// ContextSource describes where a model context window came from.
+type ContextSource string
+
+const (
+	ContextSourceUnknown  ContextSource = ""
+	ContextSourceAPI      ContextSource = "api"
+	ContextSourceCatalog  ContextSource = "catalog"
+	ContextSourceInferred ContextSource = "inferred"
+	ContextSourceBuiltin  ContextSource = "builtin"
+)
+
 // ModelInfo is a model advertised by a provider.
 type ModelInfo struct {
 	ID             string
 	Name           string
 	ContextWindow  int
+	ContextSource  ContextSource
 	MaxOutput      int
 	SupportsImages bool
+	// CapabilitiesKnown is true when the provider gave explicit modality/task
+	// metadata. When false, ChatCapable is only a hint and the model id is used
+	// as a conservative fallback for non-chat model families.
+	CapabilitiesKnown bool
+	ChatCapable       bool
 }
 
 // Provider is the single abstraction every backend implements.

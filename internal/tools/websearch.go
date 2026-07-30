@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -53,16 +54,35 @@ var (
 )
 
 // waitHostGap blocks until at least d has elapsed since the last call to host.
-func waitHostGap(host string, d time.Duration) {
+// Waiting is cancellation-aware so a stopped agent is not held by rate limiting.
+func waitHostGap(ctx context.Context, host string, d time.Duration) error {
 	hostMu.Lock()
-	last := hostLastCall[host]
-	hostMu.Unlock()
-	if elapsed := time.Since(last); elapsed < d {
-		time.Sleep(d - elapsed)
+	now := time.Now()
+	previous := hostLastCall[host]
+	allowedAt := previous.Add(d)
+	if allowedAt.Before(now) {
+		allowedAt = now
 	}
-	hostMu.Lock()
-	hostLastCall[host] = time.Now()
+	hostLastCall[host] = allowedAt
+	wait := time.Until(allowedAt)
 	hostMu.Unlock()
+
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		hostMu.Lock()
+		if hostLastCall[host].Equal(allowedAt) {
+			hostLastCall[host] = previous
+		}
+		hostMu.Unlock()
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // --- LRU cache ---
@@ -96,21 +116,20 @@ var (
 const maxSearchResponseBytes = 4 << 20
 
 func cacheGet(provider string, query string, maxResults int) ([]searchResult, bool) {
-	cacheMu.RLock()
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
 	elem, ok := cacheMap[cacheKey{provider, query, maxResults}]
-	cacheMu.RUnlock()
 	if !ok {
 		return nil, false
 	}
 	entry := elem.Value.(*cacheEntry)
 	if time.Now().After(entry.expiresAt) {
-		cacheMu.Lock()
 		delete(cacheMap, cacheKey{provider, query, maxResults})
 		cacheLRU.Remove(elem)
-		cacheMu.Unlock()
 		return nil, false
 	}
-	return entry.results, true
+	cacheLRU.MoveToFront(elem)
+	return append([]searchResult(nil), entry.results...), true
 }
 
 func cachePut(provider, query string, maxResults int, results []searchResult, ttl time.Duration) {
@@ -119,8 +138,9 @@ func cachePut(provider, query string, maxResults int, results []searchResult, tt
 	key := cacheKey{provider, query, maxResults}
 	if elem, ok := cacheMap[key]; ok {
 		cacheLRU.MoveToFront(elem)
-		elem.Value.(*cacheEntry).results = results
-		elem.Value.(*cacheEntry).expiresAt = time.Now().Add(ttl)
+		entry := elem.Value.(*cacheEntry)
+		entry.results = append([]searchResult(nil), results...)
+		entry.expiresAt = time.Now().Add(ttl)
 		return
 	}
 	if cacheLRU.Len() >= cacheMaxLen {
@@ -131,22 +151,24 @@ func cachePut(provider, query string, maxResults int, results []searchResult, tt
 			delete(cacheMap, evictKey)
 		}
 	}
-	elem := cacheLRU.PushFront(&cacheEntry{results: results, expiresAt: time.Now().Add(ttl), key: key})
+	elem := cacheLRU.PushFront(&cacheEntry{results: append([]searchResult(nil), results...), expiresAt: time.Now().Add(ttl), key: key})
 	cacheMap[key] = elem
 }
 
 // --- SearXNG instance tracking ---
 
 type searxInstance struct {
-	URL         string
-	ConsecFails int
-	Disabled    bool
+	URL           string
+	ConsecFails   int
+	Disabled      bool
+	DisabledUntil time.Time
 }
 
 var (
 	searxMu        sync.Mutex
 	searxInstances []*searxInstance
 	searxLogged    bool
+	searxCursor    int
 )
 
 func loadSearxInstances() []*searxInstance {
@@ -171,10 +193,23 @@ func getSearxInstance() *searxInstance {
 	if searxInstances == nil {
 		searxInstances = loadSearxInstances()
 	}
-	for _, si := range searxInstances {
+	now := time.Now()
+	for i := 0; i < len(searxInstances); i++ {
+		idx := (searxCursor + i) % len(searxInstances)
+		si := searxInstances[idx]
+		if si.Disabled && !si.DisabledUntil.IsZero() && now.After(si.DisabledUntil) {
+			si.Disabled = false
+			si.ConsecFails = 0
+			si.DisabledUntil = time.Time{}
+		}
 		if !si.Disabled {
+			searxCursor = (idx + 1) % len(searxInstances)
 			return si
 		}
+	}
+	if !searxLogged {
+		fmt.Fprintln(os.Stderr, "websearch: all SearXNG instances exhausted, falling back to DDG Instant")
+		searxLogged = true
 	}
 	return nil
 }
@@ -182,11 +217,24 @@ func getSearxInstance() *searxInstance {
 func disableSearxInstance(si *searxInstance) {
 	searxMu.Lock()
 	si.Disabled = true
+	si.DisabledUntil = time.Now().Add(30 * time.Second)
 	searxMu.Unlock()
-	if !searxLogged {
-		fmt.Fprintf(os.Stderr, "websearch: all SearXNG instances exhausted, falling back to DDG Instant\n")
-		searxLogged = true
+}
+
+func markSearxFailure(si *searxInstance) {
+	searxMu.Lock()
+	si.ConsecFails++
+	exhausted := si.ConsecFails >= 2
+	searxMu.Unlock()
+	if exhausted {
+		disableSearxInstance(si)
 	}
+}
+
+func markSearxSuccess(si *searxInstance) {
+	searxMu.Lock()
+	si.ConsecFails = 0
+	searxMu.Unlock()
 }
 
 // --- per-session budget ---
@@ -210,6 +258,16 @@ func checkBudget(sessionID string, max int) (bool, int) {
 func resetBudget(sessionID string) {
 	budgetMu.Lock()
 	delete(budgetCount, sessionID)
+	budgetMu.Unlock()
+}
+
+func releaseBudget(sessionID string) {
+	budgetMu.Lock()
+	if count := budgetCount[sessionID]; count <= 1 {
+		delete(budgetCount, sessionID)
+	} else {
+		budgetCount[sessionID] = count - 1
+	}
 	budgetMu.Unlock()
 }
 
@@ -300,18 +358,30 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 		{"ddginstant", duckDuckGoInstant},
 	}
 
+	searchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	filteredOut := false
+	var lastErr error
 	for _, p := range providers {
 		if cached, ok := cacheGet(p.name, a.Query, a.MaxResults); ok {
 			original := len(cached)
 			filtered := filterResults(cached, t.Restrictions)
 			if len(filtered) == 0 {
-				return Errf("all search results were filtered out by domain restrictions for query: %s", a.Query), nil
+				filteredOut = true
+				continue
 			}
 			return formatResultsFiltered(a.Query, filtered, original, t.Restrictions), nil
 		}
 
-		results, err := t.tryWithRetry(ctx, p.fn, a.Query, a.MaxResults)
-		if err == nil && len(results) > 0 {
+		results, err := t.tryWithRetry(searchCtx, p.fn, a.Query, a.MaxResults)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %w", p.name, err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Errf("web search canceled: %v", err), nil
+			}
+			continue
+		}
+		if len(results) > 0 {
 			ttl, ok := cacheTTL[p.name]
 			if !ok {
 				ttl = 300 * time.Second
@@ -321,7 +391,8 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 			original := len(results)
 			results = filterResults(results, t.Restrictions)
 			if len(results) == 0 {
-				return Errf("all search results were filtered out by domain restrictions for query: %s", a.Query), nil
+				filteredOut = true
+				continue
 			}
 			res := formatResultsFiltered(a.Query, results, original, t.Restrictions)
 			if n >= 3 {
@@ -331,6 +402,12 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 		}
 	}
 
+	if filteredOut {
+		return Errf("all search results were filtered out by domain restrictions for query: %s", a.Query), nil
+	}
+	if lastErr != nil {
+		return Errf("all web search providers failed for query: %s (last error: %v)", a.Query, lastErr), nil
+	}
 	return Errf("all web search providers failed for query: %s (try rephrasing or searching again later)", a.Query), nil
 }
 
@@ -339,16 +416,33 @@ func (t WebSearchTool) tryWithRetry(ctx context.Context, fn func(context.Context
 	if err == nil {
 		return results, nil
 	}
-	if strings.Contains(err.Error(), "HTTP 429") || strings.Contains(err.Error(), "429") {
-		base := 2 * time.Second
-		jitter := time.Duration(rand.Int63n(int64(1 * time.Second)))
-		time.Sleep(base + jitter)
-		results, err = fn(ctx, query, maxResults)
-		if err == nil {
-			return results, nil
+	if !retryableSearchError(err) {
+		return nil, err
+	}
+
+	base := 500 * time.Millisecond
+	jitter := time.Duration(rand.Int63n(int64(500 * time.Millisecond)))
+	timer := time.NewTimer(base + jitter)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+	return fn(ctx, query, maxResults)
+}
+
+func retryableSearchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"429", "408", "500", "502", "503", "504", "timeout", "temporarily", "connection reset", "eof"} {
+		if strings.Contains(message, marker) {
+			return true
 		}
 	}
-	return nil, err
+	return false
 }
 
 // filterResults removes results whose domain does not match the allow list
@@ -434,7 +528,9 @@ func formatResultsFiltered(query string, results []searchResult, original int, c
 // --- provider implementations ---
 
 func bingSearch(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
-	waitHostGap("www.bing.com", 2*time.Second)
+	if err := waitHostGap(ctx, "www.bing.com", 2*time.Second); err != nil {
+		return nil, err
+	}
 	u := "https://www.bing.com/search?q=" + url.QueryEscape(query) + "&setlang=en"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -508,7 +604,9 @@ func decodeBingURL(rawURL string) string {
 }
 
 func duckDuckGoLite(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
-	waitHostGap("lite.duckduckgo.com", 2*time.Second)
+	if err := waitHostGap(ctx, "lite.duckduckgo.com", 2*time.Second); err != nil {
+		return nil, err
+	}
 	u := "https://lite.duckduckgo.com/lite/?q=" + url.QueryEscape(query)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -575,7 +673,9 @@ func duckDuckGoLite(ctx context.Context, query string, maxResults int) ([]search
 }
 
 func braveSearch(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
-	waitHostGap("search.brave.com", 2*time.Second)
+	if err := waitHostGap(ctx, "search.brave.com", 2*time.Second); err != nil {
+		return nil, err
+	}
 	u := "https://search.brave.com/search?q=" + url.QueryEscape(query) + "&source=web"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -650,7 +750,9 @@ func searXNGSearch(ctx context.Context, query string, maxResults int) ([]searchR
 		return nil, fmt.Errorf("all SearXNG instances failed")
 	}
 
-	waitHostGap(inst.URL, 2*time.Second)
+	if err := waitHostGap(ctx, inst.URL, 2*time.Second); err != nil {
+		return nil, err
+	}
 	u := inst.URL + "/search?q=" + url.QueryEscape(query) + "&format=json&language=en"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -665,28 +767,22 @@ func searXNGSearch(ctx context.Context, query string, maxResults int) ([]searchR
 	req = req.WithContext(searchCtx)
 	resp, err := webSearchClient.Do(req)
 	if err != nil {
-		inst.ConsecFails++
-		if inst.ConsecFails >= 2 {
-			disableSearxInstance(inst)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			markSearxFailure(inst)
 		}
 		return nil, err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode == 429 {
 		resp.Body.Close()
-		inst.ConsecFails++
-		if inst.ConsecFails >= 2 {
-			disableSearxInstance(inst)
-		}
+		markSearxFailure(inst)
 		return nil, fmt.Errorf("searxng: HTTP 429 rate limited")
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		inst.ConsecFails++
-		if inst.ConsecFails >= 2 {
-			disableSearxInstance(inst)
-		}
+		markSearxFailure(inst)
 		return nil, fmt.Errorf("searxng: HTTP %d", resp.StatusCode)
 	}
 
@@ -698,18 +794,19 @@ func searXNGSearch(ctx context.Context, query string, maxResults int) ([]searchR
 		} `json:"results"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		resp.Body.Close()
-		inst.ConsecFails++
-		if inst.ConsecFails >= 2 {
-			disableSearxInstance(inst)
-		}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchResponseBytes+1))
+	if err != nil {
+		markSearxFailure(inst)
 		return nil, err
 	}
-	resp.Body.Close()
-
-	// Reset consecutive fails on success.
-	inst.ConsecFails = 0
+	if len(body) > maxSearchResponseBytes {
+		markSearxFailure(inst)
+		return nil, fmt.Errorf("searxng: response exceeds %d bytes", maxSearchResponseBytes)
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		markSearxFailure(inst)
+		return nil, err
+	}
 
 	var results []searchResult
 	for _, r := range data.Results {
@@ -726,14 +823,18 @@ func searXNGSearch(ctx context.Context, query string, maxResults int) ([]searchR
 	}
 
 	if len(results) > 0 {
+		markSearxSuccess(inst)
 		return results, nil
 	}
 
+	markSearxFailure(inst)
 	return nil, fmt.Errorf("searxng: no results")
 }
 
 func duckDuckGoInstant(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
-	waitHostGap("api.duckduckgo.com", 2*time.Second)
+	if err := waitHostGap(ctx, "api.duckduckgo.com", 2*time.Second); err != nil {
+		return nil, err
+	}
 	u := "https://api.duckduckgo.com/?q=" + url.QueryEscape(query) + "&format=json&no_html=1&skip_disambig=1"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -773,7 +874,14 @@ func duckDuckGoInstant(ctx context.Context, query string, maxResults int) ([]sea
 		Heading string `json:"Heading"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxSearchResponseBytes {
+		return nil, fmt.Errorf("ddginstant: response exceeds %d bytes", maxSearchResponseBytes)
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, err
 	}
 

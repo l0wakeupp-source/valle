@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,12 +22,15 @@ import (
 
 // Model is one model advertised by a live endpoint.
 type Model struct {
-	ID              string
-	Name            string
-	Context         int
-	Free            bool // zero-cost / free-tier model (id ends with :free)
-	SupportsImages  bool
-	ModalitiesKnown bool
+	ID                string
+	Name              string
+	Context           int
+	ContextSource     provider.ContextSource
+	Free              bool // zero-cost / free-tier model (id ends with :free)
+	SupportsImages    bool
+	ModalitiesKnown   bool
+	CapabilitiesKnown bool
+	ChatCapable       bool
 }
 
 // attemptRec records one probe attempt so the best error can be chosen.
@@ -283,21 +287,39 @@ const (
 //	[{"id":…}]                            bare arrays
 func ParseModels(body []byte) ([]Model, payloadShape, error) {
 	type rawModel struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		Model         string `json:"model"`
-		DisplayName   string `json:"display_name"`
-		Type          string `json:"type"`
-		Object        string `json:"object"`
-		ContextLength int    `json:"context_length"`
-		ContextWindow int    `json:"context_window"`
-		MaxTokens     int    `json:"max_input_tokens"`
+		ID            string          `json:"id"`
+		Name          string          `json:"name"`
+		Model         string          `json:"model"`
+		DisplayName   string          `json:"display_name"`
+		Type          string          `json:"type"`
+		Object        string          `json:"object"`
+		ContextLength json.RawMessage `json:"context_length"`
+		ContextWindow json.RawMessage `json:"context_window"`
+		MaxTokens     json.RawMessage `json:"max_input_tokens"`
+		MaxContext    json.RawMessage `json:"max_context_tokens"`
+		MaxModelLen   json.RawMessage `json:"max_model_len"`
+		InputLimit    json.RawMessage `json:"input_token_limit"`
 		TopProvider   struct {
-			ContextLength int `json:"context_length"`
+			ContextLength  json.RawMessage `json:"context_length"`
+			MaxInputTokens json.RawMessage `json:"max_input_tokens"`
 		} `json:"top_provider"`
+		Limits struct {
+			Context        json.RawMessage `json:"context"`
+			MaxInputTokens json.RawMessage `json:"max_input_tokens"`
+		} `json:"limits"`
+		Limit struct {
+			Context        json.RawMessage `json:"context"`
+			MaxInputTokens json.RawMessage `json:"max_input_tokens"`
+		} `json:"limit"`
 		Architecture struct {
-			InputModalities []string `json:"input_modalities"`
+			InputModalities  []string `json:"input_modalities"`
+			OutputModalities []string `json:"output_modalities"`
+			Modality         string   `json:"modality"`
 		} `json:"architecture"`
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+		Modality         string   `json:"modality"`
+		Task             string   `json:"task"`
 	}
 
 	var envelope struct {
@@ -343,26 +365,52 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 			continue
 		}
 		name := FirstNonEmpty(m.DisplayName, m.Name, id)
-		ctxLen := m.ContextLength
-		for _, alt := range []int{m.ContextWindow, m.TopProvider.ContextLength, m.MaxTokens} {
-			if ctxLen == 0 {
-				ctxLen = alt
-			}
+		ctxLen := firstPositiveModelInt(
+			m.ContextLength, m.ContextWindow, m.TopProvider.ContextLength,
+			m.MaxContext, m.MaxModelLen, m.InputLimit, m.MaxTokens,
+			m.TopProvider.MaxInputTokens, m.Limits.Context, m.Limits.MaxInputTokens,
+			m.Limit.Context, m.Limit.MaxInputTokens,
+		)
+		contextSource := provider.ContextSourceUnknown
+		if ctxLen > 0 {
+			contextSource = provider.ContextSourceAPI
 		}
 		if ctxLen == 0 {
 			ctxLen = provider.KnownContextWindow(id)
+			if ctxLen > 0 {
+				contextSource = provider.ContextSourceInferred
+			}
 		}
-		free := strings.HasSuffix(id, ":free")
+		free := isFreeModelID(id)
+		inputModalities := append([]string(nil), m.InputModalities...)
+		inputModalities = append(inputModalities, m.Architecture.InputModalities...)
+		outputModalities := append([]string(nil), m.OutputModalities...)
+		outputModalities = append(outputModalities, m.Architecture.OutputModalities...)
+		modality := catalogFirstNonEmpty(m.Modality, m.Architecture.Modality)
+		if modality != "" {
+			parts := strings.SplitN(strings.ToLower(modality), "->", 2)
+			if len(inputModalities) == 0 {
+				inputModalities = splitModalities(parts[0])
+			}
+			if len(outputModalities) == 0 && len(parts) == 2 {
+				outputModalities = splitModalities(parts[1])
+			}
+		}
 		supportsImages := false
-		for _, modality := range m.Architecture.InputModalities {
+		for _, modality := range inputModalities {
 			if modality == "image" {
 				supportsImages = true
 				break
 			}
 		}
+		explicitTask := strings.TrimSpace(m.Task) != "" || (strings.TrimSpace(m.Type) != "" && strings.TrimSpace(m.Type) != "model")
+		capabilitiesKnown := len(inputModalities) > 0 || len(outputModalities) > 0 || explicitTask
+		chatCapable := modelHasTextCapability(inputModalities, outputModalities) &&
+			!looksLikeNonChatTask(m.Task, m.Type, modality)
 		out = append(out, Model{
-			ID: id, Name: name, Context: ctxLen, Free: free,
-			SupportsImages: supportsImages, ModalitiesKnown: len(m.Architecture.InputModalities) > 0,
+			ID: id, Name: name, Context: ctxLen, ContextSource: contextSource, Free: free,
+			SupportsImages: supportsImages, ModalitiesKnown: len(inputModalities) > 0 || len(outputModalities) > 0,
+			CapabilitiesKnown: capabilitiesKnown, ChatCapable: chatCapable,
 		})
 	}
 	if len(out) == 0 {
@@ -370,6 +418,88 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, shape, nil
+}
+
+func isFreeModelID(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	return id == "big-pickle" || strings.HasSuffix(id, ":free") || strings.HasSuffix(id, "-free")
+}
+
+// firstPositiveModelInt returns the first usable context limit. Context fields
+// are intentionally ordered from the most specific provider value to generic
+// compatibility aliases; max_tokens is not accepted because it is an output
+// limit, not a context window.
+func firstPositiveModelInt(values ...json.RawMessage) int {
+	for _, raw := range values {
+		if n := parseModelInt(raw); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func parseModelInt(raw json.RawMessage) int {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return 0
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var quoted string
+		if json.Unmarshal(raw, &quoted) != nil {
+			return 0
+		}
+		s = strings.TrimSpace(quoted)
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+		return int(n)
+	}
+	if n, err := strconv.ParseFloat(s, 64); err == nil && n > 0 {
+		return int(n)
+	}
+	return 0
+}
+
+func catalogFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func splitModalities(value string) []string {
+	value = strings.NewReplacer("+", " ", ",", " ", "|", " ").Replace(value)
+	return strings.Fields(strings.ToLower(value))
+}
+
+func modelHasTextCapability(input, output []string) bool {
+	if len(input) > 0 && !containsModality(input, "text") {
+		return false
+	}
+	if len(output) > 0 && !containsModality(output, "text") {
+		return false
+	}
+	return true
+}
+
+func containsModality(values []string, wanted string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeNonChatTask(values ...string) bool {
+	joined := strings.ToLower(strings.Join(values, " "))
+	for _, marker := range []string{"embedding", "rerank", "moderation", "text-to-speech", "tts", "transcri", "whisper", "speech", "audio", "image-generation", "image-edit", "video", "music"} {
+		if strings.Contains(joined, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // FirstNonEmpty returns the first value that is not blank.

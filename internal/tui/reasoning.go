@@ -22,13 +22,13 @@ func (m *Model) cmdReasoning(args string) (tea.Model, tea.Cmd) {
 
 	if m.reasoningStyle == provider.ReasoningStyleNone {
 		m.appendMsg(ChatMsg{Kind: MsgSystem,
-			Text: shortModel(m.modelID) + " is not a reasoning model — nothing to set",
+			Text: m.displayModel() + " is not a reasoning model — nothing to set",
 			Time: time.Now()})
 		return m, nil
 	}
 	if m.reasoningStyle == provider.ReasoningStyleAlways {
 		m.appendMsg(ChatMsg{Kind: MsgSystem,
-			Text: shortModel(m.modelID) + " always reasons; the level cannot be changed",
+			Text: m.displayModel() + " always reasons; the level cannot be changed",
 			Time: time.Now()})
 		return m, nil
 	}

@@ -84,6 +84,7 @@ type swarmCompleteMsg struct {
 type swarmRunPlan struct {
 	ctx         context.Context
 	swarmID     string
+	modelID     string
 	jobs        []swarm.TeamJob
 	tasks       *swarm.TaskBoard
 	concurrency int
@@ -223,7 +224,7 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 		jobs = append(jobs, swarm.TeamJob{Name: spec.Name, TaskID: taskID, Runner: agent.NewAgentRunner(cfg, prompt)})
 	}
 	committed = true
-	return &swarmRunPlan{ctx: s.Ctx, swarmID: id, jobs: jobs, tasks: s.Tasks, concurrency: 4}, nil
+	return &swarmRunPlan{ctx: s.Ctx, swarmID: id, modelID: m.modelID, jobs: jobs, tasks: s.Tasks, concurrency: 4}, nil
 }
 
 func (m *Model) updateManagedAgentStatus(swarmID, agentName string, kind swarm.EventType) {
@@ -250,6 +251,9 @@ func (m *Model) updateManagedAgentStatus(swarmID, agentName string, kind swarm.E
 
 func (m *Model) runSwarmPlan(plan *swarmRunPlan) {
 	results := swarm.RunTaskTeam(plan.ctx, plan.jobs, plan.tasks, plan.concurrency, func(ev swarm.RuntimeEvent) {
+		if aev, ok := ev.Value.(agent.Event); ok && aev.Kind == agent.EvUsage && aev.Usage != nil {
+			m.recordUsageOnly(plan.modelID, *aev.Usage)
+		}
 		m.updateManagedAgentStatus(plan.swarmID, ev.Name, ev.Kind)
 		msg := swarmWorkerMsg{swarmID: plan.swarmID, name: ev.Name, kind: ev.Kind, at: ev.Time}
 		if aev, ok := ev.Value.(agent.Event); ok {

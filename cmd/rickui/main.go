@@ -165,6 +165,9 @@ func build(tmp, themeName string, w, h int) *tui.Model {
 }
 
 func buildWithCredentials(tmp, themeName string, w, h int, creds *config.Credentials) *tui.Model {
+	if creds == nil {
+		creds = &config.Credentials{Providers: map[string]config.Credential{}}
+	}
 	cwd := filepath.Join(tmp, "proj")
 	_ = os.MkdirAll(cwd, 0o755)
 	loaded, _ := config.Load(cwd)
@@ -809,8 +812,9 @@ func testFreshStart(tmp string) {
 			Registry: tools.NewRegistry(), Todos: tools.NewTodoStore(),
 			Perms: permission.New(loaded.Config.Permission, dir),
 			Store: store, Snapshots: snaps,
-			Providers: map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
-			Cwd:       dir, Version: "vtest", ResumeID: resumeID,
+			Credentials: &config.Credentials{Providers: map[string]config.Credential{}},
+			Providers:   map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
+			Cwd:         dir, Version: "vtest", ResumeID: resumeID,
 		}), tea.WindowSizeMsg{Width: 90, Height: 28})
 	}
 
@@ -1661,8 +1665,9 @@ func testModelPersistence(tmp string) {
 			Registry: tools.NewRegistry(), Todos: tools.NewTodoStore(),
 			Perms: permission.New(loaded.Config.Permission, proj),
 			Store: store, Snapshots: snaps,
-			Providers: map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
-			Cwd:       proj, Version: "vtest",
+			Credentials: &config.Credentials{Providers: map[string]config.Credential{}},
+			Providers:   map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
+			Cwd:         proj, Version: "vtest",
 		}), tea.WindowSizeMsg{Width: 100, Height: 30})
 	}
 
@@ -1732,8 +1737,9 @@ func testModelPersistence(tmp string) {
 		Registry: tools.NewRegistry(), Todos: tools.NewTodoStore(),
 		Perms: permission.New(loaded.Config.Permission, proj),
 		Store: store, Snapshots: snaps,
-		Providers: map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
-		Cwd:       proj, Version: "vtest", ResumeID: old.ID,
+		Credentials: &config.Credentials{Providers: map[string]config.Credential{}},
+		Providers:   map[string]provider.Provider{"anthropic": anthropic.New("sk", "")},
+		Cwd:         proj, Version: "vtest", ResumeID: old.ID,
 	}), tea.WindowSizeMsg{Width: 100, Height: 30})
 	if cmd := rm.Init(); cmd != nil {
 		if out := cmd(); out != nil {

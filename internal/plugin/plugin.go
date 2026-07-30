@@ -266,76 +266,96 @@ func (r *Registry) DispatchToolAfter(ctx context.Context, ev *ToolAfterEvent) er
 	return nil
 }
 
-// DispatchSessionIdle runs every idle hook.
-func (r *Registry) DispatchSessionIdle(ctx context.Context, ev *SessionEvent) {
+// dispatchLifecycle runs every lifecycle hook and retains failures so callers
+// can surface them without silently swallowing plugin errors.
+func (r *Registry) dispatchLifecycle(run func(Hooks) error) []error {
+	var errs []error
 	for _, p := range r.activePlugins() {
-		if p.SessionIdle != nil {
-			_ = p.SessionIdle(ctx, ev)
+		if err := run(p); err != nil {
+			errs = append(errs, fmt.Errorf("plugin %q: %w", p.Name, err))
 		}
 	}
+	return errs
+}
+
+// DispatchSessionIdle runs every idle hook.
+func (r *Registry) DispatchSessionIdle(ctx context.Context, ev *SessionEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SessionIdle == nil {
+			return nil
+		}
+		return p.SessionIdle(ctx, ev)
+	})
 }
 
 // DispatchSessionError runs every error hook.
-func (r *Registry) DispatchSessionError(ctx context.Context, ev *SessionEvent) {
-	for _, p := range r.activePlugins() {
-		if p.SessionError != nil {
-			_ = p.SessionError(ctx, ev)
+func (r *Registry) DispatchSessionError(ctx context.Context, ev *SessionEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SessionError == nil {
+			return nil
 		}
-	}
+		return p.SessionError(ctx, ev)
+	})
 }
 
 // DispatchTurnStart runs every turn-start hook.
-func (r *Registry) DispatchTurnStart(ctx context.Context, ev *TurnStartEvent) {
-	for _, p := range r.activePlugins() {
-		if p.TurnStart != nil {
-			_ = p.TurnStart(ctx, ev)
+func (r *Registry) DispatchTurnStart(ctx context.Context, ev *TurnStartEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.TurnStart == nil {
+			return nil
 		}
-	}
+		return p.TurnStart(ctx, ev)
+	})
 }
 
 // DispatchTurnEnd runs every turn-end hook.
-func (r *Registry) DispatchTurnEnd(ctx context.Context, ev *TurnEndEvent) {
-	for _, p := range r.activePlugins() {
-		if p.TurnEnd != nil {
-			_ = p.TurnEnd(ctx, ev)
+func (r *Registry) DispatchTurnEnd(ctx context.Context, ev *TurnEndEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.TurnEnd == nil {
+			return nil
 		}
-	}
+		return p.TurnEnd(ctx, ev)
+	})
 }
 
 // DispatchSubagentStart runs every subagent-start hook.
-func (r *Registry) DispatchSubagentStart(ctx context.Context, ev *SubagentStartEvent) {
-	for _, p := range r.activePlugins() {
-		if p.SubagentStart != nil {
-			_ = p.SubagentStart(ctx, ev)
+func (r *Registry) DispatchSubagentStart(ctx context.Context, ev *SubagentStartEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SubagentStart == nil {
+			return nil
 		}
-	}
+		return p.SubagentStart(ctx, ev)
+	})
 }
 
 // DispatchSubagentEnd runs every subagent-end hook.
-func (r *Registry) DispatchSubagentEnd(ctx context.Context, ev *SubagentEndEvent) {
-	for _, p := range r.activePlugins() {
-		if p.SubagentEnd != nil {
-			_ = p.SubagentEnd(ctx, ev)
+func (r *Registry) DispatchSubagentEnd(ctx context.Context, ev *SubagentEndEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SubagentEnd == nil {
+			return nil
 		}
-	}
+		return p.SubagentEnd(ctx, ev)
+	})
 }
 
 // DispatchSessionStart runs every session-start hook.
-func (r *Registry) DispatchSessionStart(ctx context.Context, ev *SessionStartEvent) {
-	for _, p := range r.activePlugins() {
-		if p.SessionStart != nil {
-			_ = p.SessionStart(ctx, ev)
+func (r *Registry) DispatchSessionStart(ctx context.Context, ev *SessionStartEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SessionStart == nil {
+			return nil
 		}
-	}
+		return p.SessionStart(ctx, ev)
+	})
 }
 
 // DispatchSessionEnd runs every session-end hook.
-func (r *Registry) DispatchSessionEnd(ctx context.Context, ev *SessionEndEvent) {
-	for _, p := range r.activePlugins() {
-		if p.SessionEnd != nil {
-			_ = p.SessionEnd(ctx, ev)
+func (r *Registry) DispatchSessionEnd(ctx context.Context, ev *SessionEndEvent) []error {
+	return r.dispatchLifecycle(func(p Hooks) error {
+		if p.SessionEnd == nil {
+			return nil
 		}
-	}
+		return p.SessionEnd(ctx, ev)
+	})
 }
 
 // knownHookNames enumerates valid hook keys in a manifest.

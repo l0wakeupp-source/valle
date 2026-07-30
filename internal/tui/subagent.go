@@ -8,6 +8,7 @@ import (
 	"rick/internal/agent"
 	"rick/internal/config"
 	"rick/internal/plugin"
+	"rick/internal/provider"
 )
 
 // registerTaskTool wires the subagent spawner into the tool registry.
@@ -100,10 +101,15 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 
 		// Lifecycle hook: subagent start.
 		if m.deps.Plugins != nil && m.deps.Plugins.Len() > 0 {
-			m.deps.Plugins.DispatchSubagentStart(ctx, &plugin.SubagentStartEvent{
+			pluginErrs := m.deps.Plugins.DispatchSubagentStart(ctx, &plugin.SubagentStartEvent{
 				SessionID: m.sessionID(), Agent: m.agentName,
 				SubagentName: kind, Task: description,
 			})
+			for _, pluginErr := range pluginErrs {
+				if p := m.program; p != nil {
+					p.Send(subagentEventMsg{kind: kind, description: description, phase: "error", detail: pluginErr.Error()})
+				}
+			}
 		}
 
 		// /yolo is an explicit request to give child runs the same effective
@@ -134,6 +140,9 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 
 		toolCount := 0
 		out, err := agent.RunSubagent(ctx, cfg, prompt, func(ev agent.Event) {
+			if ev.Kind == agent.EvUsage && ev.Usage != nil {
+				m.recordChildUsage(modelRef, *ev.Usage)
+			}
 			if ev.Kind == agent.EvToolEnd {
 				toolCount++
 				if p := m.program; p != nil && ev.Tool != nil {
@@ -195,7 +204,7 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
 		childCtx, cancel := context.WithCancel(ctx)
-		id, err := m.deps.AgentRegistry.Register(agent.AgentEntry{
+		id, err := m.deps.AgentRegistry.Register(&agent.AgentEntry{
 			Name: kind, ParentID: parentID, Depth: depth, Status: agent.AgentIdle,
 			Description: description, Cancel: cancel,
 		})
@@ -227,6 +236,9 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			defer m.deps.AgentRegistry.ReleaseBackground()
 			toolCount := 0
 			out, runErr := agent.RunSubagent(childCtx, cfg, prompt, func(ev agent.Event) {
+				if ev.Kind == agent.EvUsage && ev.Usage != nil {
+					m.recordChildUsage(modelRef, *ev.Usage)
+				}
 				if ev.Kind == agent.EvToolEnd {
 					toolCount++
 					if p := m.program; p != nil && ev.Tool != nil {
@@ -251,6 +263,10 @@ type subagentResultMsg struct {
 	description string
 	output      string
 	err         error
+}
+
+type childUsageMsg struct {
+	usage provider.Usage
 }
 
 // subagentEventMsg reports child-session progress to the parent UI.

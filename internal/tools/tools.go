@@ -56,9 +56,10 @@ type ToolSet interface {
 
 // Registry holds the active tool set.
 type Registry struct {
-	mu    sync.RWMutex
-	tools map[string]Tool
-	order []string
+	mu     sync.RWMutex
+	tools  map[string]Tool
+	order  []string
+	sorted []string
 }
 
 // Ensure Registry implements ToolSet.
@@ -77,6 +78,8 @@ func (r *Registry) Register(t Tool) {
 		r.order = append(r.order, t.Name())
 	}
 	r.tools[t.Name()] = t
+	r.sorted = append([]string(nil), r.order...)
+	sort.Strings(r.sorted)
 }
 
 // Unregister removes a tool.
@@ -90,6 +93,8 @@ func (r *Registry) Unregister(name string) {
 			break
 		}
 	}
+	r.sorted = append([]string(nil), r.order...)
+	sort.Strings(r.sorted)
 }
 
 // Get returns a tool by name.
@@ -112,8 +117,7 @@ func (r *Registry) Names() []string {
 func (r *Registry) Schemas(enabled func(string) bool) []provider.ToolSchema {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	names := append([]string(nil), r.order...)
-	sort.Strings(names)
+	names := append([]string(nil), r.sorted...)
 	out := make([]provider.ToolSchema, 0, len(names))
 	for _, n := range names {
 		if enabled != nil && !enabled(n) {

@@ -58,10 +58,11 @@ type authState struct {
 	draftKey string
 
 	// probe results
-	models     []catalog.Model
-	probeErr   error
-	statusLine string
-	busy       bool
+	models        []catalog.Model
+	probeErr      error
+	statusLine    string
+	busy          bool
+	confirmRemove bool
 
 	// OAuth device-code flow state
 	oauthCancel   context.CancelFunc
@@ -79,6 +80,18 @@ type authRow struct {
 	envOnly   bool // credential came from the environment, not our store
 	custom    bool
 }
+
+type authButtonZone struct {
+	id    string
+	x     int
+	y     int
+	width int
+}
+
+const (
+	authButtonBack    = "auth-back"
+	authButtonPrimary = "auth-primary"
+)
 
 // openAuth enters the /auth flow.
 func (m *Model) openAuth() (tea.Model, tea.Cmd) {
@@ -147,6 +160,12 @@ func (m *Model) rebuildAuthRows() {
 
 	sort.SliceStable(connected, func(i, j int) bool { return connected[i].label < connected[j].label })
 	m.auth.rows = append(connected, available...)
+	if m.auth.cursor >= len(m.auth.rows) {
+		m.auth.cursor = len(m.auth.rows) - 1
+	}
+	if m.auth.cursor < 0 {
+		m.auth.cursor = 0
+	}
 }
 
 func hostOf(u string) string {
@@ -157,12 +176,23 @@ func hostOf(u string) string {
 	return s
 }
 
+func (m *Model) authListPageSize() int {
+	// Reserve room for the title, input, overflow marker, buttons, hint,
+	// border, and padding. The extra row keeps the first menu inside the
+	// terminal when the catalog is longer than the viewport.
+	per := m.height - 15
+	if per < 3 {
+		per = 3
+	}
+	return per
+}
+
 // authVisibleRows returns the slice of providers that fits on screen, plus
 // the window bounds so the caller can number rows correctly.
 func (m *Model) authVisibleRows() ([]authRow, int, int) {
 	// Budget: 2 border + 2 padding + title + blank + add line + blank +
 	// input + blank + hint, plus the two overflow markers.
-	per := m.height - 13
+	per := m.authListPageSize()
 	if per < 3 {
 		per = 3
 	}
@@ -181,7 +211,7 @@ func (m *Model) authVisibleRows() ([]authRow, int, int) {
 
 // authScroll moves the provider list window.
 func (m *Model) authScroll(delta int) {
-	per := m.height - 13
+	per := m.authListPageSize()
 	if per < 3 {
 		per = 3
 	}
@@ -268,7 +298,8 @@ func (m *Model) authView() string {
 	if m.auth.statusLine != "" {
 		b.WriteString("\n" + m.auth.statusLine + "\n")
 	}
-	b.WriteString("\n" + s.Faint.Render(m.authHint()))
+	b.WriteString("\n" + m.renderAuthButtons() + "\n")
+	b.WriteString(s.Faint.Render(m.authHint()))
 
 	// Below ~14 rows the border and padding cost more than they are worth,
 	// and a framed box would overflow the screen. Render bare instead.
@@ -281,21 +312,44 @@ func (m *Model) authView() string {
 func (m *Model) authHint() string {
 	switch m.auth.stage {
 	case authList:
-		return "number to configure · add for a custom provider · ↑↓ scroll · esc close"
+		return "↑↓ select · enter configure · number/add type shortcut · esc/backspace back"
 	case authEnterKey, authAddKey, authAddName, authAddURL:
-		return "enter confirm · esc back"
+		return "enter confirm · backspace edit · esc back"
 	case authEditMenu:
-		return "1 change key · 2 change URL · 3 refresh models · 4 set default model · 5 remove · esc back"
+		return "↑↓ select · enter choose · 1–6 shortcuts · esc/backspace back"
 	case authPickModel:
-		return "↑↓ move · enter select · esc skip"
+		return "↑↓ select · enter choose · esc/backspace back"
 	case authEnterModel:
-		return "enter save · esc skip"
+		return "enter save · backspace edit · esc back"
 	case authDeviceCode:
-		return "enter paste token manually · esc cancel"
+		return "enter continue · esc/backspace back"
 	case authOAuthWaiting:
-		return "esc cancel"
+		return "esc/backspace cancel"
 	}
-	return "esc back"
+	return "esc/backspace back"
+}
+
+func (m *Model) authPrimaryLabel() string {
+	switch m.auth.stage {
+	case authList:
+		return "↵ Configure"
+	case authEnterKey, authAddName, authAddURL, authAddKey:
+		return "↵ Continue"
+	case authEnterModel:
+		return "↵ Save"
+	case authDeviceCode:
+		return "↵ Continue"
+	case authProbing, authOAuthWaiting:
+		return "× Cancel"
+	default:
+		return "↵ Select"
+	}
+}
+
+func (m *Model) renderAuthButtons() string {
+	back := m.choiceButtonStyle(false).Render("← Back")
+	primary := m.choiceButtonStyle(true).Render(m.authPrimaryLabel())
+	return "  " + back + " " + primary
 }
 
 func (m *Model) authListBody(w int) string {
@@ -313,7 +367,10 @@ func (m *Model) authListBody(w int) string {
 		num := s.Faint.Render(fmt.Sprintf("%2d ", from+i+1))
 		mark := "  "
 		label := s.Muted.Render(r.label)
-		if r.connected {
+		if from+i == m.auth.cursor {
+			mark = s.Primary.Render("❯ ")
+			label = s.Base.Render(r.label)
+		} else if r.connected {
 			mark = s.Success.Render("✓ ")
 			label = s.Base.Render(r.label)
 		}
@@ -397,24 +454,37 @@ func (m *Model) authEditBody(w int) string {
 		opts = append(opts, "only free models", "remove this provider")
 	}
 	for i, opt := range opts {
-		b.WriteString(s.Faint.Render(fmt.Sprintf("  %d ", i+1)) + s.Muted.Render(opt) + "\n")
+		prefix := s.Faint.Render(fmt.Sprintf("  %d ", i+1))
+		label := s.Muted.Render(opt)
+		if i == m.auth.cursor {
+			prefix = s.Primary.Render("❯ ")
+			label = s.Base.Render(opt)
+		}
+		b.WriteString(prefix + label + "\n")
 	}
 	return b.String()
+}
+
+func (m *Model) authSelectableModels() []catalog.Model {
+	models := catalog.FilterChatModels(m.auth.models)
+	cred := m.creds.Providers[m.auth.draftID]
+	if !cred.OnlyFree {
+		return models
+	}
+
+	filtered := make([]catalog.Model, 0, len(models))
+	for _, model := range models {
+		if model.Free {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
 }
 
 func (m *Model) authModelBody(w int) string {
 	s := m.styles
 	cred := m.creds.Providers[m.auth.draftID]
-	models := m.auth.models
-	if cred.OnlyFree {
-		var filtered []catalog.Model
-		for _, mm := range models {
-			if mm.Free {
-				filtered = append(filtered, mm)
-			}
-		}
-		models = filtered
-	}
+	models := m.authSelectableModels()
 	var b strings.Builder
 	b.WriteString(s.Muted.Render(fmt.Sprintf("%d models available from %s:", len(models), m.auth.draftID)))
 	if cred.OnlyFree {
@@ -438,8 +508,11 @@ func (m *Model) authModelBody(w int) string {
 		mm := models[i]
 		line := mk + st.Render(truncate(mm.ID, w-30))
 		ctxLen := mm.Context
+		if override, ok := provider.ProviderContextWindow(m.auth.draftID, mm.ID); ok {
+			ctxLen = override
+		}
 		if ctxLen <= 0 {
-			ctxLen = provider.KnownContextWindow(mm.ID)
+			ctxLen = provider.KnownProviderContextWindow(m.auth.draftID, mm.ID)
 		}
 		if ctxLen > 0 {
 			line += s.Faint.Render("  " + humanTokens(ctxLen))
@@ -495,7 +568,7 @@ func (m *Model) authOAuthBody(w int) string {
 func (m *Model) handleAuthKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
 
-	if key == "esc" {
+	if key == "esc" || (key == "backspace" && !authBackspaceEdits(a.stage, a.inputBuf)) {
 		return m.authBack()
 	}
 	if a.busy {
@@ -538,6 +611,18 @@ func (m *Model) handleAuthKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func authBackspaceEdits(stage authStage, input string) bool {
+	if stage == authList {
+		return input != ""
+	}
+	switch stage {
+	case authEnterKey, authAddName, authAddURL, authAddKey, authEnterModel, authKeyAdd:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Model) authBack() (tea.Model, tea.Cmd) {
 	a := &m.auth
 	a.statusLine = ""
@@ -546,10 +631,27 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 		a.active = false
 		m.input.Focus()
 		m.refresh()
-	case authEditMenu, authAddName, authProbing, authDeviceCode:
+	case authEditMenu, authAddName, authProbing, authDeviceCode, authEnterKey, authEnterModel:
 		a.stage = authList
 		a.inputBuf = ""
 		m.rebuildAuthRows()
+	case authAddURL:
+		if a.returnTo == authEditMenu {
+			a.stage = authEditMenu
+		} else {
+			a.stage = authAddName
+		}
+		a.inputBuf = ""
+	case authAddKey:
+		a.stage = authAddURL
+		a.inputBuf = ""
+	case authPickModel:
+		if a.returnTo == authEditMenu {
+			a.stage = authEditMenu
+		} else {
+			a.stage = authList
+			m.rebuildAuthRows()
+		}
 	case authOAuthWaiting:
 		if a.oauthCancel != nil {
 			a.oauthCancel()
@@ -573,7 +675,10 @@ func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 		in := strings.TrimSpace(strings.ToLower(a.inputBuf))
 		a.inputBuf = ""
 		if in == "" {
-			return m, nil
+			if len(a.rows) == 0 {
+				return m, nil
+			}
+			return m.authSelectRow(a.rows[a.cursor])
 		}
 		if in == "add" || in == "a" || in == "+" {
 			a.stage = authAddName
@@ -608,10 +713,16 @@ func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "up", "ctrl+p":
-		m.authScroll(-1)
+		if a.cursor > 0 {
+			a.cursor--
+		}
+		m.authRevealRow(a.cursor)
 		return m, nil
 	case "down", "ctrl+n":
-		m.authScroll(1)
+		if a.cursor < len(a.rows)-1 {
+			a.cursor++
+		}
+		m.authRevealRow(a.cursor)
 		return m, nil
 	case "pgup":
 		m.authScroll(-(m.height - 14))
@@ -638,7 +749,7 @@ func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 
 // authRevealRow scrolls a row into view.
 func (m *Model) authRevealRow(idx int) {
-	per := m.height - 13
+	per := m.authListPageSize()
 	if per < 3 {
 		per = 3
 	}
@@ -662,6 +773,7 @@ func (m *Model) authSelectRow(r authRow) (tea.Model, tea.Cmd) {
 	// Already saved: offer the edit menu.
 	if _, ok := m.creds.Providers[r.id]; ok {
 		a.stage = authEditMenu
+		a.cursor = 0
 		return m, nil
 	}
 	// Satisfied by an env var: adopt it and verify immediately.
@@ -737,7 +849,7 @@ func (m *Model) authInputKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 			a.stage = authList
 			m.rebuildAuthRows()
 			a.statusLine = m.styles.Success.Render("  active model: " + m.modelID)
-			m.setStatus("model: " + shortModel(m.modelID))
+			m.setStatus("model: " + m.displayModel())
 			return m, nil
 		case authAddKey, authEnterKey:
 			// A pasted key routinely carries a trailing newline or a
@@ -786,14 +898,31 @@ func (m *Model) authInputKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 func (m *Model) authKeyMenuKey(key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
 	a.statusLine = ""
+	if key == "up" || key == "ctrl+p" {
+		if a.cursor > 0 {
+			a.cursor--
+		}
+		return m, nil
+	}
+	if key == "down" || key == "ctrl+n" {
+		if a.cursor < 2 {
+			a.cursor++
+		}
+		return m, nil
+	}
+	if key == "enter" {
+		key = strconv.Itoa(a.cursor + 1)
+	}
 
 	switch key {
 	case "1":
 		a.inputBuf = ""
 		a.stage = authKeyAdd
 	case "2":
+		a.cursor = 0
 		a.stage = authKeyMode
 	case "3":
+		a.cursor = 0
 		a.stage = authEditMenu
 	}
 	return m, nil
@@ -830,6 +959,21 @@ func (m *Model) authKeyAddKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 func (m *Model) authKeyModeKey(key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
 	a.statusLine = ""
+	if key == "up" || key == "ctrl+p" {
+		if a.cursor > 0 {
+			a.cursor--
+		}
+		return m, nil
+	}
+	if key == "down" || key == "ctrl+n" {
+		if a.cursor < 2 {
+			a.cursor++
+		}
+		return m, nil
+	}
+	if key == "enter" {
+		key = strconv.Itoa(a.cursor + 1)
+	}
 
 	switch key {
 	case "1":
@@ -1103,9 +1247,13 @@ func (m *Model) applyAuthProbe(msg authProbeMsg) {
 	if label == "" {
 		label = msg.id
 	}
+	// Persist only models Rick can use for text/tool conversations. This is
+	// deliberately done before caching so /models and future sessions agree.
+	msg.res.Models = catalog.FilterChatModels(msg.res.Models)
 	ids := make([]string, 0, len(msg.res.Models))
 	visionModels := make([]string, 0)
 	windows := make(map[string]int, len(msg.res.Models))
+	sources := make(map[string]provider.ContextSource, len(msg.res.Models))
 	modalitiesKnown := false
 	for _, mm := range msg.res.Models {
 		ids = append(ids, mm.ID)
@@ -1113,27 +1261,48 @@ func (m *Model) applyAuthProbe(msg authProbeMsg) {
 			visionModels = append(visionModels, mm.ID)
 		}
 		modalitiesKnown = modalitiesKnown || mm.ModalitiesKnown
-		// Prefer what the endpoint reported; fall back to what the model id
-		// implies, so the usage gauge is meaningful either way.
+		// Prefer the provider-specific deployment override, then what the
+		// endpoint reported, then what the model id implies.
 		n := mm.Context
+		contextSource := mm.ContextSource
+		if override, ok := provider.ProviderContextWindow(msg.id, mm.ID); ok {
+			n = override
+			contextSource = provider.ContextSourceCatalog
+		}
 		if n <= 0 {
-			n = provider.KnownContextWindow(mm.ID)
+			n = provider.KnownProviderContextWindow(msg.id, mm.ID)
 		}
 		if n > 0 {
 			windows[mm.ID] = n
+			if contextSource != provider.ContextSourceUnknown {
+				sources[mm.ID] = contextSource
+			}
 		}
 	}
-	cred := config.Credential{
-		Type: msg.res.Flavor, APIKey: msg.key, BaseURL: msg.res.BaseURL,
-		Label: label, Models: ids, ContextWindows: windows, VisionModels: visionModels,
-		ModalitiesKnown: modalitiesKnown, Custom: a.custom,
+	// Start from the existing record. A connectivity probe refreshes endpoint
+	// metadata; it must not erase APIKeys, rotation mode, the selected model,
+	// disabled state, or user labels/custom fields.
+	cred := m.creds.Providers[msg.id]
+	oldCred := cred
+	cred.Type = msg.res.Flavor
+	if len(cred.APIKeys) == 0 {
+		cred.APIKey = msg.key
 	}
-	if old, ok := m.creds.Providers[msg.id]; ok {
-		cred.Default = old.Default
-		cred.OnlyFree = old.OnlyFree
+	cred.BaseURL = msg.res.BaseURL
+	if cred.Label == "" {
+		cred.Label = label
 	}
+	if len(ids) > 0 {
+		cred.Models = ids
+		cred.ContextWindows = windows
+		cred.ContextSources = sources
+		cred.VisionModels = visionModels
+		cred.ModalitiesKnown = modalitiesKnown
+	}
+	cred.Custom = a.custom || cred.Custom
 	m.creds.Set(msg.id, cred)
 	if err := m.creds.Save(); err != nil {
+		m.creds.Set(msg.id, oldCred)
 		a.statusLine = m.styles.Error.Render("  could not save: " + err.Error())
 		return
 	}
@@ -1159,13 +1328,14 @@ func (m *Model) applyAuthProbe(msg authProbeMsg) {
 
 func (m *Model) authModelKey(key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
+	models := m.authSelectableModels()
 	switch key {
 	case "up", "ctrl+p":
 		if a.cursor > 0 {
 			a.cursor--
 		}
 	case "down", "ctrl+n":
-		if a.cursor < len(a.models)-1 {
+		if a.cursor < len(models)-1 {
 			a.cursor++
 		}
 	case "pgup":
@@ -1175,15 +1345,15 @@ func (m *Model) authModelKey(key string) (tea.Model, tea.Cmd) {
 		}
 	case "pgdown":
 		a.cursor += 12
-		if a.cursor >= len(a.models) {
-			a.cursor = len(a.models) - 1
+		if a.cursor >= len(models) {
+			a.cursor = len(models) - 1
 		}
 	case "enter":
-		if len(a.models) == 0 {
+		if len(models) == 0 {
 			a.stage = authList
 			return m, nil
 		}
-		chosen := a.models[a.cursor].ID
+		chosen := models[a.cursor].ID
 		cred := m.creds.Providers[a.draftID]
 		cred.Default = chosen
 		m.creds.Set(a.draftID, cred)
@@ -1194,7 +1364,7 @@ func (m *Model) authModelKey(key string) (tea.Model, tea.Cmd) {
 		a.inputBuf = ""
 		m.rebuildAuthRows()
 		a.statusLine = m.styles.Success.Render("  active model: " + m.modelID)
-		m.setStatus("model: " + shortModel(m.modelID))
+		m.setStatus("model: " + m.displayModel())
 	}
 	return m, nil
 }
@@ -1203,6 +1373,21 @@ func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
 	cred := m.creds.Providers[a.draftID]
 	a.statusLine = ""
+	if key == "up" || key == "ctrl+p" {
+		if a.cursor > 0 {
+			a.cursor--
+		}
+		return m, nil
+	}
+	if key == "down" || key == "ctrl+n" {
+		if a.cursor < 5 {
+			a.cursor++
+		}
+		return m, nil
+	}
+	if key == "enter" {
+		key = strconv.Itoa(a.cursor + 1)
+	}
 
 	switch key {
 	case "1":
@@ -1225,16 +1410,28 @@ func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 			a.models = append(a.models, catalog.Model{ID: id})
 		}
 		a.cursor = 0
+		a.returnTo = authEditMenu
 		a.stage = authPickModel
 	case "5":
 		cred.OnlyFree = !cred.OnlyFree
 		m.creds.Set(a.draftID, cred)
 		_ = m.creds.Save()
 	case "6":
+		if !a.confirmRemove {
+			a.confirmRemove = true
+			a.statusLine = m.styles.Warning.Render("  press 6 again to permanently remove this provider")
+			return m, nil
+		}
+		a.confirmRemove = false
 		m.creds.Remove(a.draftID)
-		_ = m.creds.Save()
+		if err := m.creds.Save(); err != nil {
+			m.creds.Set(a.draftID, cred)
+			a.statusLine = m.styles.Error.Render("  provider removal was not saved: " + err.Error())
+			return m, nil
+		}
 		m.reloadProviders()
 		a.stage = authList
+		a.statusLine = ""
 	}
 	return m, nil
 }
@@ -1242,21 +1439,14 @@ func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 // reloadProviders rebuilds the live provider set from saved credentials so a
 // new login is usable immediately, without restarting rick.
 //
-// Credentials we own are rewritten wholesale — including deletions, so a
-// removed provider actually disappears. Providers pinned by rick.json are
-// left alone; they are not ours to manage.
+// Credential removal changes the live provider set but never deletes entries
+// from the loaded project configuration. The project configuration is not an
+// auth-store scratch buffer, and mutating it here used to make unrelated
+// provider settings disappear on refresh/remove flows.
 func (m *Model) reloadProviders() {
 	cfg := m.deps.Loaded.Config
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]config.Provider{}
-	}
-	for id := range cfg.Providers {
-		if _, pinned := m.pinnedProviders[id]; pinned {
-			continue
-		}
-		if _, still := m.creds.Providers[id]; !still {
-			delete(cfg.Providers, id)
-		}
 	}
 	for id, cred := range m.creds.Providers {
 		if cred.Disabled {
@@ -1272,6 +1462,14 @@ func (m *Model) reloadProviders() {
 
 	provs := map[string]provider.Provider{}
 	for id, p := range cfg.Providers {
+		if cred, hasCredential := m.creds.Providers[id]; hasCredential && cred.Disabled {
+			continue
+		}
+		if _, pinned := m.pinnedProviders[id]; !pinned {
+			if _, hasCredential := m.creds.Providers[id]; !hasCredential {
+				continue
+			}
+		}
 		if p.Enabled != nil && !*p.Enabled {
 			continue
 		}
@@ -1297,23 +1495,39 @@ func (m *Model) reloadProviders() {
 			if cred, ok := m.creds.Providers[id]; ok && len(cred.Models) > 0 {
 				infos := make([]provider.ModelInfo, 0, len(cred.Models))
 				for _, mid := range cred.Models {
+					contextWindow := cred.ContextWindows[mid]
+					contextSource := cred.ContextSources[mid]
+					if override, ok := provider.ProviderContextWindow(id, mid); ok {
+						contextWindow = override
+						contextSource = provider.ContextSourceCatalog
+					}
 					infos = append(infos, provider.ModelInfo{
-						ID: mid, Name: mid, ContextWindow: cred.ContextWindows[mid],
+						ID: mid, Name: mid, ContextWindow: contextWindow,
+						ContextSource:  contextSource,
 						SupportsImages: stringSliceContains(cred.VisionModels, mid),
 					})
 				}
-				c.SetModels(infos)
+				c.SetModels(provider.FilterChatModels(infos))
 			}
 			provs[id] = c
 		}
 	}
 	m.deps.Providers = provs
+	if m.modelID != "" {
+		providerID, _ := config.SplitModel(m.modelID)
+		if _, stillConfigured := provs[providerID]; !stillConfigured {
+			m.modelID = ""
+			m.updateContextWindow()
+			m.status = ""
+		}
+	}
 }
 
 // ---------- multi-key management ----------
 
 func (m *Model) cmdManageKeys() (tea.Model, tea.Cmd) {
 	m.auth.stage = authKeyMenu
+	m.auth.cursor = 0
 	return m, nil
 }
 
@@ -1332,9 +1546,16 @@ func (m *Model) authKeyMenuBody(w int) string {
 		mode = "single"
 	}
 	b.WriteString(s.Faint.Render(fmt.Sprintf("\nMode: %s", mode)) + "\n\n")
-	b.WriteString(s.Faint.Render("  1 ") + s.Muted.Render("＋ Add key(s)") + "\n")
-	b.WriteString(s.Faint.Render("  2 ") + s.Muted.Render("Change mode") + "\n")
-	b.WriteString(s.Faint.Render("  3 ") + s.Muted.Render("← Back") + "\n")
+	options := []string{"＋ Add key(s)", "Change mode", "← Back"}
+	for i, option := range options {
+		prefix := s.Faint.Render(fmt.Sprintf("  %d ", i+1))
+		label := s.Muted.Render(option)
+		if i == m.auth.cursor {
+			prefix = s.Primary.Render("❯ ")
+			label = s.Base.Render(option)
+		}
+		b.WriteString(prefix + label + "\n")
+	}
 	return b.String()
 }
 
@@ -1342,9 +1563,16 @@ func (m *Model) authKeyModeBody(w int) string {
 	s := m.styles
 	var b strings.Builder
 	b.WriteString(s.Muted.Render("Key rotation mode:") + "\n\n")
-	b.WriteString(s.Faint.Render("  1 ") + s.Muted.Render("Single — use first key") + "\n")
-	b.WriteString(s.Faint.Render("  2 ") + s.Muted.Render("Round-robin — rotate each request") + "\n")
-	b.WriteString(s.Faint.Render("  3 ") + s.Muted.Render("Failover — rotate on rate-limit") + "\n")
+	options := []string{"Single — use first key", "Round-robin — rotate each request", "Failover — rotate on rate-limit"}
+	for i, option := range options {
+		prefix := s.Faint.Render(fmt.Sprintf("  %d ", i+1))
+		label := s.Muted.Render(option)
+		if i == m.auth.cursor {
+			prefix = s.Primary.Render("❯ ")
+			label = s.Base.Render(option)
+		}
+		b.WriteString(prefix + label + "\n")
+	}
 	return b.String()
 }
 

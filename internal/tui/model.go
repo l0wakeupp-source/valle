@@ -116,6 +116,8 @@ type Model struct {
 
 	// generic list modal (models, themes, sessions, help)
 	modal modalKind
+	// resumeBrowser is the shared full-screen session browser used by /sessions.
+	resumeBrowser *resumeModel
 
 	listFilter string
 
@@ -163,9 +165,11 @@ type Model struct {
 	// photoBox is the cell box the current frame reserved for the mascot
 	// photo; photoDrawn is what is actually on screen. They differ only
 	// when the image needs (re)drawing.
-	photoBox   photoKey
-	photoDrawn photoKey
-	photoRow   int
+	photoBox        photoKey
+	photoDrawn      photoKey
+	photoPending    photoKey
+	photoRow        int
+	photoGeneration uint64
 
 	// consecutive quiet theme polls, used to back the interval off
 	themeIdle int
@@ -173,7 +177,8 @@ type Model struct {
 	// startup tip, chosen once per launch
 	tip string
 	// title of the most recent session here, if any
-	resumable string
+	resumable   string
+	slashCursor int
 
 	// reasoning effort for the active model, and whether it supports any
 	reasoning      provider.ReasoningEffort
@@ -187,7 +192,9 @@ type Model struct {
 	turnElapsed time.Duration
 
 	// armed inline numbered selection
-	pending pendingChoice
+	pending       pendingChoice
+	choiceSeq     uint64
+	choiceButtons []choiceButtonZone
 
 	// ctrl+c must be pressed twice to quit
 	quitArmed bool
@@ -229,6 +236,18 @@ type Model struct {
 	// double-click detection
 	lastClickTime time.Time
 	lastClickY    int
+
+	// always-visible activity browser state
+	activityCursor  int
+	activityFocused bool
+
+	// mouseEnabled is true only while an interactive activity/control surface is
+	// present. Keeping it false for the ordinary view preserves terminal text
+	// selection and copy behavior.
+	mouseEnabled bool
+
+	// agentRunID prevents stale drain ticks from consuming a later run's events.
+	agentRunID uint64
 }
 
 // toolRowEntry records the content-row span of one rendered tool block.
@@ -244,7 +263,7 @@ func (m *Model) SetProgram(p *tea.Program) { m.program = p }
 // tick messages
 type spinnerTickMsg time.Time
 type themePollMsg time.Time
-type readAgentMsg struct{}
+type readAgentMsg struct{ runID uint64 }
 type statusMsg struct {
 	text string
 	quit bool
@@ -269,7 +288,7 @@ func New(d Deps) *Model {
 		registry = agent.NewRegistry(depth, cfg.MaxBackground)
 	}
 	_, rootCancel := context.WithCancel(context.Background())
-	rootID, err := registry.Register(agent.AgentEntry{
+	rootID, err := registry.Register(&agent.AgentEntry{
 		ID: "orchestrator", Name: "orchestrator", Depth: 0,
 		Status: agent.AgentIdle, Cancel: rootCancel,
 	})
@@ -377,44 +396,63 @@ func (m *Model) updateContextWindow() {
 		m.reasoning = deflt
 	}
 
-	// Gather every candidate and take the best-informed one. Provider stubs
-	// and generic /models responses often report a placeholder window, so a
-	// value derived from the model id must be able to win.
-	known := provider.KnownContextWindow(modelID)
-	var stored, advertised int
+	// Prefer live API metadata over catalogs and id heuristics. The source is
+	// persisted alongside the value so an inferred value never silently wins
+	// over a context limit returned by the provider.
+	known := provider.KnownProviderContextWindow(provID, modelID)
+	bestValue, bestSource := known, provider.ContextSourceInferred
+	var stored int
+	var storedSource provider.ContextSource
 	if m.creds != nil {
 		if cred, ok := m.creds.Providers[provID]; ok {
 			stored = cred.ContextWindows[modelID]
+			storedSource = cred.ContextSources[modelID]
 		}
 	}
+	bestValue, bestSource = betterContextCandidate(bestValue, bestSource, stored, storedSource)
 	if p, ok := m.deps.Providers[provID]; ok {
 		for _, mi := range p.Models() {
-			if mi.ID == modelID {
-				advertised = mi.ContextWindow
-				break
+			if mi.ID != modelID {
+				continue
 			}
+			bestValue, bestSource = betterContextCandidate(
+				bestValue, bestSource, mi.ContextWindow, mi.ContextSource)
+			break
 		}
 	}
-	switch {
-	case known > 0:
-		// The id names a model we know; trust that over a generic default,
-		// but let a larger reported window through (e.g. an extended-context
-		// deployment of the same model).
-		m.ctxWindow = maxInt(known, maxInt(stored, advertised))
-	case stored > 0:
-		m.ctxWindow = stored
-	case advertised > 0:
-		m.ctxWindow = advertised
-	default:
+	if bestValue > 0 {
+		m.ctxWindow = bestValue
+	} else {
 		m.ctxWindow = 200000
 	}
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+func betterContextCandidate(current int, currentSource provider.ContextSource, candidate int, candidateSource provider.ContextSource) (int, provider.ContextSource) {
+	if candidate <= 0 {
+		return current, currentSource
 	}
-	return b
+	candidateRank := contextSourceRank(candidateSource)
+	currentRank := contextSourceRank(currentSource)
+	if candidateRank > currentRank || (candidateRank == currentRank && candidate > current) {
+		return candidate, candidateSource
+	}
+	return current, currentSource
+}
+
+func contextSourceRank(source provider.ContextSource) int {
+	switch source {
+	case provider.ContextSourceAPI:
+		return 4
+	case provider.ContextSourceBuiltin, provider.ContextSourceCatalog:
+		return 3
+	case provider.ContextSourceInferred:
+		return 1
+	default:
+		// Missing provenance is weaker than even an inferred model value. Old
+		// credential files may contain a stale endpoint default, and it must not
+		// replace reliable model-id inference.
+		return 0
+	}
 }
 
 func orString(s, d string) string {
@@ -433,7 +471,7 @@ func orInt(v, d int) int {
 
 // Init implements tea.Model.
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen}
+	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen, tea.DisableMouse}
 	// Some terminals (and piped/CI invocations) never deliver a
 	// WindowSizeMsg. Without a fallback the UI would sit on "starting rick…"
 	// forever, so seed a sane size that a real WindowSizeMsg overrides.
@@ -445,21 +483,81 @@ func (m *Model) Init() tea.Cmd {
 		cmds = append(cmds, photoTick())
 	}
 	if m.deps.ResumeID != "" {
-		cmds = append(cmds, func() tea.Msg { return resumeMsg{id: m.deps.ResumeID} })
-	}
-	if m.deps.InitialMsg != "" {
+		resumeID := m.deps.ResumeID
+		initialMsg := m.deps.InitialMsg
+		cmds = append(cmds, func() tea.Msg { return resumeMsg{id: resumeID, prompt: initialMsg} })
+	} else if m.deps.InitialMsg != "" {
 		msg := m.deps.InitialMsg
 		cmds = append(cmds, func() tea.Msg { return submitMsg{text: msg} })
+	}
+	if m.deps.Store != nil && m.deps.ResumeID == "" {
+		d := m.deps
+		cmds = append(cmds, func() tea.Msg {
+			return sessionTitleMsg{title: latestSessionTitle(d)}
+		})
 	}
 	return tea.Batch(cmds...)
 }
 
-type resumeMsg struct{ id string }
+type resumeMsg struct {
+	id     string
+	prompt string
+}
 type submitMsg struct{ text string }
 type ensureSizeMsg struct{}
+type sessionTitleMsg struct{ title string }
 
-// Update implements tea.Model.
+// Update implements tea.Model and keeps terminal mouse capture scoped to
+// interactive controls. The ordinary transcript/input view deliberately leaves
+// mouse tracking disabled so the terminal owns drag selection and copy.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := m.update(msg)
+	updated, ok := model.(*Model)
+	if !ok {
+		return model, cmd
+	}
+
+	wantsMouse := updated.wantsMouseCapture()
+	if wantsMouse == updated.mouseEnabled {
+		return updated, cmd
+	}
+	updated.mouseEnabled = wantsMouse
+	if wantsMouse {
+		return updated, tea.Batch(cmd, tea.EnableMouseCellMotion)
+	}
+	return updated, tea.Batch(cmd, tea.DisableMouse)
+}
+
+func (m *Model) wantsMouseCapture() bool {
+	if m.auth.active ||
+		m.modal != modalNone ||
+		m.picker.active ||
+		m.pending.kind != pendingNone {
+		return true
+	}
+	for _, item := range m.activityItems() {
+		if item.interactive {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.resumeBrowser != nil {
+		_, cmd := m.resumeBrowser.Update(msg)
+		if m.resumeBrowser.quit {
+			resumeID := m.resumeBrowser.resumeID
+			m.resumeBrowser = nil
+			m.input.Focus()
+			if resumeID != "" {
+				m.doResume(resumeID)
+			}
+			return m, nil
+		}
+		return m, cmd
+	}
+
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -493,14 +591,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		if m.modal != modalNone || m.auth.active {
+		if m.auth.active {
+			if msg.Button == tea.MouseButtonWheelUp {
+				m.authScroll(-m.scrollStep())
+				return m, nil
+			}
+			if msg.Button == tea.MouseButtonWheelDown {
+				m.authScroll(m.scrollStep())
+				return m, nil
+			}
+			if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+				if button, ok := m.authButtonAt(msg.X, msg.Y); ok {
+					return m.handleAuthButton(button)
+				}
+			}
+			return m, nil
+		}
+		if m.modal != modalNone {
 			return m, nil
 		}
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			m.scrollBy(-m.scrollStep())
+			if m.activityContainsY(msg.Y) {
+				m.activityFocused = true
+				m.moveActivityCursor(-1)
+			} else {
+				m.scrollBy(-m.scrollStep())
+			}
 		case tea.MouseButtonWheelDown:
-			m.scrollBy(m.scrollStep())
+			if m.activityContainsY(msg.Y) {
+				m.activityFocused = true
+				m.moveActivityCursor(1)
+			} else {
+				m.scrollBy(m.scrollStep())
+			}
 		case tea.MouseButtonLeft:
 			if msg.Action == tea.MouseActionPress {
 				m.handleMouseClick(msg)
@@ -533,12 +657,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.syncPhoto(), photoTick())
 
 	case photoDrawnMsg:
+		if msg.generation != m.photoGeneration {
+			return m, nil
+		}
+		if m.photoPending == msg.box {
+			m.photoPending = photoKey{}
+		}
 		if msg.box == m.photoBox {
 			m.photoDrawn = msg.box
 		}
 		return m, nil
 
 	case photoClearedMsg:
+		if msg.generation != m.photoGeneration {
+			return m, nil
+		}
+		if m.photoPending == msg.box {
+			m.photoPending = photoKey{}
+		}
 		if m.photoBox == (photoKey{}) && m.photoDrawn == msg.box {
 			m.photoDrawn = photoKey{}
 		}
@@ -577,7 +713,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case readAgentMsg:
-		return m.drainAgent()
+		return m.drainAgent(msg.runID)
 
 	case permAskMsg:
 		m.permReq = msg.req
@@ -609,6 +745,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case resumeMsg:
 		m.doResume(msg.id)
+		if msg.prompt != "" {
+			return m.submit(msg.prompt)
+		}
+		return m, nil
+
+	case sessionTitleMsg:
+		m.resumable = msg.title
 		return m, nil
 
 	case submitMsg:
@@ -640,12 +783,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applySubagentResult(msg)
 		return m, nil
 
+	case childUsageMsg:
+		m.billed.Input += msg.usage.InputTokens
+		m.billed.Output += msg.usage.OutputTokens
+		m.billed.CacheRead += msg.usage.CacheReadTokens
+		m.billed.CacheWrite += msg.usage.CacheWriteTokens
+		return m, nil
+
 	case swarmStartMsg:
 		plan, err := m.beginSwarm(msg)
 		if err != nil {
 			msg.reply <- swarmStartReply{err: err}
 			return m, nil
 		}
+		m.resizeForActivity()
 		msg.reply <- swarmStartReply{text: fmt.Sprintf("Team %q started with %d teammates.", msg.name, len(msg.agents))}
 		return m, func() tea.Msg { m.runSwarmPlan(plan); return nil }
 
@@ -698,14 +849,14 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 	m.width, m.height = msg.Width, msg.Height
 
 	inputH := m.inputHeight()
-	vpH := m.height - inputH - 4 - m.todoPanelHeight() // header + status + padding
+	vpH := m.height - inputH - 4 - m.todoPanelHeight() - m.activityPanelHeight() // header + status + padding
 	if vpH < 3 {
 		vpH = 3
 	}
 
 	if !m.ready {
 		m.viewport = viewport.New(m.width, vpH)
-		m.viewport.YPosition = 1
+		m.viewport.YPosition = 0
 		m.ready = true
 		m.input.SetWidth(m.width - 4)
 		m.rebuildMarkdown(m.contentWidth())
@@ -913,6 +1064,17 @@ func (m *Model) trimTranscript() {
 	}
 	remove := len(m.msgs) - maxTranscriptMessages
 	m.msgs = append([]ChatMsg{{Kind: MsgSystem, Text: fmt.Sprintf("... %d earlier messages omitted to limit RAM", remove), Time: time.Now()}}, m.msgs[remove:]...)
+	kept := make(map[string]struct{}, len(m.msgs))
+	for _, msg := range m.msgs {
+		if msg.CallID != "" {
+			kept[msg.CallID] = struct{}{}
+		}
+	}
+	for callID := range m.toolOutputs {
+		if _, ok := kept[callID]; !ok {
+			delete(m.toolOutputs, callID)
+		}
+	}
 }
 
 func (m *Model) appendMsg(msg ChatMsg) {
@@ -953,6 +1115,7 @@ func (m *Model) refresh() {
 	m.chatContent = m.tx.content
 	m.tx.apply(&m.viewport)
 	m.rebuildToolRowMap()
+	m.rebuildChoiceButtonMap()
 }
 
 // touch marks one entry as needing a re-render.
@@ -993,10 +1156,70 @@ func (m *Model) rebuildToolRowMap() {
 	_ = lines
 }
 
+func (m *Model) rebuildChoiceButtonMap() {
+	m.choiceButtons = m.choiceButtons[:0]
+	if !isChoiceMenu(m.pending.kind) || m.pending.textInput {
+		return
+	}
+	backWidth, selectWidth := m.choiceButtonWidths()
+	row := 0
+	for i, msg := range m.msgs {
+		if i >= len(m.tx.blocks) || m.tx.blocks[i] == "" {
+			continue
+		}
+		block := m.tx.blocks[i]
+		lineCount := strings.Count(block, "\n") + 1
+		if msg.Kind == MsgChoice && msg.choiceID == m.pending.choiceID {
+			buttonY := row + lineCount - 1
+			backX := 2
+			m.choiceButtons = append(m.choiceButtons,
+				choiceButtonZone{id: choiceButtonBack, x: backX, y: buttonY, width: backWidth},
+				choiceButtonZone{id: choiceButtonSelect, x: backX + backWidth + 1, y: buttonY, width: selectWidth},
+			)
+			return
+		}
+		row += lineCount + 1
+	}
+}
+
 // handleMouseClick processes a left-button press in the transcript area.
 func (m *Model) handleMouseClick(msg tea.MouseMsg) {
+	if item, ok := m.activityAt(msg.Y); ok {
+		items := m.activityItems()
+		for index := range items {
+			if items[index].id == item.id {
+				m.activityCursor = index
+				break
+			}
+		}
+		m.activityFocused = true
+		now := time.Now()
+		if msg.Y == m.lastClickY && now.Sub(m.lastClickTime) < 400*time.Millisecond {
+			m.lastClickTime = time.Time{}
+			_, _ = m.openActivity(item)
+			m.refresh()
+			return
+		}
+		m.lastClickTime = now
+		m.lastClickY = msg.Y
+		m.refresh()
+		return
+	}
+
 	// Ignore clicks outside the viewport (status bar, input area).
 	if msg.Y < m.viewport.YPosition || msg.Y >= m.viewport.YPosition+m.viewport.Height {
+		return
+	}
+
+	contentRow := m.viewport.YOffset + (msg.Y - m.viewport.YPosition)
+	if button, ok := m.choiceButtonAt(msg.X, contentRow); ok {
+		switch button.id {
+		case choiceButtonBack:
+			_, _ = m.backPendingChoice()
+		case choiceButtonSelect:
+			_, _ = m.applyPendingCursor()
+		}
+		m.refresh()
 		return
 	}
 
@@ -1009,9 +1232,6 @@ func (m *Model) handleMouseClick(msg tea.MouseMsg) {
 	}
 	m.lastClickTime = now
 	m.lastClickY = msg.Y
-
-	// Map the screen row to a content row.
-	contentRow := m.viewport.YOffset + (msg.Y - m.viewport.YPosition)
 
 	// Find the tool block at this row and toggle it.
 	for _, entry := range m.toolRowMap {
@@ -1028,6 +1248,85 @@ func (m *Model) handleMouseClick(msg tea.MouseMsg) {
 			return
 		}
 	}
+}
+
+func (m *Model) touchPendingChoice() {
+	for i, msg := range m.msgs {
+		if msg.choiceID == m.pending.choiceID {
+			m.touch(i)
+			return
+		}
+	}
+}
+
+func (m *Model) choiceButtonAt(x, contentRow int) (choiceButtonZone, bool) {
+	if !isChoiceMenu(m.pending.kind) || m.pending.textInput || contentRow < 0 {
+		return choiceButtonZone{}, false
+	}
+	for _, button := range m.choiceButtons {
+		if button.y == contentRow && x >= button.x && x < button.x+button.width {
+			return button, true
+		}
+	}
+	return choiceButtonZone{}, false
+}
+
+func (m *Model) authButtonZones() []authButtonZone {
+	if !m.auth.active {
+		return nil
+	}
+	panel := m.authView()
+	panelWidth := lipgloss.Width(panel)
+	panelLeft := (m.width - panelWidth) / 2
+	panelTop := (m.height - lipgloss.Height(panel)) / 2
+	buttonRow := -1
+	panelLine := ""
+	for row, line := range strings.Split(panel, "\n") {
+		if strings.Contains(line, "← Back") && strings.Contains(line, m.authPrimaryLabel()) {
+			buttonRow = row
+			panelLine = line
+			break
+		}
+	}
+	if buttonRow < 0 {
+		return nil
+	}
+
+	backLabel := "← Back"
+	primaryLabel := m.authPrimaryLabel()
+	backLabelIndex := strings.Index(panelLine, backLabel)
+	primaryLabelIndex := strings.Index(panelLine, primaryLabel)
+	if backLabelIndex < 0 || primaryLabelIndex < 0 {
+		return nil
+	}
+	backRendered := m.choiceButtonStyle(false).Render(backLabel)
+	primaryRendered := m.choiceButtonStyle(true).Render(primaryLabel)
+	backWidth := lipgloss.Width(backRendered)
+	primaryWidth := lipgloss.Width(primaryRendered)
+	backPadding := (backWidth - lipgloss.Width(backLabel)) / 2
+	primaryPadding := (primaryWidth - lipgloss.Width(primaryLabel)) / 2
+	backX := panelLeft + lipgloss.Width(panelLine[:backLabelIndex]) - backPadding
+	primaryX := panelLeft + lipgloss.Width(panelLine[:primaryLabelIndex]) - primaryPadding
+	return []authButtonZone{
+		{id: authButtonBack, x: backX, y: panelTop + buttonRow, width: backWidth},
+		{id: authButtonPrimary, x: primaryX, y: panelTop + buttonRow, width: primaryWidth},
+	}
+}
+
+func (m *Model) authButtonAt(x, y int) (authButtonZone, bool) {
+	for _, zone := range m.authButtonZones() {
+		if x >= zone.x && x < zone.x+zone.width && y == zone.y {
+			return zone, true
+		}
+	}
+	return authButtonZone{}, false
+}
+
+func (m *Model) handleAuthButton(zone authButtonZone) (tea.Model, tea.Cmd) {
+	if zone.id == authButtonBack || m.auth.stage == authProbing || m.auth.stage == authOAuthWaiting {
+		return m.authBack()
+	}
+	return m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEnter}, "enter")
 }
 
 // handleDoubleClick copies a file path from the clicked line to clipboard.
@@ -1051,6 +1350,9 @@ func (m *Model) seedWelcome() { m.refresh() }
 
 // View implements tea.Model.
 func (m *Model) View() string {
+	if m.resumeBrowser != nil {
+		return m.resumeBrowser.View()
+	}
 	if !m.ready {
 		return "starting rick…"
 	}
@@ -1067,6 +1369,9 @@ func (m *Model) View() string {
 		main = padHeight(m.splash(), m.viewport.Height)
 	} else {
 		// The conversation has started: no splash, so no image.
+		if m.photoBox != (photoKey{}) {
+			m.photoGeneration++
+		}
 		m.photoBox = photoKey{}
 		main = m.viewport.View()
 	}
@@ -1108,6 +1413,21 @@ func shortModel(id string) string {
 	return id
 }
 
+// displayModel returns the model label shown in the UI. A stale model
+// reference must not look like an active selection after its provider is gone.
+func (m *Model) displayModel() string {
+	providerID, modelID := config.SplitModel(strings.TrimSpace(m.modelID))
+	if modelID == "" {
+		return "None selected"
+	}
+	if providerID != "" {
+		if _, ok := m.deps.Providers[providerID]; !ok {
+			return "None selected"
+		}
+	}
+	return shortModel(m.modelID)
+}
+
 func isDigits(s string) bool {
 	for _, c := range s {
 		if c < '0' || c > '9' {
@@ -1118,35 +1438,8 @@ func isDigits(s string) bool {
 }
 
 func (m *Model) footer() string {
-	s := m.styles
 	var b strings.Builder
-
-	if m.deps.Todos != nil && m.activeSwarms == 0 {
-		if items := m.deps.Todos.Items(); len(items) > 0 {
-			b.WriteString(m.renderTodos(items, m.contentWidth()) + "\n")
-		}
-	}
-
-	// The input border carries the mode: green for build, blue for plan, so
-	// the current mode is readable at a glance without parsing any text.
-	border := s.PromptBorder
-	if m.agentName == "plan" {
-		border = s.PlanBorder
-	}
-
-	prompt := s.Accent.Render("› ")
-	switch {
-	case m.running:
-		prompt = s.Accent.Render(m.spinnerFrame() + " ")
-	case strings.HasPrefix(m.input.Value(), "!"):
-		prompt = s.Warning.Render("! ")
-	case strings.HasPrefix(m.input.Value(), "/"):
-		prompt = s.Secondary.Render("/ ")
-	}
-	inner := prompt + m.input.View()
-	b.WriteString(border.Width(m.width-2).Render(inner) + "\n")
-
-	// No attachment display in footer — markers are inline in the input
+	b.WriteString(m.activityPrefix())
 
 	if m.picker.active {
 		b.WriteString(m.pickerView() + "\n")
@@ -1412,7 +1705,7 @@ func (m *Model) ForceRunning(v bool) { m.running = v }
 
 // Drain runs one agent-drain cycle (test helper).
 func (m *Model) Drain() *Model {
-	nm, _ := m.drainAgent()
+	nm, _ := m.drainAgent(m.agentRunID)
 	return nm.(*Model)
 }
 

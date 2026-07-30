@@ -94,6 +94,49 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if isChoiceMenu(m.pending.kind) && !m.pending.textInput && m.input.Value() == "" {
+		switch key {
+		case "up":
+			m.movePendingCursor(-1)
+			m.touchPendingChoice()
+			m.refresh()
+			return m, nil
+		case "down":
+			m.movePendingCursor(1)
+			m.touchPendingChoice()
+			m.refresh()
+			return m, nil
+		case "enter":
+			if len(m.pending.options) == 1 || m.pending.cursorMoved {
+				return m.applyPendingCursor()
+			}
+			mm, cmd, _ := m.handlePendingInput("")
+			return mm, cmd
+		case "esc", "backspace":
+			return m.backPendingChoice()
+		}
+	}
+
+	if m.activityFocused {
+		switch key {
+		case "enter":
+			return m.openFocusedActivity()
+		case "esc", "shift+tab":
+			m.activityFocused = false
+			return m, nil
+		}
+	}
+
+	if key == "up" || key == "down" {
+		delta := 1
+		if key == "up" {
+			delta = -1
+		}
+		if m.moveSlashCursor(delta) {
+			return m, nil
+		}
+	}
+
 	switch key {
 	case "esc":
 		if m.running {
@@ -110,13 +153,23 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		return m, nil
 
+	case "shift+tab":
+		if len(m.activityItems()) > 0 {
+			m.activityFocused = true
+			return m, nil
+		}
+		return m, nil
+
 	case "tab":
 		// Slash completion first, then agent cycling.
 		v := m.input.Value()
-		if v == "" {
-			m.cycleAgent()
+		if v != "" {
+			if m.moveSlashCursor(1) {
+				return m, nil
+			}
 			return m, nil
 		}
+		m.cycleAgent()
 		return m, nil
 
 	case "alt+enter", "shift+enter", "ctrl+enter", "ctrl+j":
@@ -130,11 +183,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter":
+		if selected, ok := m.slashSelection(); ok {
+			m.input.SetValue("")
+			m.input.SetHeight(1)
+			m.histIdx = -1
+			m.pushHistory(selected)
+			return m.submit(selected)
+		}
 		// If the textarea has multiple logical lines, let user submit with enter
 		// (single line submits, multi-line submits on enter)
 		val := m.input.Value()
 		if strings.Contains(val, "\n") {
-			// Multi-line: submit the whole block
 			v := strings.TrimSpace(val)
 			if v == "" {
 				if m.pending.kind != pendingNone {
@@ -142,6 +201,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return mm, cmd
 				}
 				return m, nil
+			}
+			if m.running {
+				return m.submit(v)
 			}
 			m.input.SetValue("")
 			m.input.SetHeight(1)
@@ -158,20 +220,20 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.running {
+			return m.submit(v)
+		}
 		m.input.SetValue("")
 		m.input.SetHeight(1)
 		m.histIdx = -1
 		m.pushHistory(v)
 		return m.submit(v)
 
-	case "up", "down":
-		// Arrow keys scroll the chat transcript, not the input history.
-		// History recall is on Alt+up/down.
-		if key == "up" {
-			m.scrollBy(-m.scrollStep())
-		} else {
-			m.scrollBy(m.scrollStep())
-		}
+	case "up":
+		m.historyUp()
+		return m, nil
+	case "down":
+		m.historyDown()
 		return m, nil
 
 	case "pgup":
@@ -213,8 +275,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	prevLines := m.input.LineCount()
+	previousValue := m.input.Value()
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	if m.input.Value() != previousValue {
+		m.slashCursor = 0
+		m.histIdx = -1
+	}
 
 	m.resizeAfterInputEdit()
 	if m.input.LineCount() > prevLines {

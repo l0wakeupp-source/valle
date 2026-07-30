@@ -50,9 +50,11 @@ func patchGlobal(name, key string, value any) error {
 
 	doc := map[string]any{}
 	if raw, err := os.ReadFile(path); err == nil {
-		// Tolerate comments and trailing commas; a malformed file is treated
-		// as empty rather than blocking the write.
-		_ = json.Unmarshal(StripJSONC(raw), &doc)
+		if err := json.Unmarshal(StripJSONC(raw), &doc); err != nil {
+			return fmt.Errorf("refusing to patch malformed %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	doc[key] = value
 

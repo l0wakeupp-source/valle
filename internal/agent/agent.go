@@ -169,6 +169,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 
 	msgs := append([]provider.Message(nil), history...)
 	var lastErr error
+	repeatedCalls := make(map[string]int)
 
 	schemas := r.cfg.Tools.Schemas(r.cfg.ToolFilter)
 
@@ -180,9 +181,12 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 
 		// Lifecycle hook: turn start.
 		if r.cfg.Plugins != nil && r.cfg.Plugins.Len() > 0 {
-			r.cfg.Plugins.DispatchTurnStart(ctx, &plugin.TurnStartEvent{
+			pluginErrs := r.cfg.Plugins.DispatchTurnStart(ctx, &plugin.TurnStartEvent{
 				SessionID: r.cfg.SessionID, Agent: r.cfg.AgentName, TurnNumber: turn,
 			})
+			for _, pluginErr := range pluginErrs {
+				emit(Event{Kind: EvAgentMessage, Text: "plugin hook error: " + pluginErr.Error()})
+			}
 		}
 
 		req := provider.Request{
@@ -204,6 +208,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			calls      []provider.ToolCall
 			streamErr  error
 			stopReason string
+			streamDone bool
 		)
 
 		for ev := range ch {
@@ -244,6 +249,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 					}
 				}
 			case provider.EventDone:
+				streamDone = true
 				stopReason = ev.StopReason
 			case provider.EventError:
 				streamErr = ev.Err
@@ -254,12 +260,29 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			// Check for rate-limit / quota errors and rotate keys if configured.
 			if r.cfg.Provider != nil && r.cfg.Creds != nil && isRateLimitError(streamErr) {
 				provID, _ := config.SplitModel(r.cfg.Model)
-				if key := rotateKeyForProviderWithCreds(r.cfg.Creds, provID); key != "" {
-					r.cfg.Creds = r.cfg.Creds
-					emit(Event{Kind: EvError, Err: fmt.Errorf("rate limited, retrying with next key: %w", streamErr)})
+				key, rotateErr := rotateKeyForProviderWithCreds(r.cfg.Creds, provID)
+				if rotateErr != nil {
+					rotationErr := fmt.Errorf("rate-limit key rotation failed: %w", rotateErr)
+					emit(Event{Kind: EvError, Err: rotationErr})
+					return appended, rotationErr
+				}
+				if key != "" {
+					keySetter, ok := r.cfg.Provider.(interface{ SetAPIKey(string) })
+					if !ok {
+						rotationErr := fmt.Errorf("provider %q cannot accept rotated API keys", r.cfg.Provider.Name())
+						emit(Event{Kind: EvError, Err: rotationErr})
+						return appended, rotationErr
+					}
+					keySetter.SetAPIKey(key)
+					emit(Event{Kind: EvAgentMessage, Text: "rate limited; retrying with next key"})
 					continue
 				}
 			}
+			emit(Event{Kind: EvError, Err: streamErr})
+			return appended, streamErr
+		}
+		if !streamDone {
+			streamErr = fmt.Errorf("agent: provider stream ended without a completion event")
 			emit(Event{Kind: EvError, Err: streamErr})
 			return appended, streamErr
 		}
@@ -286,10 +309,13 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 
 		// Lifecycle hook: turn end.
 		if r.cfg.Plugins != nil && r.cfg.Plugins.Len() > 0 {
-			r.cfg.Plugins.DispatchTurnEnd(ctx, &plugin.TurnEndEvent{
+			pluginErrs := r.cfg.Plugins.DispatchTurnEnd(ctx, &plugin.TurnEndEvent{
 				SessionID: r.cfg.SessionID, Agent: r.cfg.AgentName,
 				TurnNumber: turn, StopReason: stopReason,
 			})
+			for _, pluginErr := range pluginErrs {
+				emit(Event{Kind: EvAgentMessage, Text: "plugin hook error: " + pluginErr.Error()})
+			}
 		}
 
 		if len(calls) == 0 {
@@ -297,6 +323,15 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			return appended, nil
 		}
 
+		for _, call := range calls {
+			key := call.Name + "\x00" + string(call.Input)
+			repeatedCalls[key]++
+			if repeatedCalls[key] > 2 {
+				err := fmt.Errorf("agent: repeated tool call limit reached for %s", call.Name)
+				emit(Event{Kind: EvError, Err: err})
+				return appended, err
+			}
+		}
 		results := r.execTools(ctx, calls, emit)
 		if ctx.Err() != nil {
 			return appended, ctx.Err()
@@ -363,34 +398,11 @@ func isRateLimitError(err error) bool {
 
 // rotateKeyForProviderWithCreds rotates the key for the given provider using the credentials store.
 // Returns the new key, or "" if rotation is not possible.
-func rotateKeyForProviderWithCreds(creds *config.Credentials, provID string) string {
+func rotateKeyForProviderWithCreds(creds *config.Credentials, provID string) (string, error) {
 	if creds == nil {
-		return ""
+		return "", nil
 	}
-	cred, ok := creds.Providers[provID]
-	if !ok {
-		return ""
-	}
-	mode := cred.APIKeyMode
-	if mode == "" {
-		mode = "single"
-	}
-	if mode != "failover" && mode != "round-robin" {
-		return ""
-	}
-	keys := creds.AllKeys(provID)
-	if len(keys) < 2 {
-		return ""
-	}
-	newKey := creds.RotateKey(provID)
-	if newKey == "" {
-		return ""
-	}
-	// Update the provider's API key.
-	cred.APIKey = newKey
-	creds.Set(provID, cred)
-	_ = creds.Save()
-	return newKey
+	return creds.RotateKeyAndSave(provID)
 }
 
 // execTools runs a batch of tool calls, honouring permissions and executing
@@ -398,6 +410,11 @@ func rotateKeyForProviderWithCreds(creds *config.Credentials, provID string) str
 func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit func(Event) bool) []provider.ContentBlock {
 	results := make([]provider.ContentBlock, len(calls))
 	events := make([]*ToolEvent, len(calls))
+	for i := range calls {
+		if calls[i].ID == "" {
+			calls[i].ID = fmt.Sprintf("rick-tool-%d-%d", time.Now().UnixNano(), i)
+		}
+	}
 
 	// Partition: read-only calls can run in parallel; the rest run in order.
 	parallelIdx := []int{}

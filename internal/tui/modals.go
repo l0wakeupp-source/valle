@@ -98,7 +98,7 @@ func (m *Model) cmdSessionsMenu() (tea.Model, tea.Cmd) {
 func (m *Model) applySessionMenu(action string) (tea.Model, tea.Cmd) {
 	switch action {
 	case "browse":
-		return m.cmdSessionPage("0")
+		return m.cmdSessions()
 	case "search":
 		m.armInput("search sessions:", pendingSessionSearch, "")
 		return m, nil
@@ -296,29 +296,21 @@ func (m *Model) cmdSessionsArgs(args string) (tea.Model, tea.Cmd) {
 	}
 }
 
-// cmdSessions lists resumable sessions inline (used by leader key).
+// cmdSessions opens the same full-screen browser used by `rick resume`.
 func (m *Model) cmdSessions() (tea.Model, tea.Cmd) {
-	metas, err := m.deps.Store.List(m.deps.Cwd)
-	if err != nil || len(metas) == 0 {
-		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "no saved sessions here yet", Time: time.Now()})
+	if m.running || m.agentCh != nil {
+		m.interrupt()
+	}
+	browser, err := newResumeModel(m.styles)
+	if err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "sessions: " + err.Error(), Time: time.Now()})
 		return m, nil
 	}
-	if len(metas) > 20 {
-		metas = metas[:20]
+	m.resumeBrowser = browser
+	if m.width > 0 && m.height > 0 {
+		browser.width, browser.height = m.width, m.height
+		browser.recalculateViewport()
 	}
-	var opts []choiceOption
-	for _, meta := range metas {
-		title := meta.Title
-		if title == "" {
-			title = "(untitled)"
-		}
-		opts = append(opts, choiceOption{
-			value: meta.ID, label: truncate(title, 40),
-			detail: humanAge(meta.Updated),
-			active: m.sess != nil && m.sess.ID == meta.ID,
-		})
-	}
-	m.armChoice("resume a session", pendingSession, "", opts)
 	return m, nil
 }
 
@@ -407,14 +399,8 @@ func humanAge(t time.Time) string {
 // ---------- session commands ----------
 
 func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
-	if m.running {
-		if m.agentCancel != nil {
-			m.agentCancel()
-		}
-		if m.permReply != nil {
-			m.answerPermission(agent.DecideReject)
-		}
-		m.running = false
+	if m.running || m.agentCh != nil {
+		m.interrupt()
 	}
 	m.agentCh = nil
 	m.agentCancel = nil
@@ -441,10 +427,8 @@ func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) doResume(id string) {
-	if m.agentCancel != nil {
-		m.agentCancel()
-		m.agentCancel = nil
-		m.running = false
+	if m.running || m.agentCh != nil {
+		m.interrupt()
 	}
 	m.resetSwarmRuntime()
 	sess, err := m.deps.Store.Load(id)
@@ -475,7 +459,7 @@ func (m *Model) doResume(id string) {
 
 func messagesToChat(msgs []provider.Message) []ChatMsg {
 	var out []ChatMsg
-	toolNames := map[string]string{}
+	toolMsgIndex := map[string]int{}
 	for _, msg := range msgs {
 		for _, b := range msg.Content {
 			switch b.Type {
@@ -489,18 +473,15 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 				}
 				out = append(out, ChatMsg{Kind: kind, Text: b.Text})
 			case "tool_use":
-				toolNames[b.ID] = b.Name
+				toolMsgIndex[b.ID] = len(out)
 				out = append(out, ChatMsg{
 					Kind: MsgTool, CallID: b.ID, ToolName: b.Name,
 					ToolTitle: b.Name, ToolInput: b.Input,
 				})
 			case "tool_result":
-				for i := len(out) - 1; i >= 0; i-- {
-					if out[i].Kind == MsgTool && out[i].CallID == b.ToolUseID {
-						out[i].ToolOutput = truncate(b.Content, toolOutputPreviewChars)
-						out[i].ToolErr = b.IsError
-						break
-					}
+				if index, ok := toolMsgIndex[b.ToolUseID]; ok && index < len(out) {
+					out[index].ToolOutput = truncate(b.Content, toolOutputPreviewChars)
+					out[index].ToolErr = b.IsError
 				}
 			}
 		}

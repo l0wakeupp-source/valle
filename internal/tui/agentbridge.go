@@ -34,6 +34,8 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 
 	ch := make(chan agent.Event, 128)
 	ctx, cancel := context.WithCancel(context.Background())
+	m.agentRunID++
+	runID := m.agentRunID
 	m.agentCh = ch
 	m.agentCancel = cancel
 	m.running = true
@@ -41,7 +43,7 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	m.streamBuf.Reset()
 	m.thinkBuf.Reset()
 	if m.deps.AgentRegistry != nil {
-		id, registerErr := m.deps.AgentRegistry.Register(agent.AgentEntry{
+		id, registerErr := m.deps.AgentRegistry.Register(&agent.AgentEntry{
 			Name: m.agentName, Depth: 0, Status: agent.AgentIdle,
 			Description: prompt, Cancel: cancel,
 		})
@@ -53,6 +55,8 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 		}
 		m.agentID = id
 	}
+	agentID := m.agentID
+	m.resizeForActivity()
 	cfg := m.deps.Loaded.Config
 	cfg.Instructions = append([]string(nil), cfg.Instructions...)
 	agentName := m.agentName
@@ -100,7 +104,7 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			Cwd:         cwd,
 			SessionID:   sessionID,
 			AgentName:   agentName,
-			AgentID:     m.agentID,
+			AgentID:     agentID,
 			Registry:    m.deps.AgentRegistry,
 			Snapshotter: snapshotter,
 			Plugins:     plugins,
@@ -116,11 +120,11 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 
 	// Track appended messages by reconstructing them in the Update loop.
 	m.pendingTools = map[string]int{}
-	return tea.Batch(m.drainCmd(), m.spinnerCmd())
+	return tea.Batch(m.drainCmd(runID), m.spinnerCmd())
 }
 
-func (m *Model) drainCmd() tea.Cmd {
-	return tea.Tick(40*time.Millisecond, func(time.Time) tea.Msg { return readAgentMsg{} })
+func (m *Model) drainCmd(runID uint64) tea.Cmd {
+	return tea.Tick(40*time.Millisecond, func(time.Time) tea.Msg { return readAgentMsg{runID: runID} })
 }
 
 func (m *Model) sessionID() string {
@@ -131,7 +135,10 @@ func (m *Model) sessionID() string {
 }
 
 // drainAgent pulls whatever is available from the agent channel.
-func (m *Model) drainAgent() (tea.Model, tea.Cmd) {
+func (m *Model) drainAgent(runID uint64) (tea.Model, tea.Cmd) {
+	if runID != m.agentRunID {
+		return m, nil
+	}
 	if m.agentCh == nil {
 		return m, nil
 	}
@@ -139,18 +146,21 @@ func (m *Model) drainAgent() (tea.Model, tea.Cmd) {
 		select {
 		case ev, ok := <-m.agentCh:
 			if !ok {
-				return m, m.finishRun(nil)
+				if m.agentCh != nil {
+					return m, m.finishRun(fmt.Errorf("agent event stream ended unexpectedly"))
+				}
+				return m, nil
 			}
 			if cmd, stop := m.applyAgentEvent(ev); stop {
 				return m, cmd
 			}
 		default:
 			m.refresh()
-			return m, m.drainCmd()
+			return m, m.drainCmd(runID)
 		}
 	}
 	m.refresh()
-	return m, m.drainCmd()
+	return m, m.drainCmd(runID)
 }
 
 func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
@@ -164,6 +174,14 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 	case agent.EvToolStart:
 		m.flushStream()
 		if ev.Tool != nil {
+			if ev.Tool.CallID != "" {
+				if _, pending := m.pendingTools[ev.Tool.CallID]; pending {
+					return nil, false
+				}
+				if _, completed := m.toolOutputs[ev.Tool.CallID]; completed {
+					return nil, false
+				}
+			}
 			idx := len(m.msgs)
 			m.pendingTools[ev.Tool.CallID] = idx
 			m.msgs = append(m.msgs, toolMsgFromEvent(ev.Tool, true))
@@ -172,6 +190,11 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvToolEnd:
 		if ev.Tool != nil {
+			if ev.Tool.CallID != "" {
+				if _, completed := m.toolOutputs[ev.Tool.CallID]; completed {
+					return nil, false
+				}
+			}
 			if m.toolOutputs == nil {
 				m.toolOutputs = make(map[string]string)
 			}
@@ -241,7 +264,25 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 	return nil, false
 }
 
-// flushStream converts the live buffers into permanent chat entries.
+// recordChildUsage updates persistent accounting from a child runner. Child
+// runners execute outside Bubble Tea's update loop, so the tracker is updated
+// at the event source rather than relying on a UI message arriving.
+func (m *Model) recordChildUsage(modelID string, usage provider.Usage) {
+	if m.deps.Usage != nil {
+		_ = m.deps.Usage.Record(modelID, usage.InputTokens, usage.OutputTokens,
+			usage.CacheReadTokens, usage.CacheWriteTokens)
+	}
+	if p := m.program; p != nil {
+		p.Send(childUsageMsg{usage: usage})
+	}
+}
+
+func (m *Model) recordUsageOnly(modelID string, usage provider.Usage) {
+	if m.deps.Usage != nil {
+		_ = m.deps.Usage.Record(modelID, usage.InputTokens, usage.OutputTokens,
+			usage.CacheReadTokens, usage.CacheWriteTokens)
+	}
+}
 func (m *Model) flushStream() {
 	if m.thinkBuf.Len() > 0 {
 		m.msgs = append(m.msgs, ChatMsg{Kind: MsgThinking, Text: m.thinkBuf.String(), Time: time.Now()})
@@ -271,6 +312,7 @@ func (m *Model) finishRun(err error) tea.Cmd {
 		m.agentCancel = nil
 	}
 	m.agentCh = nil
+	m.resizeForActivity()
 
 	// Rebuild the canonical history from what actually happened so the next
 	// turn replays tool calls and results correctly.
@@ -332,6 +374,21 @@ func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
 			pendingAssistant.Content = append(pendingAssistant.Content, provider.TextBlock(msg.Text))
 		case MsgTool:
 			if msg.ToolRunning {
+				if pendingAssistant == nil {
+					pendingAssistant = &provider.Message{Role: provider.RoleAssistant}
+				}
+				callID := msg.CallID
+				if callID == "" {
+					callID = fmt.Sprintf("interrupted-tool-%d", len(pendingResults))
+				}
+				input := msg.ToolInput
+				if len(input) == 0 {
+					input = []byte("{}")
+				}
+				pendingAssistant.Content = append(pendingAssistant.Content, provider.ContentBlock{
+					Type: "tool_use", ID: callID, Name: msg.ToolName, Input: input,
+				})
+				pendingResults = append(pendingResults, provider.ToolResultBlock(callID, "interrupted", true))
 				continue
 			}
 			if pendingAssistant == nil {
@@ -365,23 +422,27 @@ func capHistory(history []provider.Message) []provider.Message {
 }
 
 func (m *Model) interrupt() {
+	if m.permReply != nil {
+		m.answerPermission(agent.DecideReject)
+	}
+	if m.agentCh != nil {
+		// Invalidate already-scheduled drain ticks before cancelling the runner.
+		// The runner may still close its old channel after a new run starts.
+		agentID := m.agentID
+		m.agentRunID++
+		_ = m.finishRun(context.Canceled)
+		if m.deps.AgentRegistry != nil && agentID != "" {
+			m.deps.AgentRegistry.Update(agentID, agent.AgentKilled, "", context.Canceled)
+		}
+		m.setStatus("interrupted")
+		return
+	}
 	if m.agentCancel != nil {
 		m.agentCancel()
 		m.agentCancel = nil
 	}
-	// Stop already-scheduled drain commands from consuming a future run's
-	// channel. The runner observes the cancelled context and exits on its own.
-	m.agentCh = nil
-	if m.permReply != nil {
-		m.answerPermission(agent.DecideReject)
-	}
 	m.running = false
-	if !m.turnStart.IsZero() {
-		m.turnElapsed = time.Since(m.turnStart)
-	}
 	m.setStatus("interrupted")
-	m.flushStream()
-	m.refresh()
 }
 
 // makeAsker builds a permission callback that hands the request to the UI and

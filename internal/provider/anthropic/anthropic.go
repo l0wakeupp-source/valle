@@ -37,7 +37,7 @@ func New(apiKey, baseURL string) *Client {
 	return &Client{
 		APIKey:  catalog.CleanSecret(apiKey),
 		BaseURL: strings.TrimRight(strings.ReplaceAll(baseURL, "\x00", ""), "/"),
-		HTTP:    &http.Client{Timeout: 0}, // streaming: no client-level timeout
+		HTTP:    &http.Client{Timeout: 15 * time.Minute},
 	}
 }
 

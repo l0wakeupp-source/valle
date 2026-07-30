@@ -43,6 +43,7 @@ type ChatMsg struct {
 	ToolRunning bool
 	ToolElapsed time.Duration
 	Choices     []choiceOption
+	choiceID    uint64
 	CallID      string
 
 	// Diff entries
@@ -92,20 +93,32 @@ func (m *Model) renderMsg(msg ChatMsg, width int) string {
 	case MsgChoice:
 		var b strings.Builder
 		b.WriteString(s.Accent.Render(msg.Text) + "\n")
+		interactive := m.pending.choiceID != 0 && m.pending.choiceID == msg.choiceID && isChoiceMenu(m.pending.kind) && !m.pending.textInput
 		for i, o := range msg.Choices {
-			num := s.Faint.Render(fmt.Sprintf("  %2d ", i+1))
-			label := s.Base.Render(o.label)
-			if o.active {
-				label = s.Accent.Render(o.label)
+			marker := "  "
+			if interactive && i == m.pending.cursor {
+				marker = "▸ "
 			}
-			line := num + padRight(label, 34)
+			line := fmt.Sprintf("%s%2d %s", marker, i+1, padRight(o.label, 34))
 			if o.detail != "" {
-				line += s.Faint.Render(o.detail)
+				line += o.detail
 			}
 			if o.active {
-				line += s.Secondary.Render("  ← current")
+				line += "  ← current"
+			}
+			if interactive && i == m.pending.cursor {
+				line = s.Accent.Bold(true).Render(line)
+			} else if o.active {
+				line = s.Accent.Render(line)
+			} else {
+				line = s.Base.Render(line)
 			}
 			b.WriteString(strings.TrimRight(line, " ") + "\n")
+		}
+		if interactive {
+			b.WriteString(s.Faint.Render("  ↑/↓ select · enter confirm · esc/backspace back · type a number") + "\n")
+			b.WriteString(m.renderChoiceButtons())
+			return b.String()
 		}
 		hint := "type a number"
 		if msg.Text != "" && strings.Contains(msg.Text, "·") {
@@ -139,6 +152,26 @@ func (m *Model) renderMsg(msg ChatMsg, width int) string {
 		return m.renderTool(msg, width)
 	}
 	return ""
+}
+
+func (m *Model) choiceButtonStyle(active bool) lipgloss.Style {
+	c := m.styles.Theme().Color
+	foreground, background := c("text"), c("border")
+	if active {
+		foreground, background = c("background"), c("borderActive")
+	}
+	return lipgloss.NewStyle().Foreground(foreground).Background(background).Bold(true).Padding(0, 1)
+}
+
+func (m *Model) renderChoiceButtons() string {
+	back := m.choiceButtonStyle(false).Render("← Back")
+	selectButton := m.choiceButtonStyle(true).Render("↵ Select")
+	return "  " + back + " " + selectButton
+}
+
+func (m *Model) choiceButtonWidths() (int, int) {
+	return lipgloss.Width(m.choiceButtonStyle(false).Render("← Back")),
+		lipgloss.Width(m.choiceButtonStyle(true).Render("↵ Select"))
 }
 
 func (m *Model) fullToolOutput(msg ChatMsg) string {

@@ -25,15 +25,22 @@ func (m *Model) modelsFor(id string) []provider.ModelInfo {
 	if cred, ok := m.creds.Providers[id]; ok && len(cred.Models) > 0 {
 		out := make([]provider.ModelInfo, 0, len(cred.Models))
 		for _, mid := range cred.Models {
+			contextWindow := cred.ContextWindows[mid]
+			contextSource := cred.ContextSources[mid]
+			if override, ok := provider.ProviderContextWindow(id, mid); ok {
+				contextWindow = override
+				contextSource = provider.ContextSourceCatalog
+			}
 			out = append(out, provider.ModelInfo{
-				ID: mid, Name: mid, ContextWindow: cred.ContextWindows[mid],
+				ID: mid, Name: mid, ContextWindow: contextWindow,
+				ContextSource:  contextSource,
 				SupportsImages: stringSliceContains(cred.VisionModels, mid),
 			})
 		}
-		return out
+		return provider.FilterChatModels(out)
 	}
 	if p, ok := m.deps.Providers[id]; ok && p != nil {
-		return p.Models()
+		return provider.FilterChatModels(p.Models())
 	}
 	return nil
 }
@@ -128,11 +135,14 @@ const (
 
 // pendingChoice is an armed numbered selection.
 type pendingChoice struct {
-	kind      pendingKind
-	options   []choiceOption
-	context   string // e.g. the provider id while choosing a model
-	edit      *editModal
-	textInput bool // true when waiting for free text, not a number
+	kind        pendingKind
+	options     []choiceOption
+	context     string // e.g. the provider id while choosing a model
+	edit        *editModal
+	textInput   bool // true when waiting for free text, not a number
+	choiceID    uint64
+	cursor      int
+	cursorMoved bool
 }
 
 type choiceOption struct {
@@ -142,12 +152,61 @@ type choiceOption struct {
 	active bool
 }
 
+type choiceButtonZone struct {
+	id    string
+	x     int
+	y     int
+	width int
+}
+
+const (
+	choiceButtonBack   = "choice-back"
+	choiceButtonSelect = "choice-select"
+)
+
+func isChoiceMenu(kind pendingKind) bool {
+	return kind != pendingNone
+}
+
 func (m *Model) clearPending() { m.pending = pendingChoice{} }
 
 // armChoice prints a numbered list into the chat and waits for a number.
 func (m *Model) armChoice(title string, kind pendingKind, ctx string, opts []choiceOption) {
-	m.pending = pendingChoice{kind: kind, options: opts, context: ctx}
-	m.appendMsg(ChatMsg{Kind: MsgChoice, Text: title, Choices: opts, Time: nowFn()})
+	m.choiceSeq++
+	cursor := 0
+	for i, option := range opts {
+		if option.active {
+			cursor = i
+			break
+		}
+	}
+	m.pending = pendingChoice{kind: kind, options: opts, context: ctx, choiceID: m.choiceSeq, cursor: cursor}
+	m.appendMsg(ChatMsg{Kind: MsgChoice, Text: title, Choices: opts, choiceID: m.choiceSeq, Time: nowFn()})
+}
+
+func (m *Model) movePendingCursor(delta int) {
+	if !isChoiceMenu(m.pending.kind) || m.pending.textInput || len(m.pending.options) == 0 {
+		return
+	}
+	m.pending.cursor = (m.pending.cursor + delta + len(m.pending.options)) % len(m.pending.options)
+	m.pending.cursorMoved = true
+}
+
+func (m *Model) applyPendingCursor() (tea.Model, tea.Cmd) {
+	if !isChoiceMenu(m.pending.kind) || m.pending.textInput || len(m.pending.options) == 0 {
+		return m, nil
+	}
+	return m.applyChoice(m.pending.options[m.pending.cursor])
+}
+
+func (m *Model) backPendingChoice() (tea.Model, tea.Cmd) {
+	if m.pending.kind == pendingModel {
+		m.clearPending()
+		return m.cmdModels()
+	}
+	m.clearPending()
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "cancelled", Time: nowFn()})
+	return m, nil
 }
 
 // armInput prints a prompt and waits for free-form text input.
@@ -170,13 +229,8 @@ func (m *Model) handlePendingInput(text string) (tea.Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	if t == "b" || t == "back" {
-		if m.pending.kind == pendingModel {
-			m.clearPending()
-			mm, cmd := m.cmdModels()
-			return mm, cmd, true
-		}
-		m.clearPending()
-		return m, nil, true
+		mm, cmd := m.backPendingChoice()
+		return mm, cmd, true
 	}
 
 	// Text-input kinds accept any non-cancel text as the answer.
@@ -203,7 +257,7 @@ func (m *Model) handlePendingInput(text string) (tea.Model, tea.Cmd, bool) {
 	}
 	if n < 1 || n > len(m.pending.options) {
 		m.appendMsg(ChatMsg{Kind: MsgError,
-			Text: fmt.Sprintf("pick 1–%d, or press enter to cancel", len(m.pending.options)),
+			Text: fmt.Sprintf("pick 1–%d, or press enter to select", len(m.pending.options)),
 			Time: nowFn()})
 		return m, nil, true
 	}
@@ -219,6 +273,9 @@ func (m *Model) applyChoice(o choiceOption) (tea.Model, tea.Cmd) {
 	case pendingProvider:
 		return m.cmdModelsFor(o.value)
 	case pendingModel:
+		if o.value == "__back__" {
+			return m.cmdModels()
+		}
 		id := o.value
 		if ctx != "" {
 			id = ctx + "/" + id
@@ -393,6 +450,8 @@ func (m *Model) applyChoice(o choiceOption) (tea.Model, tea.Cmd) {
 		return m.applyKeyManage(o.value)
 	case pendingKeyMode:
 		return m.applyKeyMode(o.value)
+	case pendingJobManage:
+		return m.showJobDetail(o.value)
 	case pendingMaintenance:
 		return m, runUninstall(o.value)
 	}
@@ -598,6 +657,7 @@ func (m *Model) cmdModelsFor(providerID string) (tea.Model, tea.Cmd) {
 			value: mi.ID, label: mi.ID, detail: detail, active: mi.ID == activeModel,
 		})
 	}
+	opts = append(opts, choiceOption{value: "__back__", label: "b back"})
 	label := providerID
 	if e, ok := catalog.Get(providerID); ok {
 		label = e.Name

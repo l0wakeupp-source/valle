@@ -235,6 +235,24 @@ var Registry = []Entry{
 		KeyEnv:  []string{"LM_API_KEY"}, BaseEnv: "LM_BASE_URL", Note: "no key needed"},
 }
 
+// appendUnique appends generated entries while preserving the first entry for
+// each provider id. Curated entries therefore remain authoritative.
+func appendUnique(existing, additions []Entry) []Entry {
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	out := append([]Entry(nil), existing...)
+	for _, entry := range existing {
+		seen[entry.ID] = struct{}{}
+	}
+	for _, entry := range additions {
+		if _, ok := seen[entry.ID]; ok {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // Get returns the registry entry for an id.
 func Get(id string) (Entry, bool) {
 	for _, e := range Registry {

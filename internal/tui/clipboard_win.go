@@ -30,6 +30,7 @@ var (
 	procGlobalLock                 = kernel32.NewProc("GlobalLock")
 	procGlobalSize                 = kernel32.NewProc("GlobalSize")
 	procGlobalUnlock               = kernel32.NewProc("GlobalUnlock")
+	procRtlMoveMemory              = kernel32.NewProc("RtlMoveMemory")
 	procDragQueryFileW             = shell32.NewProc("DragQueryFileW")
 	procGetAsyncKeyState           = user32.NewProc("GetAsyncKeyState")
 	procGetForegroundWindow        = user32.NewProc("GetForegroundWindow")
@@ -194,8 +195,8 @@ func readClipboardImage() (string, error) {
 
 	size, _, _ := procGlobalSize.Call(h)
 	data := make([]byte, size)
-	for i := uintptr(0); i < size; i++ {
-		data[i] = *(*byte)(unsafe.Pointer(p + i))
+	if len(data) > 0 {
+		procRtlMoveMemory.Call(uintptr(unsafe.Pointer(&data[0])), p, size)
 	}
 
 	return dibToPNG(data)

@@ -8,6 +8,39 @@ import (
 	"rick/internal/modelsdev"
 )
 
+// ProviderContextWindow returns an explicit provider-specific context window
+// when the provider's deployment is smaller or larger than the base model.
+func ProviderContextWindow(providerID, modelID string) (int, bool) {
+	if !strings.EqualFold(strings.TrimSpace(providerID), "opencode-zen") {
+		return 0, false
+	}
+
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	switch id {
+	case "big-pickle":
+		return 200_000, true
+	case "deepseek-v4-flash-free", "mimo-v2.5-free":
+		return 200_000, true
+	case "laguna-s-2.1-free", "north-mini-code-free":
+		return 256_000, true
+	case "ling-3.0-flash-free":
+		return 262_144, true
+	case "nemotron-3-ultra-free":
+		return 1_000_000, true
+	default:
+		return 0, false
+	}
+}
+
+// KnownProviderContextWindow returns a provider-specific override when one is
+// known, otherwise falling back to the generic model-id catalog.
+func KnownProviderContextWindow(providerID, modelID string) int {
+	if ctx, ok := ProviderContextWindow(providerID, modelID); ok {
+		return ctx
+	}
+	return KnownContextWindow(modelID)
+}
+
 // KnownContextWindow returns a model's context window when it can be inferred
 // from its id, or 0.
 //
@@ -26,6 +59,13 @@ func KnownContextWindow(modelID string) int {
 	// An explicit size in the id wins: "-128k", "-1m", "-32768".
 	if n := sizeFromID(id); n > 0 {
 		return n
+	}
+
+	// The embedded models.dev catalog is a maintained model-specific source and
+	// is more reliable than broad family guesses. Explicit size suffixes above
+	// still win because they usually describe a deployment-specific limit.
+	if ctx, ok := modelsdev.Lookup(modelID); ok {
+		return ctx
 	}
 
 	switch {
@@ -88,11 +128,6 @@ func KnownContextWindow(modelID string) int {
 		return 131_072
 	case strings.Contains(id, "nemotron"):
 		return 131_072
-	}
-
-	// Fallback to models.dev database
-	if ctx, ok := modelsdev.Lookup(modelID); ok {
-		return ctx
 	}
 
 	return 0

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3 — 2026-07-30
+
+- Restored normal terminal text selection by scoping mouse reporting to active interactive agent/task controls.
+- Added dynamic mouse capture for active prompts and activity controls, with terminal mouse reset on startup and after completion.
+- Added prompt history, activity routing, lifecycle, provider, session, and regression coverage across the TUI and agent systems.
+
 ## v0.1.2 — 2026-07-29
 
 - Fixed the TUI splash version so release builds display `v0.1.2`.

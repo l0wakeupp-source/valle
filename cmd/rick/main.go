@@ -36,7 +36,7 @@ import (
 	"rick/internal/usage"
 )
 
-var Version = "0.1.2"
+var Version = "0.1.3"
 
 func main() {
 	var (
@@ -215,14 +215,15 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	}
 	// Saved /auth credentials fill in any provider rick.json did not pin.
 	creds, cerr := config.LoadCredentials()
-	if cerr == nil {
-		config.MergeCredentials(&loaded.Config, creds)
-		if loaded.Config.Model == "" {
-			for _, id := range creds.IDs() {
-				if mdl := config.FirstConfiguredModel(creds, id); mdl != "" {
-					loaded.Config.Model = mdl
-					break
-				}
+	if cerr != nil {
+		return tui.Deps{}, fmt.Errorf("load credentials: %w", cerr)
+	}
+	config.MergeCredentials(&loaded.Config, creds)
+	if loaded.Config.Model == "" {
+		for _, id := range creds.IDs() {
+			if mdl := config.FirstConfiguredModel(creds, id); mdl != "" {
+				loaded.Config.Model = mdl
+				break
 			}
 		}
 	}
@@ -400,9 +401,6 @@ func runTUI(dir string, o opts) error {
 	}
 	m := tui.New(deps)
 	popts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithReportFocus()}
-	if deps.Loaded.TUI.Mouse {
-		popts = append(popts, tea.WithMouseCellMotion())
-	}
 	p := tea.NewProgram(m, popts...)
 	m.SetProgram(p)
 	if len(deps.Loaded.Config.MCP) > 0 {
@@ -643,8 +641,8 @@ func modelsCmd() *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "MODEL\tCONTEXT\tNAME")
 			for name, p := range provs {
-				for _, mi := range p.Models() {
-					fmt.Fprintf(w, "%s/%s\t%dk\t%s\n", name, mi.ID, mi.ContextWindow/1000, mi.Name)
+				for _, mi := range provider.FilterChatModels(p.Models()) {
+					fmt.Fprintf(w, "%s/%s	%dk	%s\n", name, mi.ID, mi.ContextWindow/1000, mi.Name)
 				}
 			}
 			return w.Flush()
