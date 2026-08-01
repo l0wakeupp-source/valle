@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.5 — 2026-08-01
+
+### Reasoning / Thinking
+
+- `/thinking` now shows only the efforts supported by the active model instead of always showing off/minimal/low/medium/high.
+- Provider model catalogs can advertise supported efforts, defaults, mandatory reasoning, and token-budget-only reasoning; OpenRouter's concrete, null, and omitted effort metadata are handled distinctly.
+- Added model-specific vocabularies such as `max` and `xhigh`, boolean enablement for Qwen/GLM models, and mandatory-model menus without an invalid off option.
+- OpenRouter requests use its normalized `reasoning` object for effort and enablement-only models. Plain models still receive no reasoning fields by default.
+
+### Bug Fixes
+
+- Provider-aware reasoning detection and wire-format handling now cover GLM, Gemini, DeepSeek, Qwen, OpenAI, Anthropic-compatible MiniMax, and gateway model variants.
+- Reasoning history and streamed reasoning content remain available where the provider requires them.
+
+### Testing
+
+- Added provider, catalog, OpenAI-compatible wire, streaming, and TUI regression coverage for model-specific reasoning menus and request formats.
+
 ## v0.1.4 — 2026-08-01
 
 ### Performance
