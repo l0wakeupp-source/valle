@@ -22,15 +22,32 @@ import (
 
 // Model is one model advertised by a live endpoint.
 type Model struct {
-	ID                string
-	Name              string
-	Context           int
-	ContextSource     provider.ContextSource
-	Free              bool // zero-cost / free-tier model (id ends with :free)
-	SupportsImages    bool
-	ModalitiesKnown   bool
-	CapabilitiesKnown bool
-	ChatCapable       bool
+	ID                           string
+	Name                         string
+	Context                      int
+	ContextSource                provider.ContextSource
+	Free                         bool // zero-cost / free-tier model (id ends with :free)
+	SupportsImages               bool
+	ModalitiesKnown              bool
+	CapabilitiesKnown            bool
+	ChatCapable                  bool
+	ReasoningEfforts             []provider.ReasoningEffort
+	ReasoningEffortsKnown        bool
+	ReasoningEffortsAll          bool
+	ReasoningDefault             provider.ReasoningEffort
+	ReasoningDefaultEnabled      bool
+	ReasoningDefaultEnabledKnown bool
+	ReasoningMandatory           bool
+	ReasoningSupportsMaxTokens   bool
+	ReasoningKnown               bool
+}
+
+type reasoningMetadata struct {
+	SupportedEfforts  json.RawMessage `json:"supported_efforts"`
+	DefaultEffort     string          `json:"default_effort"`
+	DefaultEnabled    *bool           `json:"default_enabled"`
+	Mandatory         bool            `json:"mandatory"`
+	SupportsMaxTokens bool            `json:"supports_max_tokens"`
 }
 
 // attemptRec records one probe attempt so the best error can be chosen.
@@ -316,10 +333,11 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 			OutputModalities []string `json:"output_modalities"`
 			Modality         string   `json:"modality"`
 		} `json:"architecture"`
-		InputModalities  []string `json:"input_modalities"`
-		OutputModalities []string `json:"output_modalities"`
-		Modality         string   `json:"modality"`
-		Task             string   `json:"task"`
+		InputModalities  []string           `json:"input_modalities"`
+		OutputModalities []string           `json:"output_modalities"`
+		Modality         string             `json:"modality"`
+		Task             string             `json:"task"`
+		Reasoning        *reasoningMetadata `json:"reasoning"`
 	}
 
 	var envelope struct {
@@ -407,10 +425,16 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 		capabilitiesKnown := len(inputModalities) > 0 || len(outputModalities) > 0 || explicitTask
 		chatCapable := modelHasTextCapability(inputModalities, outputModalities) &&
 			!looksLikeNonChatTask(m.Task, m.Type, modality)
+		reasoning := parseReasoning(m.Reasoning)
 		out = append(out, Model{
 			ID: id, Name: name, Context: ctxLen, ContextSource: contextSource, Free: free,
 			SupportsImages: supportsImages, ModalitiesKnown: len(inputModalities) > 0 || len(outputModalities) > 0,
 			CapabilitiesKnown: capabilitiesKnown, ChatCapable: chatCapable,
+			ReasoningEfforts: reasoning.efforts, ReasoningEffortsKnown: reasoning.effortsKnown,
+			ReasoningEffortsAll: reasoning.effortsAll, ReasoningDefault: reasoning.defaultEffort,
+			ReasoningDefaultEnabled: reasoning.defaultEnabled, ReasoningDefaultEnabledKnown: reasoning.defaultEnabledKnown,
+			ReasoningMandatory: reasoning.mandatory, ReasoningSupportsMaxTokens: reasoning.supportsMaxTokens,
+			ReasoningKnown: reasoning.known,
 		})
 	}
 	if len(out) == 0 {
@@ -457,6 +481,50 @@ func parseModelInt(raw json.RawMessage) int {
 		return int(n)
 	}
 	return 0
+}
+
+type parsedReasoning struct {
+	efforts             []provider.ReasoningEffort
+	effortsKnown        bool
+	effortsAll          bool
+	defaultEffort       provider.ReasoningEffort
+	defaultEnabled      bool
+	defaultEnabledKnown bool
+	mandatory           bool
+	supportsMaxTokens   bool
+	known               bool
+}
+
+func parseReasoning(raw *reasoningMetadata) parsedReasoning {
+	if raw == nil {
+		return parsedReasoning{}
+	}
+	parsed := parsedReasoning{
+		mandatory:         raw.Mandatory,
+		supportsMaxTokens: raw.SupportsMaxTokens,
+		known:             true,
+	}
+	if raw.SupportedEfforts != nil {
+		parsed.effortsKnown = true
+		if string(raw.SupportedEfforts) == "null" {
+			parsed.effortsAll = true
+		} else {
+			var values []string
+			if err := json.Unmarshal(raw.SupportedEfforts, &values); err == nil {
+				for _, value := range values {
+					if effort, ok := provider.ParseEffort(value); ok && effort != provider.ReasoningOn {
+						parsed.efforts = append(parsed.efforts, effort)
+					}
+				}
+			}
+		}
+	}
+	parsed.defaultEffort, _ = provider.ParseEffort(raw.DefaultEffort)
+	if raw.DefaultEnabled != nil {
+		parsed.defaultEnabled = *raw.DefaultEnabled
+		parsed.defaultEnabledKnown = true
+	}
+	return parsed
 }
 
 func catalogFirstNonEmpty(values ...string) string {
