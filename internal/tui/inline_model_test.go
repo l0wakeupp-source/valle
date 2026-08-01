@@ -223,6 +223,103 @@ func TestGenericChoiceMenusHaveWorkingButtons(t *testing.T) {
 	}
 }
 
+type advertisedReasoningProvider struct{}
+
+func (advertisedReasoningProvider) Name() string { return "openrouter" }
+func (advertisedReasoningProvider) Models() []provider.ModelInfo {
+	return []provider.ModelInfo{{
+		ID:                    "vendor/model",
+		ReasoningKnown:        true,
+		ReasoningEffortsKnown: true,
+		ReasoningEfforts:      []provider.ReasoningEffort{provider.ReasoningMax, provider.ReasoningHigh, provider.ReasoningLow},
+		ReasoningDefault:      provider.ReasoningMax,
+	}}
+}
+func (advertisedReasoningProvider) Stream(context.Context, provider.Request, chan<- provider.Event) {}
+
+func TestReasoningChoiceUsesActiveModelVocabulary(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{
+		Loaded:    &config.Loaded{},
+		Providers: map[string]provider.Provider{"openrouter": advertisedReasoningProvider{}},
+	}
+	m.modelID = "openrouter/vendor/model"
+	m.updateContextWindow()
+	if _, _ = m.cmdReasoning(""); m.pending.kind != pendingReasoning {
+		t.Fatalf("reasoning command did not open a choice menu: %+v", m.pending)
+	}
+	got := make([]string, 0, len(m.pending.options))
+	for _, option := range m.pending.options {
+		got = append(got, option.value)
+	}
+	want := []string{"off", "low", "high", "max"}
+	if !equalStrings(got, want) {
+		t.Fatalf("reasoning options = %v, want %v", got, want)
+	}
+}
+
+type incompleteAdvertisedReasoningProvider struct{}
+
+func (incompleteAdvertisedReasoningProvider) Name() string { return "openrouter" }
+func (incompleteAdvertisedReasoningProvider) Models() []provider.ModelInfo {
+	return []provider.ModelInfo{{ID: "openai/gpt-5.2", ReasoningKnown: true}}
+}
+func (incompleteAdvertisedReasoningProvider) Stream(context.Context, provider.Request, chan<- provider.Event) {
+}
+
+func TestReasoningChoiceKeepsFallbackForIncompleteModelMetadata(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{
+		Loaded:    &config.Loaded{},
+		Providers: map[string]provider.Provider{"openrouter": incompleteAdvertisedReasoningProvider{}},
+	}
+	m.modelID = "openrouter/openai/gpt-5.2"
+	m.updateContextWindow()
+	if _, _ = m.cmdReasoning(""); m.pending.kind != pendingReasoning {
+		t.Fatalf("reasoning command did not open a choice menu: %+v", m.pending)
+	}
+	got := make([]string, 0, len(m.pending.options))
+	for _, option := range m.pending.options {
+		got = append(got, option.value)
+	}
+	want := []string{"off", "low", "medium", "high", "xhigh"}
+	if !equalStrings(got, want) {
+		t.Fatalf("reasoning options with incomplete metadata = %v, want %v", got, want)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestAuthModelBodyOnlyLabelsConfirmedReasoning(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.creds = &config.Credentials{Providers: map[string]config.Credential{"openai": {}}}
+	m.auth.draftID = "openai"
+	m.auth.models = []catalog.Model{
+		{ID: "custom-unknown"},
+		{ID: "gpt-5"},
+	}
+
+	rendered := m.authModelBody(100)
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.Contains(line, "custom-unknown") && strings.Contains(line, "reasoning") {
+			t.Fatalf("unknown model was labelled as confirmed reasoning: %q", line)
+		}
+		if strings.Contains(line, "gpt-5") && !strings.Contains(line, "reasoning") {
+			t.Fatalf("known reasoning model was not labelled: %q", line)
+		}
+	}
+}
+
 func TestModelChoiceSelectButtonSelectsHighlightedModel(t *testing.T) {
 	m := newModelChoiceTestModel()
 	m.viewport.YPosition = 0
