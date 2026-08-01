@@ -11,12 +11,9 @@ import (
 	"rick/internal/provider"
 )
 
-// cmdReasoning shows or sets the reasoning effort for the active model.
-//
-// The level is a spectrum, not a switch: reasoning models bill thinking
-// tokens and get slower as the budget grows, so "off / minimal / low /
-// medium / high" is the useful control. Models that cannot reason say so
-// rather than silently accepting a setting that does nothing.
+// cmdReasoning shows or sets the reasoning effort for the active model. The
+// selector is populated from the model's advertised vocabulary when available,
+// with provider/model fallbacks for endpoints that do not publish metadata.
 func (m *Model) cmdReasoning(args string) (tea.Model, tea.Cmd) {
 	_, modelID := config.SplitModel(m.modelID)
 
@@ -38,19 +35,15 @@ func (m *Model) cmdReasoning(args string) (tea.Model, tea.Cmd) {
 		lvl, ok := provider.ParseEffort(args)
 		if !ok {
 			m.appendMsg(ChatMsg{Kind: MsgError,
-				Text: "unknown level " + strconvQuote(args) + " — try off, minimal, low, medium or high",
+				Text: "unknown level " + strconvQuote(args) + " — available: " + formatReasoningEfforts(m.reasoningCapabilities.Efforts),
 				Time: time.Now()})
 			return m, nil
 		}
 		return m.applyReasoning(lvl)
 	}
 
-	// Otherwise offer the levels this model actually supports.
 	var opts []choiceOption
-	for _, lvl := range provider.ReasoningLevels() {
-		if lvl == provider.ReasoningMinimal && m.reasoningStyle == provider.ReasoningStyleAnthropic {
-			continue // Anthropic's floor is 1024 tokens; minimal is meaningless
-		}
+	for _, lvl := range m.reasoningCapabilities.Efforts {
 		opts = append(opts, choiceOption{
 			value:  string(lvl),
 			label:  string(lvl),
@@ -63,6 +56,12 @@ func (m *Model) cmdReasoning(args string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applyReasoning(lvl provider.ReasoningEffort) (tea.Model, tea.Cmd) {
+	if len(m.reasoningCapabilities.Efforts) > 0 && !containsReasoningEffort(m.reasoningCapabilities.Efforts, lvl) {
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: "reasoning level " + strconvQuote(string(lvl)) + " is not supported by " + m.displayModel() + " — available: " + formatReasoningEfforts(m.reasoningCapabilities.Efforts),
+			Time: time.Now()})
+		return m, nil
+	}
 	m.reasoning = lvl
 	// Showing the reasoning stream only makes sense when there is one.
 	m.showThinking = lvl != provider.ReasoningOff
@@ -74,10 +73,30 @@ func (m *Model) applyReasoning(lvl provider.ReasoningEffort) (tea.Model, tea.Cmd
 	return m, nil
 }
 
+func containsReasoningEffort(efforts []provider.ReasoningEffort, wanted provider.ReasoningEffort) bool {
+	for _, effort := range efforts {
+		if effort == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func formatReasoningEfforts(efforts []provider.ReasoningEffort) string {
+	values := make([]string, 0, len(efforts))
+	for _, effort := range efforts {
+		values = append(values, string(effort))
+	}
+	return strings.Join(values, ", ")
+}
+
 // effortDetail explains what a level costs in the model's own terms.
 func effortDetail(lvl provider.ReasoningEffort, style provider.ReasoningStyle, maxTok int) string {
-	if lvl == provider.ReasoningOff {
+	switch lvl {
+	case provider.ReasoningOff:
 		return "no thinking, fastest"
+	case provider.ReasoningOn:
+		return "thinking enabled; model controls depth"
 	}
 	if style == provider.ReasoningStyleAnthropic {
 		if b := lvl.Budget(maxTok); b > 0 {
@@ -91,9 +110,16 @@ func effortDetail(lvl provider.ReasoningEffort, style provider.ReasoningStyle, m
 	case provider.ReasoningLow:
 		return "quick reasoning"
 	case provider.ReasoningMedium:
-		return "balanced (default)"
+		return "balanced"
 	case provider.ReasoningHigh:
-		return "deepest, slowest"
+		return "deep reasoning"
+	case provider.ReasoningXHigh:
+		return "extra-deep reasoning"
+	case provider.ReasoningMax:
+		return "maximum reasoning"
+	}
+	if style == provider.ReasoningStyleGLM {
+		return "thinking enabled; model controls depth"
 	}
 	return ""
 }
