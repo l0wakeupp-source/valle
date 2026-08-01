@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -123,7 +122,7 @@ func cacheGet(provider string, query string, maxResults int) ([]searchResult, bo
 func cacheGetVariant(provider string, query string, maxResults int, variant string) ([]searchResult, bool) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	key := cacheKey{provider: provider, query: query, maxResults: maxResults, variant: variant}
+	key := cacheKey{provider: strings.ToLower(strings.TrimSpace(provider)), query: normalizedCacheQuery(query), maxResults: maxResults, variant: variant}
 	elem, ok := cacheMap[key]
 	if !ok {
 		return nil, false
@@ -145,7 +144,7 @@ func cachePut(provider, query string, maxResults int, results []searchResult, tt
 func cachePutVariant(provider, query string, maxResults int, results []searchResult, ttl time.Duration, variant string) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	key := cacheKey{provider: provider, query: query, maxResults: maxResults, variant: variant}
+	key := cacheKey{provider: strings.ToLower(strings.TrimSpace(provider)), query: normalizedCacheQuery(query), maxResults: maxResults, variant: variant}
 	if elem, ok := cacheMap[key]; ok {
 		cacheLRU.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
@@ -249,20 +248,33 @@ func markSearxSuccess(si *searxInstance) {
 
 // --- per-session budget ---
 
+type budgetUsage struct {
+	count    int
+	lastUsed time.Time
+}
+
 var (
 	budgetMu    sync.Mutex
-	budgetCount = map[string]int{}
+	budgetCount = map[string]budgetUsage{}
 )
 
 func checkBudget(sessionID string, max int) (bool, int) {
 	budgetMu.Lock()
 	defer budgetMu.Unlock()
-	count := budgetCount[sessionID]
-	if count >= max {
-		return false, count
+	now := time.Now()
+	for key, usage := range budgetCount {
+		if now.Sub(usage.lastUsed) > 2*time.Hour {
+			delete(budgetCount, key)
+		}
 	}
-	budgetCount[sessionID] = count + 1
-	return true, count + 1
+	usage := budgetCount[sessionID]
+	if usage.count >= max {
+		return false, usage.count
+	}
+	usage.count++
+	usage.lastUsed = now
+	budgetCount[sessionID] = usage
+	return true, usage.count
 }
 
 func resetBudget(sessionID string) {
@@ -273,10 +285,13 @@ func resetBudget(sessionID string) {
 
 func releaseBudget(sessionID string) {
 	budgetMu.Lock()
-	if count := budgetCount[sessionID]; count <= 1 {
+	usage, ok := budgetCount[sessionID]
+	if !ok || usage.count <= 1 {
 		delete(budgetCount, sessionID)
 	} else {
-		budgetCount[sessionID] = count - 1
+		usage.count--
+		usage.lastUsed = time.Now()
+		budgetCount[sessionID] = usage
 	}
 	budgetMu.Unlock()
 }
@@ -382,80 +397,103 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 	if args.MaxResults > 10 {
 		args.MaxResults = 10
 	}
+	cfg := config.CloneWebSearchConfig(t.Restrictions)
+	searchTool := WebSearchTool{Restrictions: cfg}
 	maxSession := 10
-	if t.Restrictions != nil && t.Restrictions.MaxSearchesPerSession > 0 {
-		maxSession = t.Restrictions.MaxSearchesPerSession
+	if cfg != nil {
+		if cfg.LogicalBudget > 0 {
+			maxSession = cfg.LogicalBudget
+		} else if cfg.MaxSearchesPerSession > 0 {
+			maxSession = cfg.MaxSearchesPerSession
+		}
 	}
-	allowed, n := checkBudget(tc.SessionID, maxSession)
+	budgetID := tc.SessionID
+	if strings.TrimSpace(budgetID) == "" {
+		budgetID = nextAnonymousBudgetID()
+	}
+	allowed, n := checkBudget(budgetID, maxSession)
 	if !allowed {
 		return Result{
-			Output: fmt.Sprintf("search budget exhausted (max %d per session)", maxSession),
+			Output: fmt.Sprintf("Rick session search budget exhausted (max %d per session)", maxSession),
 			Title:  "web search (budget exceeded)",
-			Meta:   map[string]any{"query": args.Query, "results": 0, "budget_exceeded": true},
+			Meta:   map[string]any{"query": args.Query, "results": 0, "budget_exceeded": true, "logical_budget": n},
 		}, nil
 	}
-	if t.Restrictions != nil && t.Restrictions.MaxResults > 0 && args.MaxResults > t.Restrictions.MaxResults {
-		args.MaxResults = t.Restrictions.MaxResults
+	if cfg != nil && cfg.MaxResults > 0 && args.MaxResults > cfg.MaxResults {
+		args.MaxResults = cfg.MaxResults
 	}
 
-	options, err := t.searchOptions(args)
+	options, err := searchTool.searchOptions(args)
 	if err != nil {
+		releaseBudget(budgetID)
 		return Errf("invalid search options: %v", err), nil
 	}
 	forced := strings.ToLower(strings.TrimSpace(args.Provider))
-	if forced == "" && t.Restrictions != nil {
-		forced = strings.ToLower(strings.TrimSpace(t.Restrictions.Provider))
+	if forced == "" && cfg != nil {
+		forced = strings.ToLower(strings.TrimSpace(cfg.Provider))
 	}
-	if forced == "ddg" {
+	if forced == "" && cfg != nil && cfg.Mode != "" {
+		forced = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	}
+	if forced == "ddg" || forced == "lite" {
 		forced = "duckduckgo"
 	}
-	if forced == "lite" {
-		forced = "duckduckgo"
-	}
-	providers := t.configuredProviders(options, forced)
+	providers := searchTool.configuredProvidersFor(cfg, options, forced)
 	if len(providers) == 0 {
+		releaseBudget(budgetID)
 		return Errf("no enabled web search providers are configured"), nil
 	}
 
-	searchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	searchCtx, cancel := context.WithTimeout(ctx, webSearchDeadline(cfg))
 	defer cancel()
 	variant := options.cacheVariant()
 	for _, provider := range providers {
-		variant += "&" + provider.name + "=" + providerConfig(t.Restrictions, provider.name).BaseURL
+		variant += "&" + provider.name + "=" + safeEndpointVariant(provider.config.BaseURL)
 	}
 	parallel := forced == "parallel"
-	if !parallel && t.Restrictions != nil && t.Restrictions.Parallel != nil {
-		parallel = *t.Restrictions.Parallel
+	if !parallel && cfg != nil && cfg.Parallel != nil {
+		parallel = *cfg.Parallel
 	}
 	maxParallel := defaultMaxParallel
-	if t.Restrictions != nil && t.Restrictions.MaxParallel > 0 {
-		maxParallel = t.Restrictions.MaxParallel
+	if cfg != nil && cfg.MaxParallel > 0 {
+		maxParallel = cfg.MaxParallel
+	}
+	if cfg != nil && cfg.MaxConcurrent > 0 && maxParallel > cfg.MaxConcurrent {
+		maxParallel = cfg.MaxConcurrent
 	}
 
 	var batches []providerBatch
-	if parallel {
-		batches = t.runParallelProviders(searchCtx, providers, args.Query, args.MaxResults, maxParallel, variant)
-	} else {
-		batches = make([]providerBatch, 0, len(providers))
-		for _, provider := range providers {
-			batch := t.runProvider(searchCtx, provider, args.Query, args.MaxResults, variant)
-			batches = append(batches, batch)
-			if batch.err != nil && (errors.Is(batch.err, context.Canceled) || errors.Is(batch.err, context.DeadlineExceeded)) {
-				break
-			}
-			if len(batch.results) > 0 {
-				break
-			}
+	inFlightKey := normalizedSearchKey(args.Query, args.MaxResults, forced, variant)
+	inFlight, isLeader := beginInFlightSearch(inFlightKey)
+	if !isLeader {
+		select {
+		case <-inFlight.done:
+			batches = cloneProviderBatches(inFlight.batches)
+		case <-searchCtx.Done():
+			return Errf("web search canceled while waiting for an identical search"), nil
 		}
+	} else {
+		batches = searchTool.collectProviderBatches(searchCtx, providers, args.Query, args.MaxResults, maxParallel, parallel, variant)
+		finishInFlightSearch(inFlightKey, inFlight, batches)
 	}
 
 	var lastErr error
 	providerNames := make([]string, 0, len(batches))
+	providerDiagnostics := make([]map[string]any, 0, len(batches))
 	for _, batch := range batches {
 		providerNames = append(providerNames, batch.name)
+		diagnostic := map[string]any{"provider": batch.name, "results": len(batch.results)}
 		if batch.err != nil {
 			lastErr = fmt.Errorf("%s: %w", batch.name, batch.err)
+			if typed := providerErrorFrom(batch.err, batch.name); typed != nil {
+				diagnostic["class"] = typed.Class
+				diagnostic["message"] = typed.Error()
+				if !typed.RetryAt.IsZero() {
+					diagnostic["retry_at"] = typed.RetryAt.Format(time.RFC3339)
+				}
+			}
 		}
+		providerDiagnostics = append(providerDiagnostics, diagnostic)
 	}
 	merged := mergeSearchResults(batches, args.MaxResults)
 	if len(merged) == 0 {
@@ -463,16 +501,16 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 			return Errf("web search canceled: %v", searchCtx.Err()), nil
 		}
 		if lastErr != nil {
-			return Errf("all web search providers failed for query: %s (last error: %v)", args.Query, lastErr), nil
+			return Errf("no configured/healthy provider succeeded for query %q: %v", args.Query, lastErr), nil
 		}
 		return Errf("all web search results were empty for query: %s", args.Query), nil
 	}
 	original := len(merged)
-	filtered := filterResults(merged, t.Restrictions)
+	filtered := filterResults(merged, cfg)
 	if len(filtered) == 0 {
 		return Errf("all search results were filtered out by domain restrictions for query: %s", args.Query), nil
 	}
-	result := formatResultsFiltered(args.Query, filtered, original, t.Restrictions)
+	result := formatResultsFiltered(args.Query, filtered, original, cfg)
 	if n >= 3 {
 		result.Output = fmt.Sprintf("[note: %d searches in this turn]\n%s", n, result.Output)
 	}
@@ -480,8 +518,25 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 		result.Meta = map[string]any{}
 	}
 	result.Meta["providers"] = providerNames
+	result.Meta["provider_diagnostics"] = providerDiagnostics
 	result.Meta["parallel"] = parallel
+	result.Meta["logical_budget_used"] = n
 	return result, nil
+}
+
+func webSearchDeadline(cfg *config.WebSearchConfig) time.Duration {
+	deadline := 45 * time.Second
+	if cfg != nil {
+		for _, provider := range cfg.Providers {
+			if provider.TimeoutSeconds > 0 {
+				candidate := time.Duration(provider.TimeoutSeconds) * time.Second
+				if candidate < deadline {
+					deadline = candidate
+				}
+			}
+		}
+	}
+	return deadline
 }
 
 func (t WebSearchTool) tryWithRetry(ctx context.Context, fn func(context.Context, string, int) ([]searchResult, error), query string, maxResults int) ([]searchResult, error) {
@@ -489,16 +544,18 @@ func (t WebSearchTool) tryWithRetry(ctx context.Context, fn func(context.Context
 	if err == nil {
 		return results, nil
 	}
-	if !retryableSearchError(err) {
+	providerErr := providerErrorFrom(err, "")
+	if providerErr == nil || !providerErr.Retryable {
 		return nil, err
 	}
-
-	base := 500 * time.Millisecond
-	jitter := time.Duration(rand.Int63n(int64(500 * time.Millisecond)))
-	timer := time.NewTimer(base + jitter)
+	delay := retryDelay(providerErr)
+	if deadline, ok := ctx.Deadline(); ok && time.Now().Add(delay).Add(100*time.Millisecond).After(deadline) {
+		return nil, err
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		timer.Stop()
 		return nil, ctx.Err()
 	case <-timer.C:
 	}
@@ -506,16 +563,8 @@ func (t WebSearchTool) tryWithRetry(ctx context.Context, fn func(context.Context
 }
 
 func retryableSearchError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"429", "408", "500", "502", "503", "504", "timeout", "temporarily", "connection reset", "eof"} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
+	providerErr := providerErrorFrom(err, "")
+	return providerErr != nil && providerErr.Retryable
 }
 
 // filterResults removes results whose domain does not match the allow list
@@ -1020,8 +1069,4 @@ func cleanHTML(s string) string {
 		b.WriteRune(r)
 	}
 	return strings.TrimSpace(b.String())
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
