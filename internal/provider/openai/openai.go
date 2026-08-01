@@ -90,6 +90,16 @@ func (c *Client) SetModels(m []provider.ModelInfo) {
 	}
 }
 
+func (c *Client) modelInfo(id string) *provider.ModelInfo {
+	for _, model := range c.models {
+		if model.ID == id {
+			copy := model
+			return &copy
+		}
+	}
+	return nil
+}
+
 // SetAPIKey updates the API key for this client.
 func (c *Client) SetAPIKey(key string) {
 	c.APIKey = key
@@ -118,10 +128,11 @@ type wireImageURL struct {
 }
 
 type wireMessage struct {
-	Role       string         `json:"role"`
-	Content    any            `json:"content,omitempty"`
-	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role             string         `json:"role"`
+	Content          any            `json:"content,omitempty"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
 type wireTool struct {
@@ -143,8 +154,22 @@ type wireRequest struct {
 	Temperature *float64      `json:"temperature,omitempty"`
 	// Effort is OpenAI's reasoning control; Qwen-style endpoints use the
 	// boolean instead. Only one is ever set.
-	Effort         string `json:"reasoning_effort,omitempty"`
-	EnableThinking *bool  `json:"enable_thinking,omitempty"`
+	Effort         string         `json:"reasoning_effort,omitempty"`
+	EnableThinking *bool          `json:"enable_thinking,omitempty"`
+	Thinking       *wireThinking  `json:"thinking,omitempty"`
+	Reasoning      *wireReasoning `json:"reasoning,omitempty"`
+}
+
+// wireThinking is GLM's native OpenAI-compatible thinking switch.
+type wireThinking struct {
+	Type          string `json:"type"`
+	ClearThinking *bool  `json:"clear_thinking,omitempty"`
+}
+
+type wireReasoning struct {
+	Effort    string `json:"effort,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
 }
 
 type streamOpts struct {
@@ -153,12 +178,19 @@ type streamOpts struct {
 
 // toWire flattens rick's block model onto OpenAI's message model.
 func toWire(system string, msgs []provider.Message) []wireMessage {
+	return toWireWithReasoning(system, msgs, false)
+}
+
+// toWireWithReasoning preserves reasoning_content for providers such as GLM
+// and DeepSeek that require it when a tool call is followed by another turn.
+func toWireWithReasoning(system string, msgs []provider.Message, includeReasoning bool) []wireMessage {
 	var out []wireMessage
 	if strings.TrimSpace(system) != "" {
 		out = append(out, wireMessage{Role: "system", Content: system})
 	}
 	for _, m := range msgs {
 		var text strings.Builder
+		var reasoning strings.Builder
 		var calls []wireToolCall
 		var results []wireMessage
 		var imageBlocks []wireImageContent
@@ -167,6 +199,10 @@ func toWire(system string, msgs []provider.Message) []wireMessage {
 			switch b.Type {
 			case "text":
 				text.WriteString(b.Text)
+			case "thinking":
+				if includeReasoning {
+					reasoning.WriteString(b.Text)
+				}
 			case "tool_use":
 				var tc wireToolCall
 				tc.ID = b.ID
@@ -195,10 +231,13 @@ func toWire(system string, msgs []provider.Message) []wireMessage {
 			}
 		}
 
-		if m.Role == provider.RoleAssistant && (text.Len() > 0 || len(calls) > 0) {
+		if m.Role == provider.RoleAssistant && (text.Len() > 0 || reasoning.Len() > 0 || len(calls) > 0) {
 			wm := wireMessage{Role: "assistant", ToolCalls: calls}
 			if text.Len() > 0 {
 				wm.Content = text.String()
+			}
+			if reasoning.Len() > 0 {
+				wm.ReasoningContent = reasoning.String()
 			}
 			out = append(out, wm)
 		} else if m.Role == provider.RoleUser && (text.Len() > 0 || len(imageBlocks) > 0) {
@@ -259,9 +298,17 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		return
 	}
 
+	style, _ := provider.DetectReasoningForProvider(c.ID, req.Model)
+	advertised := c.modelInfo(req.Model)
+	preserveReasoning := style == provider.ReasoningStyleGLM || style == provider.ReasoningStyleDeepSeek ||
+		style == provider.ReasoningStyleAlways || style == provider.ReasoningStyleQwen ||
+		style == provider.ReasoningStyleUnknown
+	if c.ID == "openrouter" && advertised != nil && advertised.ReasoningKnown {
+		preserveReasoning = true
+	}
 	body := wireRequest{
 		Model:       req.Model,
-		Messages:    toWire(req.System, req.Messages),
+		Messages:    toWireWithReasoning(req.System, req.Messages, preserveReasoning),
 		Tools:       toWireTools(req.Tools),
 		Stream:      true,
 		StreamOpts:  &streamOpts{IncludeUsage: true},
@@ -269,16 +316,63 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		Temperature: req.Temperature,
 	}
 
-	// Reasoning controls, in whichever dialect the model speaks.
-	if req.Reasoning != "" && req.Reasoning != provider.ReasoningOff {
-		switch style, _ := provider.DetectReasoning(req.Model); style {
+	// OpenRouter has one normalized reasoning object. Use it for every
+	// explicitly selected effort so model-specific metadata is not translated
+	// into a potentially unsupported root reasoning_effort field.
+	if c.ID == "openrouter" && style != provider.ReasoningStyleAlways && req.Reasoning != "" &&
+		(req.Reasoning != provider.ReasoningOff || style != provider.ReasoningStyleNone && style != provider.ReasoningStyleUnknown) {
+		body.Reasoning = &wireReasoning{}
+		if req.Reasoning == provider.ReasoningOn {
+			on := true
+			body.Reasoning.Enabled = &on
+		} else {
+			body.Reasoning.Effort = map[provider.ReasoningEffort]string{
+				provider.ReasoningOff: "none",
+			}[req.Reasoning]
+			if body.Reasoning.Effort == "" {
+				body.Reasoning.Effort = string(req.Reasoning)
+			}
+		}
+		body.Temperature = nil
+	} else if req.Reasoning != "" && req.Reasoning != provider.ReasoningOff {
+		// Direct providers use their native reasoning dialect.
+		switch style {
 		case provider.ReasoningStyleOpenAI:
-			body.Effort = string(req.Reasoning)
+			effort := req.Reasoning
+			if effort == provider.ReasoningOn {
+				// Unknown/gateway-normalized models use the common medium
+				// effort as their explicit opt-in.
+				effort = provider.ReasoningMedium
+			}
+			body.Effort = string(effort)
 			// Reasoning models reject a custom temperature.
 			body.Temperature = nil
 		case provider.ReasoningStyleQwen:
 			on := true
 			body.EnableThinking = &on
+		case provider.ReasoningStyleGLM:
+			clearThinking := false
+			body.Thinking = &wireThinking{Type: "enabled", ClearThinking: &clearThinking}
+			if req.Reasoning != provider.ReasoningOn && strings.Contains(strings.ToLower(req.Model), "glm-5.2") {
+				body.Effort = string(req.Reasoning)
+			}
+			// Reasoning models reject a custom temperature.
+			body.Temperature = nil
+		case provider.ReasoningStyleDeepSeek:
+			body.Effort = string(req.Reasoning)
+			body.Thinking = &wireThinking{Type: "enabled"}
+			// Reasoning models reject a custom temperature.
+			body.Temperature = nil
+		case provider.ReasoningStyleUnknown:
+			// Custom gateways often omit capability metadata. Only use the
+			// generic OpenAI field after the user explicitly enables thinking;
+			// the default off path never sends an unsupported parameter.
+			effort := req.Reasoning
+			if effort == provider.ReasoningOn {
+				effort = provider.ReasoningMedium
+			}
+			body.Effort = string(effort)
+			body.Temperature = nil
 		}
 	}
 
@@ -382,9 +476,10 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string         `json:"content"`
-					Reasoning string         `json:"reasoning"`
-					ToolCalls []wireToolCall `json:"tool_calls"`
+					Content          string         `json:"content"`
+					Reasoning        string         `json:"reasoning"`
+					ReasoningContent string         `json:"reasoning_content"`
+					ToolCalls        []wireToolCall `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
@@ -418,7 +513,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 					return
 				}
 			}
-			if t := choice.Delta.Reasoning; t != "" {
+			if t := choice.Delta.Reasoning + choice.Delta.ReasoningContent; t != "" {
 				if !emit(provider.Event{Kind: provider.EventThinking, Text: t}) {
 					return
 				}
@@ -502,6 +597,12 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.ModelInfo, error) {
 			ID: model.ID, Name: model.Name, ContextWindow: contextWindow,
 			ContextSource: contextSource, SupportsImages: model.SupportsImages,
 			CapabilitiesKnown: model.CapabilitiesKnown, ChatCapable: model.ChatCapable,
+			ReasoningEfforts:      append([]provider.ReasoningEffort(nil), model.ReasoningEfforts...),
+			ReasoningEffortsKnown: model.ReasoningEffortsKnown, ReasoningEffortsAll: model.ReasoningEffortsAll,
+			ReasoningDefault: model.ReasoningDefault, ReasoningDefaultEnabled: model.ReasoningDefaultEnabled,
+			ReasoningDefaultEnabledKnown: model.ReasoningDefaultEnabledKnown, ReasoningMandatory: model.ReasoningMandatory,
+			ReasoningSupportsMaxTokens: model.ReasoningSupportsMaxTokens,
+			ReasoningKnown:             model.ReasoningKnown,
 		})
 	}
 	return infos, nil
