@@ -28,14 +28,17 @@ const (
 )
 
 type searchOptions struct {
-	Region         string
-	SafeSearch     string
-	TimeRange      string
-	DDGBackend     string
-	ExaType        string
-	Livecrawl      string
-	IncludeDomains []string
-	ExcludeDomains []string
+	Region               string
+	SafeSearch           string
+	TimeRange            string
+	DDGBackend           string
+	ExaType              string
+	Livecrawl            string
+	IncludeDomains       []string
+	ExcludeDomains       []string
+	TavilyTimeRange      string
+	TavilyIncludeDomains []string
+	TavilyExcludeDomains []string
 }
 
 func (o searchOptions) cacheVariant() string {
@@ -56,6 +59,12 @@ func (o searchOptions) cacheVariant() string {
 	b.WriteString(strings.Join(o.IncludeDomains, ","))
 	b.WriteString("&exclude=")
 	b.WriteString(strings.Join(o.ExcludeDomains, ","))
+	b.WriteString("&tavily_time=")
+	b.WriteString(o.TavilyTimeRange)
+	b.WriteString("&tavily_include=")
+	b.WriteString(strings.Join(o.TavilyIncludeDomains, ","))
+	b.WriteString("&tavily_exclude=")
+	b.WriteString(strings.Join(o.TavilyExcludeDomains, ","))
 	return b.String()
 }
 
@@ -104,7 +113,7 @@ func providerEnabled(cfg *config.WebSearchConfig, name string) bool {
 		return *provider.Enabled
 	}
 	switch name {
-	case "duckduckgo", "bing", "brave", "searxng":
+	case "duckduckgo":
 		return true
 	default:
 		return providerConfigured(cfg, name)
@@ -118,24 +127,39 @@ func envAPIKey(name, configured string) string {
 	return strings.TrimSpace(os.Getenv(name))
 }
 
+func providerAPIKey(provider config.WebSearchProviderConfig, fallbackEnv string) string {
+	envName := firstNonEmpty(provider.APIKeyEnv, fallbackEnv)
+	return envAPIKey(envName, provider.APIKey)
+}
+
 func (t WebSearchTool) searchOptions(args searchArgs) (searchOptions, error) {
 	ddg := providerConfig(t.Restrictions, "duckduckgo")
 	exa := providerConfig(t.Restrictions, "exa")
+	tavily := providerConfig(t.Restrictions, "tavily")
 	options := searchOptions{
-		Region:         firstNonEmpty(args.Region, ddg.Region, defaultDDGRegion),
-		SafeSearch:     firstNonEmpty(args.SafeSearch, ddg.SafeSearch, defaultDDGSafeSearch),
-		TimeRange:      firstNonEmpty(args.TimeRange, ddg.TimeRange),
-		DDGBackend:     firstNonEmpty(args.DDGBackend, ddg.Backend, defaultDDGBackend),
-		ExaType:        firstNonEmpty(args.ExaType, exa.Type, "auto"),
-		Livecrawl:      firstNonEmpty(args.Livecrawl, exa.Livecrawl, "fallback"),
-		IncludeDomains: append([]string(nil), args.IncludeDomains...),
-		ExcludeDomains: append([]string(nil), args.ExcludeDomains...),
+		Region:          firstNonEmpty(args.Region, ddg.Region, defaultDDGRegion),
+		SafeSearch:      firstNonEmpty(args.SafeSearch, ddg.SafeSearch, defaultDDGSafeSearch),
+		TimeRange:       firstNonEmpty(args.TimeRange, ddg.TimeRange),
+		DDGBackend:      firstNonEmpty(args.DDGBackend, ddg.Backend, defaultDDGBackend),
+		ExaType:         firstNonEmpty(args.ExaType, exa.Type, "auto"),
+		Livecrawl:       firstNonEmpty(args.Livecrawl, exa.Livecrawl, "fallback"),
+		IncludeDomains:  append([]string(nil), args.IncludeDomains...),
+		ExcludeDomains:  append([]string(nil), args.ExcludeDomains...),
+		TavilyTimeRange: firstNonEmpty(args.TimeRange, tavily.TimeRange),
 	}
 	if len(options.IncludeDomains) == 0 {
 		options.IncludeDomains = append([]string(nil), exa.IncludeDomains...)
 	}
 	if len(options.ExcludeDomains) == 0 {
 		options.ExcludeDomains = append([]string(nil), exa.ExcludeDomains...)
+	}
+	options.TavilyIncludeDomains = append([]string(nil), options.IncludeDomains...)
+	options.TavilyExcludeDomains = append([]string(nil), options.ExcludeDomains...)
+	if len(args.IncludeDomains) == 0 {
+		options.TavilyIncludeDomains = append([]string(nil), tavily.IncludeDomains...)
+	}
+	if len(args.ExcludeDomains) == 0 {
+		options.TavilyExcludeDomains = append([]string(nil), tavily.ExcludeDomains...)
 	}
 	if err := validateSearchOptions(&options); err != nil {
 		return searchOptions{}, err
@@ -185,65 +209,109 @@ func validateSearchOptions(options *searchOptions) error {
 }
 
 type configuredSearchProvider struct {
-	name   string
-	weight float64
-	fn     func(context.Context, string, int) ([]searchResult, error)
+	name        string
+	weight      float64
+	priority    int
+	globalLimit int
+	config      config.WebSearchProviderConfig
+	fn          func(context.Context, string, int) ([]searchResult, error)
 }
 
 func (t WebSearchTool) configuredProviders(options searchOptions, forced string) []configuredSearchProvider {
-	providers := make([]configuredSearchProvider, 0, 7)
+	return t.configuredProvidersFor(t.Restrictions, options, forced)
+}
+
+func (t WebSearchTool) configuredProvidersFor(cfg *config.WebSearchConfig, options searchOptions, forced string) []configuredSearchProvider {
+	providers := make([]configuredSearchProvider, 0, 16)
 	add := func(name string, weight float64, fn func(context.Context, string, int) ([]searchResult, error)) {
-		if forced == "" || forced == "auto" || forced == "parallel" || forced == name {
-			providers = append(providers, configuredSearchProvider{name: name, weight: weight, fn: fn})
+		if forced != "" && forced != "auto" && forced != "parallel" && forced != name {
+			return
 		}
+		provider := providerConfig(cfg, name)
+		if provider.CacheTTLSeconds == 0 && cfg != nil && cfg.CacheTTLSeconds > 0 {
+			provider.CacheTTLSeconds = cfg.CacheTTLSeconds
+		}
+		priority := provider.Priority
+		if priority <= 0 {
+			priority = defaultProviderPriority(name)
+		}
+		globalLimit := defaultGlobalWebConcurrency
+		if cfg != nil && cfg.MaxConcurrent > 0 {
+			globalLimit = cfg.MaxConcurrent
+		}
+		if globalLimit > defaultGlobalWebConcurrency {
+			globalLimit = defaultGlobalWebConcurrency
+		}
+		providers = append(providers, configuredSearchProvider{name: name, weight: weight, priority: priority, globalLimit: globalLimit, config: provider, fn: fn})
 	}
 
-	if providerEnabled(t.Restrictions, "ollama") || forced == "ollama" {
-		ollama := providerConfig(t.Restrictions, "ollama")
+	if providerEnabled(cfg, "ollama") || forced == "ollama" {
+		ollama := providerConfig(cfg, "ollama")
 		add("ollama", providerWeight(ollama.Weight, 1.05), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
 			return ollamaSearch(ctx, query, maxResults, ollama)
 		})
 	}
-	if providerEnabled(t.Restrictions, "duckduckgo") || forced == "duckduckgo" || forced == "ddg" || forced == "ddglite" {
-		ddg := providerConfig(t.Restrictions, "duckduckgo")
+	if providerEnabled(cfg, "duckduckgo") || forced == "duckduckgo" || forced == "ddg" || forced == "ddglite" {
+		ddg := providerConfig(cfg, "duckduckgo")
 		add("duckduckgo", providerWeight(ddg.Weight, 1.0), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
 			return duckDuckGoSearch(ctx, query, maxResults, ddg, options)
 		})
 	}
-	if providerEnabled(t.Restrictions, "bing") || forced == "bing" {
-		add("bing", 0.95, bingSearch)
+	if forced == "bing" {
+		add("bing", 0.1, func(context.Context, string, int) ([]searchResult, error) {
+			return nil, &ProviderError{Provider: "bing", Class: ProviderNotSupported, Message: "Bing Search API is retired; remove the bing provider", TryFallback: true}
+		})
 	}
-	if providerEnabled(t.Restrictions, "brave") || forced == "brave" {
-		add("brave", 1.0, braveSearch)
+	if providerEnabled(cfg, "brave") || forced == "brave" {
+		brave := providerConfig(cfg, "brave")
+		add("brave", providerWeight(brave.Weight, 1.1), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
+			return braveConfiguredSearch(ctx, query, maxResults, brave)
+		})
 	}
-	if providerEnabled(t.Restrictions, "searxng") || forced == "searxng" {
-		add("searxng", 0.9, searXNGSearch)
+	if providerEnabled(cfg, "searxng") || forced == "searxng" {
+		searx := providerConfig(cfg, "searxng")
+		add("searxng", providerWeight(searx.Weight, 0.9), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
+			return searXNGSearchWithConfig(ctx, query, maxResults, searx)
+		})
 	}
 	if forced == "ddginstant" {
-		ddg := providerConfig(t.Restrictions, "duckduckgo")
+		ddg := providerConfig(cfg, "duckduckgo")
 		add("ddginstant", providerWeight(ddg.Weight, 0.75), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
 			return duckDuckGoInstantWithOptions(ctx, query, maxResults, ddg, options)
 		})
-	} else if forced == "" || forced == "auto" || forced == "parallel" {
-		if providerEnabled(t.Restrictions, "ddginstant") {
-			ddg := providerConfig(t.Restrictions, "duckduckgo")
-			add("ddginstant", providerWeight(ddg.Weight, 0.75), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
-				return duckDuckGoInstantWithOptions(ctx, query, maxResults, ddg, options)
-			})
-		}
+	} else if (forced == "" || forced == "auto" || forced == "parallel") && providerConfigured(cfg, "ddginstant") {
+		ddg := providerConfig(cfg, "duckduckgo")
+		add("ddginstant", providerWeight(ddg.Weight, 0.75), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
+			return duckDuckGoInstantWithOptions(ctx, query, maxResults, ddg, options)
+		})
 	}
-	if providerEnabled(t.Restrictions, "exa") || forced == "exa" {
-		exa := providerConfig(t.Restrictions, "exa")
+	if providerEnabled(cfg, "exa") || forced == "exa" {
+		exa := providerConfig(cfg, "exa")
 		add("exa", providerWeight(exa.Weight, 1.35), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
 			return exaSearch(ctx, query, maxResults, exa, options)
 		})
 	}
-	if providerEnabled(t.Restrictions, "tavily") || forced == "tavily" {
-		tavily := providerConfig(t.Restrictions, "tavily")
+	if providerEnabled(cfg, "tavily") || forced == "tavily" {
+		tavily := providerConfig(cfg, "tavily")
 		add("tavily", providerWeight(tavily.Weight, 1.2), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
 			return tavilySearch(ctx, query, maxResults, tavily, options)
 		})
 	}
+	for _, name := range []string{"serper", "you", "firecrawl", "serpapi", "google_cse", "jina", "gdelt", "mediawiki", "arxiv", "crossref", "openalex", "github", "stackexchange", "hackernews", "archive"} {
+		if providerEnabled(cfg, name) || forced == name {
+			provider := providerConfig(cfg, name)
+			providerName := name
+			add(providerName, providerWeight(provider.Weight, defaultProviderWeight(providerName)), func(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
+				return optionalProviderSearch(ctx, providerName, query, maxResults, provider)
+			})
+		}
+	}
+	sort.SliceStable(providers, func(i, j int) bool {
+		if providers[i].priority != providers[j].priority {
+			return providers[i].priority < providers[j].priority
+		}
+		return providers[i].name < providers[j].name
+	})
 	return providers
 }
 
@@ -265,13 +333,35 @@ func (t WebSearchTool) runProvider(ctx context.Context, provider configuredSearc
 	if cached, ok := cacheGetVariant(provider.name, query, maxResults, variant); ok {
 		return providerBatch{name: provider.name, weight: provider.weight, results: normalizeResults(cached, maxResults)}
 	}
+	endpoint := provider.config.BaseURL
+	if endpoint == "" {
+		endpoint = provider.name
+	}
+	healthKeyValue, healthErr := beginProviderHealth(provider.name, endpoint)
+	if healthErr != nil {
+		return providerBatch{name: provider.name, weight: provider.weight, err: healthErr}
+	}
+	started := time.Now()
+	release, err := sharedWebSearchScheduler.acquire(ctx, provider.name, provider.config.MaxConcurrency, provider.config.MaxRPM, provider.globalLimit)
+	if err != nil {
+		typed := providerErrorFrom(err, provider.name)
+		finishProviderHealth(healthKeyValue, typed, 0, time.Since(started))
+		return providerBatch{name: provider.name, weight: provider.weight, err: typed}
+	}
+	defer release()
 	results, err := t.tryWithRetry(ctx, provider.fn, query, maxResults)
 	if err != nil {
-		return providerBatch{name: provider.name, weight: provider.weight, err: err}
+		typed := providerErrorFrom(err, provider.name)
+		finishProviderHealth(healthKeyValue, typed, 0, time.Since(started))
+		return providerBatch{name: provider.name, weight: provider.weight, err: typed}
 	}
 	results = normalizeResults(results, maxResults)
+	finishProviderHealth(healthKeyValue, nil, len(results), time.Since(started))
 	if len(results) > 0 {
 		ttl := cacheTTL[provider.name]
+		if provider.config.CacheTTLSeconds > 0 {
+			ttl = time.Duration(provider.config.CacheTTLSeconds) * time.Second
+		}
 		if ttl == 0 {
 			ttl = 300 * time.Second
 		}
@@ -748,7 +838,7 @@ func ollamaSearch(ctx context.Context, query string, maxResults int, provider co
 	endpoint := joinProviderEndpoint(firstNonEmpty(provider.BaseURL, defaultOllamaSearchURL), "web_search")
 	request := map[string]any{"query": query, "max_results": maxResults}
 	headers := map[string]string{"Accept": "application/json"}
-	if key := envAPIKey("OLLAMA_API_KEY", provider.APIKey); key != "" {
+	if key := providerAPIKey(provider, "OLLAMA_API_KEY"); key != "" {
 		headers["Authorization"] = "Bearer " + key
 	}
 	body, err := doSearchJSON(ctx, http.MethodPost, endpoint, request, headers, "ollama")
@@ -791,9 +881,9 @@ type exaSearchResponse struct {
 }
 
 func exaSearch(ctx context.Context, query string, maxResults int, provider config.WebSearchProviderConfig, options searchOptions) ([]searchResult, error) {
-	key := envAPIKey("EXA_API_KEY", provider.APIKey)
+	key := providerAPIKey(provider, "EXA_API_KEY")
 	if key == "" {
-		return nil, fmt.Errorf("exa: API key is not configured")
+		return nil, newProviderError("exa", ProviderMissingConfig, "API key is not configured")
 	}
 	request := exaSearchRequest{
 		Query:          query,
@@ -853,19 +943,28 @@ type tavilySearchResponse struct {
 }
 
 func tavilySearch(ctx context.Context, query string, maxResults int, provider config.WebSearchProviderConfig, options searchOptions) ([]searchResult, error) {
-	key := envAPIKey("TAVILY_API_KEY", provider.APIKey)
+	key := providerAPIKey(provider, "TAVILY_API_KEY")
 	if key == "" {
-		return nil, fmt.Errorf("tavily: API key is not configured")
+		return nil, newProviderError("tavily", ProviderMissingConfig, "API key is not configured")
+	}
+	tavilyTimeRange := firstNonEmpty(options.TavilyTimeRange, options.TimeRange)
+	tavilyIncludeDomains := options.TavilyIncludeDomains
+	if len(tavilyIncludeDomains) == 0 {
+		tavilyIncludeDomains = options.IncludeDomains
+	}
+	tavilyExcludeDomains := options.TavilyExcludeDomains
+	if len(tavilyExcludeDomains) == 0 {
+		tavilyExcludeDomains = options.ExcludeDomains
 	}
 	request := tavilySearchRequest{
 		Query:          query,
 		SearchDepth:    "basic",
 		MaxResults:     maxResults,
 		Topic:          firstNonEmpty(provider.Type, "general"),
-		IncludeDomains: append([]string(nil), options.IncludeDomains...),
-		ExcludeDomains: append([]string(nil), options.ExcludeDomains...),
+		IncludeDomains: append([]string(nil), tavilyIncludeDomains...),
+		ExcludeDomains: append([]string(nil), tavilyExcludeDomains...),
 	}
-	if freshness, ok := duckDuckGoTimeRangeValue(options.TimeRange); ok {
+	if freshness, ok := duckDuckGoTimeRangeValue(tavilyTimeRange); ok {
 		request.TimeRange = map[string]string{"d": "day", "w": "week", "m": "month", "y": "year"}[freshness]
 	}
 	endpoint := joinProviderEndpoint(firstNonEmpty(provider.BaseURL, defaultTavilySearchURL), "search")
@@ -894,10 +993,10 @@ func joinProviderEndpoint(base, path string) string {
 func doSearchHTTP(ctx context.Context, method, endpoint string, body []byte, headers map[string]string, provider string) ([]byte, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, err
+		return nil, newProviderError(provider, ProviderPermanent, "invalid endpoint")
 	}
 	if err := waitHostGap(ctx, parsed.Hostname(), 2*time.Second); err != nil {
-		return nil, err
+		return nil, providerErrorFrom(err, provider)
 	}
 	var reader io.Reader
 	if body != nil {
@@ -905,7 +1004,7 @@ func doSearchHTTP(ctx context.Context, method, endpoint string, body []byte, hea
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
-		return nil, err
+		return nil, newProviderError(provider, ProviderPermanent, "invalid request")
 	}
 	request.Header.Set("User-Agent", chromeUA)
 	for key, value := range headers {
@@ -913,18 +1012,18 @@ func doSearchHTTP(ctx context.Context, method, endpoint string, body []byte, hea
 	}
 	response, err := webSearchClient.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, providerErrorFrom(err, provider)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: HTTP %d", provider, response.StatusCode)
+		return nil, providerHTTPError(provider, response.StatusCode, response.Header)
 	}
 	result, err := io.ReadAll(io.LimitReader(response.Body, maxSearchResponseBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, providerErrorFrom(err, provider)
 	}
 	if len(result) > maxSearchResponseBytes {
-		return nil, fmt.Errorf("%s: response exceeds %d bytes", provider, maxSearchResponseBytes)
+		return nil, newProviderError(provider, ProviderInvalidResponse, "response exceeds configured limit")
 	}
 	return result, nil
 }
