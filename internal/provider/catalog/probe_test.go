@@ -6,6 +6,40 @@ import (
 	"rick/internal/provider"
 )
 
+func TestParseModelsReadsReasoningCapabilities(t *testing.T) {
+	body := []byte(`{"data":[
+		{"id":"effort-model","reasoning":{"supported_efforts":["high","low"],"default_effort":"high","default_enabled":true,"mandatory":true}},
+		{"id":"all-efforts-model","reasoning":{"supported_efforts":null}},
+		{"id":"budget-model","reasoning":{"supports_max_tokens":true,"default_enabled":false}}
+	]}`)
+	models, _, err := ParseModels(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]Model, len(models))
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	explicit := byID["effort-model"]
+	if !explicit.ReasoningKnown || !explicit.ReasoningEffortsKnown || !explicit.ReasoningMandatory || len(explicit.ReasoningEfforts) != 2 {
+		t.Fatalf("explicit reasoning metadata = %+v", explicit)
+	}
+	if explicit.ReasoningDefault != provider.ReasoningHigh {
+		t.Fatalf("explicit default = %q", explicit.ReasoningDefault)
+	}
+	if !explicit.ReasoningDefaultEnabled || !explicit.ReasoningDefaultEnabledKnown {
+		t.Fatalf("explicit default enabled = %+v", explicit)
+	}
+	allEfforts := byID["all-efforts-model"]
+	if !allEfforts.ReasoningEffortsAll || !allEfforts.ReasoningEffortsKnown {
+		t.Fatalf("all-efforts metadata = %+v", allEfforts)
+	}
+	budget := byID["budget-model"]
+	if !budget.ReasoningKnown || budget.ReasoningEffortsKnown || !budget.ReasoningSupportsMaxTokens || budget.ReasoningDefaultEnabled || !budget.ReasoningDefaultEnabledKnown {
+		t.Fatalf("budget metadata = %+v", budget)
+	}
+}
+
 func TestParseModelsReadsImageCapability(t *testing.T) {
 	body := []byte(`{"object":"list","data":[
 		{"id":"text-model","architecture":{"input_modalities":["text"]}},
