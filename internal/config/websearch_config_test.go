@@ -29,3 +29,17 @@ func TestMergeWebSearchConfigPreservesProviderDefaults(t *testing.T) {
 		t.Fatalf("merged domains = %#v", exa.IncludeDomains)
 	}
 }
+
+func TestMergeWebSearchConfigCanClearInheritedSecretsAndEndpoints(t *testing.T) {
+	base := &WebSearchConfig{Providers: map[string]WebSearchProviderConfig{
+		"searxng": {APIKey: "secret", BaseURL: "https://private.example"},
+	}}
+	override := &WebSearchConfig{Providers: map[string]WebSearchProviderConfig{
+		"searxng": {ClearAPIKey: true, ClearBaseURL: true},
+	}}
+	merged := mergeWebSearchConfig(base, override)
+	provider := merged.Providers["searxng"]
+	if provider.APIKey != "" || provider.BaseURL != "" {
+		t.Fatalf("clear flags did not remove inherited values: %#v", provider)
+	}
+}
