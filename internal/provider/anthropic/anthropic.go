@@ -228,7 +228,8 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 
 	// Extended thinking, when the model supports it and a level is asked for.
-	if style, _ := provider.DetectReasoning(req.Model); style == provider.ReasoningStyleAnthropic {
+	if style, _ := provider.DetectReasoningForProvider("anthropic", req.Model); style == provider.ReasoningStyleAnthropic ||
+		(style == provider.ReasoningStyleUnknown && req.Reasoning != provider.ReasoningOff) {
 		if budget := req.Reasoning.Budget(maxTok); budget > 0 {
 			body.Thinking = &wireThinking{Type: "enabled", BudgetTokens: budget}
 			// Anthropic rejects a temperature alongside thinking.
