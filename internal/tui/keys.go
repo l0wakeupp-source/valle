@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"rick/internal/agent"
 	"rick/internal/permission"
 	"rick/internal/provider"
+	"rick/internal/tools"
 )
 
 func (m *Model) syncInputHeight() bool {
@@ -94,6 +97,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.web.active {
+		return m.handleWebKey(msg, key)
+	}
+
 	if isChoiceMenu(m.pending.kind) && !m.pending.textInput && m.input.Value() == "" {
 		switch key {
 		case "up":
@@ -161,12 +168,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "tab":
-		// Slash completion first, then agent cycling.
-		v := m.input.Value()
-		if v != "" {
-			if m.moveSlashCursor(1) {
-				return m, nil
-			}
+		// Complete a slash command before using Tab for agent cycling.
+		if m.completeSlashCommand() {
 			return m, nil
 		}
 		m.cycleAgent()
@@ -478,6 +481,10 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 		m.setStatus("still working — esc to interrupt")
 		return m, nil
 	}
+	if m.compactionActive {
+		m.setStatus("compacting — wait for completion")
+		return m, nil
+	}
 
 	// An armed inline selection gets first refusal on the input.
 	if mm, cmd, handled := m.handlePendingInput(text); handled {
@@ -541,7 +548,47 @@ func (m *Model) runShell(cmdline string) (tea.Model, tea.Cmd) {
 		Kind: MsgTool, ToolName: "bash", ToolTitle: cmdline,
 		ToolRunning: true, Time: time.Now(),
 	})
-	return m, nil
+	idx := len(m.msgs) - 1
+	request := permission.Request{Tool: "bash", Title: cmdline, Command: cmdline, Body: cmdline}
+	level := permission.Allow
+	if m.deps.Perms != nil {
+		level = m.deps.Perms.Check(request)
+	}
+	if level == permission.Deny {
+		return m, func() tea.Msg {
+			return shellDoneMsg{idx: idx, err: fmt.Errorf("permission denied by policy: %s", cmdline)}
+		}
+	}
+
+	return m, func() tea.Msg {
+		ctx := context.Background()
+		decision := agent.DecideAccept
+		if level == permission.Ask {
+			decision = m.makeAsker()(ctx, request)
+			if decision == agent.DecideReject {
+				return shellDoneMsg{idx: idx, err: fmt.Errorf("permission denied: %s", cmdline)}
+			}
+			if decision == agent.DecideAlways && m.deps.Perms != nil {
+				m.deps.Perms.GrantSession(permission.SessionKey(request))
+			}
+		}
+		if m.deps.Registry == nil {
+			return shellDoneMsg{idx: idx, err: fmt.Errorf("bash tool is unavailable")}
+		}
+		tool, ok := m.deps.Registry.Get("bash")
+		if !ok {
+			return shellDoneMsg{idx: idx, err: fmt.Errorf("bash tool is unavailable")}
+		}
+		input, _ := json.Marshal(map[string]string{"command": cmdline, "description": cmdline})
+		result, err := tool.Run(ctx, tools.Context{Cwd: m.deps.Cwd, SessionID: m.sessionID(), Agent: m.agentName}, input)
+		if err != nil {
+			return shellDoneMsg{idx: idx, err: err}
+		}
+		if result.IsError {
+			return shellDoneMsg{idx: idx, err: fmt.Errorf("%s", result.Output)}
+		}
+		return shellDoneMsg{idx: idx, output: result.Output}
+	}
 }
 
 // handlePermissionKey navigates the compact approval panel.

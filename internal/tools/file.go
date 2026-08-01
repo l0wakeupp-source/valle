@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -106,7 +107,7 @@ func (ReadTool) ReadOnly() bool { return true }
 // Description implements Tool.
 func (ReadTool) Description() string {
 	return "Read a file from the filesystem. Returns contents with 1-indexed line numbers " +
-		"in the form 'NNNN|line'. Use offset/limit for large files. Always read a file " +
+		"in the form 'N|line'. Use offset/limit for large files. Always read a file " +
 		"before editing it. Prefer this over 'cat' via bash."
 }
 
@@ -203,8 +204,9 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if len(line) > 2000 {
 			line = line[:2000] + " …<truncated>"
 		}
-		fmt.Fprintf(&b, "%5d|%s\n", i+1, line)
-		written += len(line) + 7
+		lineNumber := strconv.Itoa(i + 1)
+		fmt.Fprintf(&b, "%s|%s\n", lineNumber, line)
+		written += len(lineNumber) + len(line) + 2
 		if written > maxBytes {
 			fmt.Fprintf(&b, "\n<output truncated at %d bytes; continue with offset=%d>\n", maxBytes, i+2)
 			end = i + 1

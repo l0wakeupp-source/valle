@@ -45,17 +45,21 @@ func (m *Model) cmdYolo(args string) (tea.Model, tea.Cmd) {
 
 	// Link sandbox state to yolo: yolo on → sandbox off, yolo off → sandbox on.
 	if m.deps.Sandbox != nil {
+		var policy sandbox.Policy
 		if want {
-			m.deps.Sandbox.SetMode(sandbox.ModeOff)
+			policy = m.deps.Sandbox.SetMode(sandbox.ModeOff)
 		} else {
-			m.deps.Sandbox.SetMode(sandbox.ModeWorkspace)
+			policy = m.deps.Sandbox.SetMode(sandbox.ModeWorkspace)
+		}
+		if m.deps.Perms != nil {
+			m.deps.Perms.SetSandboxRoot(policy.Workspace, policy.Mode == sandbox.ModeWorkspace)
 		}
 	}
 
 	var b strings.Builder
 	if want {
-		b.WriteString("YOLO MODE ON — every tool call is auto-approved.\n")
-		b.WriteString("No prompts for edits, writes, or shell commands.\n")
+		b.WriteString("YOLO MODE ON — every non-blocklisted tool call is auto-approved.\n")
+		b.WriteString("No prompts for edits, writes, or shell commands; protected paths remain denied.\n")
 		b.WriteString("Sandbox turned OFF — commands run unconfined on the host.\n")
 	} else {
 		b.WriteString("yolo mode off — the permission policy applies again.\n")
@@ -121,6 +125,9 @@ func (m *Model) cmdSandbox(args string) (tea.Model, tea.Cmd) {
 	}
 
 	policy := holder.SetMode(mode)
+	if m.deps.Perms != nil {
+		m.deps.Perms.SetSandboxRoot(policy.Workspace, policy.Mode == sandbox.ModeWorkspace)
+	}
 	text := "sandbox: " + policy.Describe()
 	if mode == sandbox.ModeOff {
 		text = "SANDBOX OFF — commands now run directly on the host with no confinement."

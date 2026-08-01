@@ -1,0 +1,6 @@
+{
+  "results": [
+    {"title": "Ollama", "url": "https://ollama.com/", "content": "Run and use large language models locally."},
+    {"title": "Ollama web search", "url": "https://docs.ollama.com/capabilities/web-search", "content": "Search results from the Ollama web search API."}
+  ]
+}

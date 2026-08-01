@@ -76,6 +76,9 @@ type Permission struct {
 // sandbox.Policy but lives here so config has no dependency on the sandbox
 // package.
 type SandboxConfig struct {
+	// Root is the workspace-write fence. Relative paths are resolved from the
+	// project root; empty means the project root itself.
+	Root            string   `json:"root,omitempty"`
 	Mode            string   `json:"mode,omitempty"`        // read-only | workspace-write | trusted | off
 	Enforcement     string   `json:"enforcement,omitempty"` // auto | os | static
 	Network         *bool    `json:"network,omitempty"`
@@ -123,12 +126,37 @@ type Command struct {
 	Model       string `json:"model,omitempty"`
 }
 
-// WebSearchConfig restricts web search results by domain.
+// WebSearchProviderConfig contains provider-specific defaults and credentials.
+// API keys may also be supplied through the provider's conventional environment
+// variable so they do not need to be written to rick.json.
+type WebSearchProviderConfig struct {
+	Enabled        *bool    `json:"enabled,omitempty"`
+	APIKey         string   `json:"api_key,omitempty"`
+	BaseURL        string   `json:"base_url,omitempty"`
+	Backend        string   `json:"backend,omitempty"`
+	Region         string   `json:"region,omitempty"`
+	SafeSearch     string   `json:"safe_search,omitempty"`
+	TimeRange      string   `json:"time_range,omitempty"`
+	Type           string   `json:"type,omitempty"`
+	Livecrawl      string   `json:"livecrawl,omitempty"`
+	MaxAgeHours    *int     `json:"max_age_hours,omitempty"`
+	IncludeDomains []string `json:"include_domains,omitempty"`
+	ExcludeDomains []string `json:"exclude_domains,omitempty"`
+	Weight         float64  `json:"weight,omitempty"`
+}
+
+// WebSearchConfig restricts web search results by domain and controls the
+// provider pipeline. Existing domain and budget fields remain compatible with
+// the original web_search configuration shape.
 type WebSearchConfig struct {
-	AllowDomains          []string `json:"allow_domains,omitempty"`            // if set, only these domains
-	DenyDomains           []string `json:"deny_domains,omitempty"`             // always blocked
-	MaxResults            int      `json:"max_results,omitempty"`              // default 5
-	MaxSearchesPerSession int      `json:"max_searches_per_session,omitempty"` // budget, default 10
+	AllowDomains          []string                           `json:"allow_domains,omitempty"`            // if set, only these domains
+	DenyDomains           []string                           `json:"deny_domains,omitempty"`             // always blocked
+	MaxResults            int                                `json:"max_results,omitempty"`              // default 5
+	MaxSearchesPerSession int                                `json:"max_searches_per_session,omitempty"` // budget, default 10
+	Provider              string                             `json:"provider,omitempty"`
+	Parallel              *bool                              `json:"parallel,omitempty"`
+	MaxParallel           int                                `json:"max_parallel,omitempty"`
+	Providers             map[string]WebSearchProviderConfig `json:"providers,omitempty"`
 }
 
 // Config is rick.json.
@@ -201,6 +229,8 @@ type Loaded struct {
 	Config      Config
 	TUI         TUI
 	ProjectRoot string
+	// SandboxRoot is the effective workspace fence exposed to runtime clients.
+	SandboxRoot string
 	Sources     []string
 }
 
@@ -439,5 +469,91 @@ func FindProjectRoot(dir string) string {
 			return dir
 		}
 		d = parent
+	}
+}
+
+// SandboxRoot resolves the configured workspace-write fence from one place.
+// Relative roots are anchored to projectRoot so tools never need to invent
+// their own interpretation of the sandbox configuration.
+func SandboxRoot(sandbox *SandboxConfig, projectRoot string) string {
+	root := strings.TrimSpace(projectRoot)
+	if sandbox != nil && strings.TrimSpace(sandbox.Root) != "" {
+		root = strings.TrimSpace(sandbox.Root)
+		if strings.HasPrefix(root, "~") {
+			if home, err := os.UserHomeDir(); err == nil {
+				root = filepath.Join(home, strings.TrimPrefix(root, "~"))
+			}
+		}
+		if !filepath.IsAbs(root) {
+			root = filepath.Join(projectRoot, root)
+		}
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(root)
+}
+
+// PathWithinRoot reports whether path is safely contained by root. Existing
+// symlinks and junctions are resolved, while new files are checked against the
+// deepest existing parent. An error means containment could not be established
+// and callers must fail closed.
+func PathWithinRoot(root, path string) (bool, error) {
+	if strings.TrimSpace(root) == "" || strings.TrimSpace(path) == "" {
+		return false, fmt.Errorf("empty sandbox path")
+	}
+	rootPath, err := resolveContainmentPath(root)
+	if err != nil {
+		return false, fmt.Errorf("resolve sandbox root: %w", err)
+	}
+	targetPath, err := resolveContainmentPath(path)
+	if err != nil {
+		return false, fmt.Errorf("resolve target path: %w", err)
+	}
+	if runtime.GOOS == "windows" {
+		rootPath = strings.ToLower(rootPath)
+		targetPath = strings.ToLower(targetPath)
+	}
+	rel, err := filepath.Rel(rootPath, targetPath)
+	if err != nil {
+		return false, err
+	}
+	if rel == "." {
+		return true, nil
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
+}
+
+func resolveContainmentPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	missing := ""
+	for current := abs; ; current = filepath.Dir(current) {
+		if _, statErr := os.Lstat(current); statErr == nil {
+			resolved, evalErr := filepath.EvalSymlinks(current)
+			if evalErr != nil {
+				return "", evalErr
+			}
+			if missing != "" {
+				resolved = filepath.Join(resolved, missing)
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(statErr) {
+			return "", statErr
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", os.ErrNotExist
+		}
+		part := filepath.Base(current)
+		if missing == "" {
+			missing = part
+		} else {
+			missing = filepath.Join(part, missing)
+		}
 	}
 }

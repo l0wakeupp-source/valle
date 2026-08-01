@@ -1,0 +1,6 @@
+{
+  "results": [
+    {"title": "Go Documentation", "url": "https://go.dev/doc/", "highlights": ["Official documentation for the Go programming language."], "summary": "Go docs"},
+    {"title": "Go Packages", "url": "https://pkg.go.dev/", "text": "Discover Go packages."}
+  ]
+}

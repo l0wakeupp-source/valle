@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.1.4 — 2026-08-01
+
+### Performance
+
+- Fixed slow session loading in `/sessions` and on resume.
+
+### Bug Fixes
+
+- Approved commands now execute correctly when `/yolo` is off (no longer reported as failed).
+- Scroll wheel now scrolls chat history instead of prompt history.
+- Direct `!` shell commands now go through the permission system.
+- Fixed multi-line diff calculation.
+- Fixed provider resolution incorrectly consuming the compaction cooldown.
+- Repeated tool-call detection now canonicalizes equivalent JSON inputs.
+- Undo snapshots are taken once per model tool-call turn instead of once per mutating call.
+- Snapshot comparisons no longer stage worktree files in the shadow index, and restores remove files absent from the target snapshot.
+- Linux process-count limits now use architecture-specific `RLIMIT_NPROC` values.
+- Bubblewrap no longer exposes the entire home directory; only selected toolchain cache directories are mounted read-only.
+
+### UI / Icons
+
+- Removed the graphical “rick” PNG icon and all related terminal graphics code.
+- Pixelated icon is now the single default.
+
+### UX
+
+- Tab autocomplete for slash commands (type `/s`, Tab to complete).
+- Added direct `/theme <name>` support.
+- Mouse tracking stays enabled in chat view.
+- Blocked prompt submission while compaction is running.
+
+### Token & Output Efficiency
+
+- Split system prompt into stable (cacheable) and volatile parts; Anthropic cache markers applied.
+  - Cacheable prefix ≈ 84–184 tokens depending on agent.
+- Shortened prompts and tool descriptions (~143 + ~175 tokens saved).
+- Compact line numbers (1|line instead of padded) — noticeable savings on large files.
+- ~15 KiB output caps on Git, tree, diagnostics, and test commands.
+- Compaction cooldown, no overlapping runs, and ignore stale results.
+
+### Session / Resume
+
+- Store a truncated last-prompt preview in lightweight session metadata (used for search/filter, no full transcript load).
+
+### Web Providers
+
+- Added `/webproviders` with `/webprovider` and `/web` aliases for interactive web-search configuration.
+- Added routing, result limits, search budgets, parallel execution, domain filters, and provider enable/disable controls.
+- Added configuration for DuckDuckGo, Ollama, Exa, and Tavily, including provider-specific endpoints and search options.
+- Added persistence to global `rick.json` with immediate refresh of the active web-search tool.
+- Added redacted API-key editing: blank keeps the current key, while `-` clears it.
+
+### Web Search
+
+- Added configurable multi-provider web search with DuckDuckGo Lite HTML and Instant Answer JSON, Ollama Web Search, Exa, Tavily, Bing, Brave, and SearXNG support.
+- Independent providers can run in parallel; results are normalized, deduplicated across sources, merged, and deterministically ranked using provider contributions and source rank.
+- Added provider-specific configuration, domain filters, safe-search/region/time-range options, bounded concurrency, request variants in cache keys, captured fixtures, and parser/request/merge/ranking tests.
+
+### Backlog (from results-30-07-2026)
+
+- Sandbox-aware approval gating: couple sandbox confinement to approval so writes inside the workspace-write fence are auto-approved (no prompt), while outside-fence writes still prompt. See `results/sandbox-approval-gating-prompt.md`.
+
 ## v0.1.3 — 2026-07-30
 
 - Restored normal terminal text selection by scoping mouse reporting to active interactive agent/task controls.

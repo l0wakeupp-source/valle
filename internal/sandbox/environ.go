@@ -56,6 +56,7 @@ func Environ(p Policy, extra ...string) []string {
 	out = append(out,
 		"RICK=1",
 		"RICK_SANDBOX="+string(p.Mode),
+		"RICK_SANDBOX_ROOT="+p.Workspace,
 		"GIT_PAGER=cat", "PAGER=cat", "TERM=dumb", "NO_COLOR=1",
 	)
 

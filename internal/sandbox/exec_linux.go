@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -85,10 +87,14 @@ func bwrapArgs(p Policy) []string {
 			args = append(args, "--ro-bind", ro, ro)
 		}
 	}
-	// Toolchain caches live under $HOME; without them every build refetches
-	// the world.
+	// Toolchain caches live in a small allowlist under $HOME; do not expose
+	// credentials and unrelated application data from the whole home directory.
 	if home, err := os.UserHomeDir(); err == nil {
-		args = append(args, "--ro-bind-try", home, home)
+		for _, cacheRoot := range homeCacheRoots(home) {
+			if _, err := os.Stat(cacheRoot); err == nil {
+				args = append(args, "--ro-bind-try", cacheRoot, cacheRoot)
+			}
+		}
 	}
 	for _, r := range p.ReadableRoots {
 		args = append(args, "--ro-bind-try", r, r)
@@ -130,7 +136,6 @@ func applyResourceLimits(pid int, l Limits) {
 		set(syscall.RLIMIT_FSIZE, uint64(l.FileSizeMB)<<20)
 	}
 	if l.Processes > 0 {
-		const rlimitNproc = 6 // RLIMIT_NPROC is not exported by syscall
-		set(rlimitNproc, uint64(l.Processes))
+		set(unix.RLIMIT_NPROC, uint64(l.Processes))
 	}
 }

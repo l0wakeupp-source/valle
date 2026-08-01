@@ -26,6 +26,12 @@ func SaveModelChoice(id string) error {
 	return patchGlobal("rick.json", "model", id)
 }
 
+// SaveWebSearchConfig persists the web-search settings to the global rick.json
+// while preserving all unrelated configuration keys.
+func SaveWebSearchConfig(cfg WebSearchConfig) error {
+	return patchGlobal("rick.json", "web_search", cfg)
+}
+
 // patchGlobal sets one key in a global config file, leaving everything else
 // untouched.
 //

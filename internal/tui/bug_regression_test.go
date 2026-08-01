@@ -11,47 +11,6 @@ import (
 	"rick/internal/provider"
 )
 
-func TestPhotoSyncDoesNotQueueDuplicateDraws(t *testing.T) {
-	model := &Model{photoBox: photoKey{proto: imageKitty, cols: 20, rows: 10}}
-	if model.syncPhoto() == nil {
-		t.Fatal("expected the first photo sync to schedule a draw")
-	}
-	if model.syncPhoto() != nil {
-		t.Fatal("photo sync queued a duplicate draw while the first draw was pending")
-	}
-}
-
-func TestPhotoSyncIgnoresStaleDrawAfterStateChange(t *testing.T) {
-	oldBox := photoKey{proto: imageKitty, cols: 20, rows: 10}
-	newBox := photoKey{proto: imageKitty, cols: 24, rows: 12}
-	model := &Model{photoBox: oldBox, width: 100}
-	oldDraw := model.syncPhoto()
-	if oldDraw == nil {
-		t.Fatal("expected initial draw")
-	}
-	oldMessage, ok := oldDraw().(photoDrawnMsg)
-	if !ok {
-		t.Fatal("initial photo command returned unexpected message")
-	}
-
-	model.photoBox = photoKey{}
-	clear := model.syncPhoto()
-	if clear == nil {
-		t.Fatal("expected clear after removing the photo box")
-	}
-	model.photoBox = newBox
-	newDraw := model.syncPhoto()
-	if newDraw == nil {
-		t.Fatal("expected redraw for the new photo box")
-	}
-	if oldMessage.generation == model.photoGeneration {
-		t.Fatal("photo generations did not advance")
-	}
-	model.Update(oldMessage)
-	if model.photoPending != newBox {
-		t.Fatalf("stale draw changed newer pending state: %#v", model.photoPending)
-	}
-}
 func TestMessagesToChatIndexesToolResults(t *testing.T) {
 	history := make([]provider.Message, 0, 400)
 	for i := 0; i < 200; i++ {

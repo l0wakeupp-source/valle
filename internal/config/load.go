@@ -76,6 +76,7 @@ func Load(cwd string) (*Loaded, error) {
 
 	l.Config = cfg
 	l.TUI = tui
+	l.SandboxRoot = SandboxRoot(cfg.Sandbox, root)
 	return l, nil
 }
 
@@ -234,6 +235,90 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 	if has(p, "sandbox") && src.Sandbox != nil {
 		dst.Sandbox = MergeSandbox(dst.Sandbox, src.Sandbox)
 	}
+	if has(p, "web_search") && src.WebSearch != nil {
+		dst.WebSearch = mergeWebSearchConfig(dst.WebSearch, src.WebSearch)
+	}
+}
+
+func mergeWebSearchConfig(base, over *WebSearchConfig) *WebSearchConfig {
+	if base == nil {
+		base = &WebSearchConfig{}
+	}
+	out := *base
+	if over.AllowDomains != nil {
+		out.AllowDomains = append([]string(nil), over.AllowDomains...)
+	}
+	if over.DenyDomains != nil {
+		out.DenyDomains = append([]string(nil), over.DenyDomains...)
+	}
+	if over.MaxResults != 0 {
+		out.MaxResults = over.MaxResults
+	}
+	if over.MaxSearchesPerSession != 0 {
+		out.MaxSearchesPerSession = over.MaxSearchesPerSession
+	}
+	if over.Provider != "" {
+		out.Provider = over.Provider
+	}
+	if over.Parallel != nil {
+		out.Parallel = over.Parallel
+	}
+	if over.MaxParallel != 0 {
+		out.MaxParallel = over.MaxParallel
+	}
+	if over.Providers != nil {
+		if out.Providers == nil {
+			out.Providers = map[string]WebSearchProviderConfig{}
+		}
+		for name, provider := range over.Providers {
+			out.Providers[name] = mergeWebSearchProvider(out.Providers[name], provider)
+		}
+	}
+	return &out
+}
+
+func mergeWebSearchProvider(base, over WebSearchProviderConfig) WebSearchProviderConfig {
+	out := base
+	if over.Enabled != nil {
+		out.Enabled = over.Enabled
+	}
+	if over.APIKey != "" {
+		out.APIKey = over.APIKey
+	}
+	if over.BaseURL != "" {
+		out.BaseURL = over.BaseURL
+	}
+	if over.Backend != "" {
+		out.Backend = over.Backend
+	}
+	if over.Region != "" {
+		out.Region = over.Region
+	}
+	if over.SafeSearch != "" {
+		out.SafeSearch = over.SafeSearch
+	}
+	if over.TimeRange != "" {
+		out.TimeRange = over.TimeRange
+	}
+	if over.Type != "" {
+		out.Type = over.Type
+	}
+	if over.Livecrawl != "" {
+		out.Livecrawl = over.Livecrawl
+	}
+	if over.MaxAgeHours != nil {
+		out.MaxAgeHours = over.MaxAgeHours
+	}
+	if over.IncludeDomains != nil {
+		out.IncludeDomains = append([]string(nil), over.IncludeDomains...)
+	}
+	if over.ExcludeDomains != nil {
+		out.ExcludeDomains = append([]string(nil), over.ExcludeDomains...)
+	}
+	if over.Weight != 0 {
+		out.Weight = over.Weight
+	}
+	return out
 }
 
 func mergeAgent(dst, src Agent) Agent {

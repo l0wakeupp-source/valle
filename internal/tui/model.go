@@ -57,10 +57,6 @@ type Deps struct {
 	InitialMsg   string
 	// Credentials is already-loaded auth data (avoids double-load at startup).
 	Credentials *config.Credentials
-	// ImageProto names the terminal's graphics protocol ("kitty", "iterm2"
-	// or ""). It is resolved before the program starts, because detecting it
-	// reads a reply from stdin and bubbletea owns stdin once running.
-	ImageProto string
 	// Usage persists cumulative token usage per model per day.
 	Usage         *usage.Tracker
 	AgentRegistry *agent.Registry
@@ -151,25 +147,16 @@ type Model struct {
 	ctxWindow          int
 	lastAutoCompact    time.Time
 	autoCompactPending bool
+	compactionActive   bool
+	compactionRunID    uint64
 	quitting           bool
 
 	// provider auth flow
 	auth  authState
+	web   webSearchState
 	creds *config.Credentials
 	// providers declared by rick.json/env, which /auth must not delete
 	pinnedProviders map[string]bool
-
-	// terminal graphics protocol, detected once at startup
-	imageProto imageProto
-
-	// photoBox is the cell box the current frame reserved for the mascot
-	// photo; photoDrawn is what is actually on screen. They differ only
-	// when the image needs (re)drawing.
-	photoBox        photoKey
-	photoDrawn      photoKey
-	photoPending    photoKey
-	photoRow        int
-	photoGeneration uint64
 
 	// consecutive quiet theme polls, used to back the interval off
 	themeIdle int
@@ -337,7 +324,6 @@ func New(d Deps) *Model {
 		tx:            newTranscript(),
 		tip:           pickTip(),
 		resumable:     latestSessionTitle(d),
-		imageProto:    parseImageProto(d.ImageProto),
 		themeWatch:    d.ThemeDirs,
 		pendingTools:  map[string]int{},
 		permGate:      make(chan struct{}, 1),
@@ -471,16 +457,13 @@ func orInt(v, d int) int {
 
 // Init implements tea.Model.
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen, tea.DisableMouse}
+	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen, tea.EnableMouseCellMotion}
 	// Some terminals (and piped/CI invocations) never deliver a
 	// WindowSizeMsg. Without a fallback the UI would sit on "starting rick…"
 	// forever, so seed a sane size that a real WindowSizeMsg overrides.
 	cmds = append(cmds, func() tea.Msg { return ensureSizeMsg{} }, m.themePollCmd())
 	if clipboardShortcutSupported() {
 		cmds = append(cmds, clipboardShortcutTick())
-	}
-	if m.imageProto != imageNone {
-		cmds = append(cmds, photoTick())
 	}
 	if m.deps.ResumeID != "" {
 		resumeID := m.deps.ResumeID
@@ -529,18 +512,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) wantsMouseCapture() bool {
-	if m.auth.active ||
-		m.modal != modalNone ||
-		m.picker.active ||
-		m.pending.kind != pendingNone {
-		return true
-	}
-	for _, item := range m.activityItems() {
-		if item.interactive {
-			return true
-		}
-	}
-	return false
+	// Wheel events must remain terminal mouse messages in the ordinary chat
+	// view. If mouse tracking is disabled here, Windows Terminal reports the
+	// wheel as Up/Down key events and the chat bar navigates prompt history.
+	return true
 }
 
 func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -591,6 +566,9 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		if m.web.active {
+			return m.handleWebMouse(msg)
+		}
 		if m.auth.active {
 			if msg.Button == tea.MouseButtonWheelUp {
 				m.authScroll(-m.scrollStep())
@@ -652,33 +630,6 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case oauthDoneMsg:
 		return m.applyOAuthDone(msg)
-
-	case photoTickMsg:
-		return m, tea.Batch(m.syncPhoto(), photoTick())
-
-	case photoDrawnMsg:
-		if msg.generation != m.photoGeneration {
-			return m, nil
-		}
-		if m.photoPending == msg.box {
-			m.photoPending = photoKey{}
-		}
-		if msg.box == m.photoBox {
-			m.photoDrawn = msg.box
-		}
-		return m, nil
-
-	case photoClearedMsg:
-		if msg.generation != m.photoGeneration {
-			return m, nil
-		}
-		if m.photoPending == msg.box {
-			m.photoPending = photoKey{}
-		}
-		if m.photoBox == (photoKey{}) && m.photoDrawn == msg.box {
-			m.photoDrawn = photoKey{}
-		}
-		return m, nil
 
 	case themePollMsg:
 		if m.themeWatch != nil && m.themeWatch.Changed() {
@@ -809,6 +760,18 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case compactDoneMsg:
+		if !m.compactionActive || msg.runID != m.compactionRunID {
+			return m, nil
+		}
+		m.compactionActive = false
+		m.billed.Input += msg.usage.InputTokens
+		m.billed.Output += msg.usage.OutputTokens
+		m.billed.CacheRead += msg.usage.CacheReadTokens
+		m.billed.CacheWrite += msg.usage.CacheWriteTokens
+		if m.deps.Usage != nil && msg.modelID != "" {
+			_ = m.deps.Usage.Record(msg.modelID, msg.usage.InputTokens, msg.usage.OutputTokens,
+				msg.usage.CacheReadTokens, msg.usage.CacheWriteTokens)
+		}
 		if msg.err != nil {
 			m.appendMsg(ChatMsg{Kind: MsgError, Text: "compact: " + msg.err.Error(), Time: time.Now()})
 			return m, nil
@@ -1368,15 +1331,13 @@ func (m *Model) View() string {
 		// made /new look like it did nothing.
 		main = padHeight(m.splash(), m.viewport.Height)
 	} else {
-		// The conversation has started: no splash, so no image.
-		if m.photoBox != (photoKey{}) {
-			m.photoGeneration++
-		}
-		m.photoBox = photoKey{}
 		main = m.viewport.View()
 	}
 	body := main + "\n" + m.footer()
 
+	if m.web.active {
+		return m.overlay(body, m.webView())
+	}
 	if m.auth.active {
 		return m.overlay(body, m.authView())
 	}
@@ -1608,18 +1569,6 @@ func (m *Model) resetStats() {
 	m.billed = session.Usage{}
 	m.turnStart = time.Time{}
 	m.turnElapsed = 0
-}
-
-// ForceImageProto pretends the terminal supports graphics (test helper).
-func (m *Model) ForceImageProto(name string) {
-	switch name {
-	case "kitty":
-		m.imageProto = imageKitty
-	case "iterm2":
-		m.imageProto = imageITerm
-	default:
-		m.imageProto = imageNone
-	}
 }
 
 // SetTurnElapsed fakes a completed turn duration (test helper).

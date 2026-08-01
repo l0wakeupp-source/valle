@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -25,6 +26,25 @@ type Spec struct {
 	Timeout time.Duration // hard wall clock cap
 	Stdout  io.Writer
 	Stderr  io.Writer
+}
+
+var homeCacheRelativePaths = []string{
+	".cache",
+	".cargo/registry",
+	".cargo/git",
+	".npm",
+	"go/pkg/mod",
+	".gradle/caches",
+	".m2/repository",
+	".nuget/packages",
+}
+
+func homeCacheRoots(home string) []string {
+	roots := make([]string, 0, len(homeCacheRelativePaths))
+	for _, relativePath := range homeCacheRelativePaths {
+		roots = append(roots, filepath.Join(home, filepath.FromSlash(relativePath)))
+	}
+	return roots
 }
 
 // Outcome reports how a sandboxed command finished.
@@ -71,8 +91,8 @@ var backendFor = func(p Policy) Backend { return nopBackend{} }
 // analysis instead of failing.
 type nopBackend struct{}
 
-func (nopBackend) Name() string                              { return "none" }
-func (nopBackend) Available() bool                           { return false }
+func (nopBackend) Name() string                               { return "none" }
+func (nopBackend) Available() bool                            { return false }
 func (nopBackend) Prepare(*exec.Cmd, Policy) (Session, error) { return nopSession{}, nil }
 
 type nopSession struct{}

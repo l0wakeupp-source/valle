@@ -262,6 +262,22 @@ func ParsePatch(patch string) ([]patchFile, error) {
 	return files, nil
 }
 
+// PatchPaths returns every source and destination path touched by a patch.
+func PatchPaths(patch string) ([]string, error) {
+	files, err := ParsePatch(patch)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(files)*2)
+	for _, file := range files {
+		paths = append(paths, file.path)
+		if file.dest != "" {
+			paths = append(paths, file.dest)
+		}
+	}
+	return paths, nil
+}
+
 // applyHunks applies context/-/+ hunks to content.
 func applyHunks(content string, body []string) (string, error) {
 	crlf := strings.Contains(content, "\r\n")

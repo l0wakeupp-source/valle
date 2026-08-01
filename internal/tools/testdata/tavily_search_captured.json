@@ -1,0 +1,6 @@
+{
+  "results": [
+    {"title": "The Go Programming Language", "url": "https://go.dev/", "content": "Go is an open source programming language."},
+    {"title": "Go by Example", "url": "https://gobyexample.com/", "content": "Hands-on introductions to Go."}
+  ]
+}

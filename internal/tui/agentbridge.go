@@ -90,26 +90,28 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			break
 		}
 	}
+	stableSystem, systemPrompt := buildSystemPromptParts(agentName, modelID, cwd, projectRoot, cfg, skills, userText)
 	go func() {
 		runner := agent.New(agent.Config{
-			Provider:    prov,
-			Model:       modelID,
-			System:      buildSystemPrompt(agentName, modelID, cwd, projectRoot, cfg, skills, userText),
-			MaxTokens:   cfg.MaxTokens,
-			Reasoning:   reasoning,
-			Tools:       registry,
-			ToolFilter:  toolFilter,
-			Perms:       perms,
-			Ask:         ask,
-			Cwd:         cwd,
-			SessionID:   sessionID,
-			AgentName:   agentName,
-			AgentID:     agentID,
-			Registry:    m.deps.AgentRegistry,
-			Snapshotter: snapshotter,
-			Plugins:     plugins,
-			Parallel:    true,
-			Goals:       m.deps.Goals,
+			Provider:     prov,
+			Model:        modelID,
+			System:       systemPrompt,
+			SystemStable: stableSystem,
+			MaxTokens:    cfg.MaxTokens,
+			Reasoning:    reasoning,
+			Tools:        registry,
+			ToolFilter:   toolFilter,
+			Perms:        perms,
+			Ask:          ask,
+			Cwd:          cwd,
+			SessionID:    sessionID,
+			AgentName:    agentName,
+			AgentID:      agentID,
+			Registry:     m.deps.AgentRegistry,
+			Snapshotter:  snapshotter,
+			Plugins:      plugins,
+			Parallel:     true,
+			Goals:        m.deps.Goals,
 		})
 		appended, _ := runner.Run(ctx, history, ch)
 		// Results are delivered through the channel; the appended slice is
@@ -325,8 +327,10 @@ func (m *Model) finishRun(err error) tea.Cmd {
 	}
 	if m.autoCompactPending {
 		m.autoCompactPending = false
-		m.lastAutoCompact = time.Now()
 		_, compactCmd := m.cmdCompact()
+		if compactCmd != nil {
+			m.lastAutoCompact = time.Now()
+		}
 		return compactCmd
 	}
 	return nil
@@ -505,6 +509,11 @@ func (m *Model) resolveProvider() (provider.Provider, string, error) {
 }
 
 func buildSystemPrompt(agentName, modelID, cwd, projectRoot string, cfg config.Config, skills []plugin.Skill, userText string) string {
+	_, prompt := buildSystemPromptParts(agentName, modelID, cwd, projectRoot, cfg, skills, userText)
+	return prompt
+}
+
+func buildSystemPromptParts(agentName, modelID, cwd, projectRoot string, cfg config.Config, skills []plugin.Skill, userText string) (string, string) {
 	base := agent.BuildPrompt
 	if agentName == "plan" {
 		base = agent.PlanPrompt
@@ -512,14 +521,14 @@ func buildSystemPrompt(agentName, modelID, cwd, projectRoot string, cfg config.C
 	if a, ok := cfg.Agents[agentName]; ok && a.Prompt != "" {
 		base = a.Prompt
 	}
-	gitInfo := session.GitInfo(cwd)
-	prompt := base +
-		agent.Environment(cwd, modelID, agentName, gitInfo) +
-		agent.ProjectContext(projectRoot, cfg.Instructions)
+
+	stable := base + agent.ProjectContext(projectRoot, cfg.Instructions)
+	volatile := ""
 	if len(skills) > 0 && userText != "" {
-		prompt += plugin.SkillBlock(plugin.MatchSkills(skills, userText))
+		volatile += plugin.SkillBlock(plugin.MatchSkills(skills, userText))
 	}
-	return prompt
+	volatile += agent.Environment(cwd, modelID, agentName, session.GitInfo(cwd))
+	return stable, stable + volatile
 }
 
 // toolFilter honours config tool enable/disable globs, plan-mode limits,

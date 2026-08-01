@@ -25,12 +25,13 @@ const (
 
 // Request describes a pending tool invocation to be checked.
 type Request struct {
-	Tool    string // "bash", "edit", "write", "read", "webfetch", or an MCP tool name
-	Command string // bash command line (Tool == "bash")
-	Path    string // target path for file tools
-	Host    string // target host for webfetch
-	Title   string // human summary for the prompt
-	Body    string // preview (diff, command, ...) rendered in the prompt
+	Tool    string   // "bash", "edit", "write", "read", "webfetch", or an MCP tool name
+	Command string   // bash command line (Tool == "bash")
+	Path    string   // target path for file tools
+	Paths   []string // all target paths for multi-file tools such as apply_patch
+	Host    string   // target host for webfetch
+	Title   string   // human summary for the prompt
+	Body    string   // preview (diff, command, ...) rendered in the prompt
 }
 
 // Decision is a resolved level plus the rule that produced it, so the UI can
@@ -43,12 +44,15 @@ type Decision struct {
 
 // Engine resolves permissions from config plus session-scoped grants.
 type Engine struct {
-	mu        sync.RWMutex
-	perm      *config.Permission
-	root      string
-	sessionOK map[string]bool // pattern -> always allow this session
-	yolo      bool
-	profile   string // name of the active profile, for display
+	mu             sync.RWMutex
+	perm           *config.Permission
+	root           string
+	sandboxRoot    string
+	sandboxWrites  bool
+	protectedPaths []string
+	sessionOK      map[string]bool // pattern -> always allow this session
+	yolo           bool
+	profile        string // name of the active profile, for display
 }
 
 // New builds an engine for a project root.
@@ -94,6 +98,31 @@ func (e *Engine) SetYolo(v bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.yolo = v
+}
+
+// SetSandboxRoot configures the workspace-write fence used by write tooling.
+// The root is supplied by the config/sandbox layer; individual tools must not
+// define their own fence.
+func (e *Engine) SetSandboxRoot(root string, workspaceWrite bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sandboxRoot = filepath.Clean(root)
+	e.sandboxWrites = workspaceWrite && strings.TrimSpace(root) != ""
+}
+
+// SandboxRoot returns the effective workspace fence for inspection.
+func (e *Engine) SandboxRoot() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.sandboxRoot
+}
+
+// SetProtectedPaths installs sandbox blocklist patterns. These are a security
+// floor and cannot be bypassed by --yolo or workspace-write auto-approval.
+func (e *Engine) SetProtectedPaths(patterns []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.protectedPaths = append([]string(nil), patterns...)
 }
 
 // Yolo reports whether prompting is disabled.
@@ -171,23 +200,28 @@ func (e *Engine) Check(r Request) Level { return e.Resolve(r).Level }
 // Resolve is Check with the reasoning attached.
 //
 // Precedence, strongest first:
-//  1. yolo
-//  2. an explicit deny anywhere (path, host, tool or bash rule)
-//  3. session grants
-//  4. the most specific matching rule for the tool's own dimension
-//  5. the coarse per-tool level
-//  6. the policy default
+//  1. an explicit path/blocklist deny
+//  2. yolo (still skips every prompt not covered by the blocklist floor)
+//  3. an explicit deny anywhere else (host, tool or bash rule)
+//  4. session grants
+//  5. the most specific matching rule for the tool's own dimension
+//  6. the coarse per-tool level
+//  7. the policy default
 //
-// Rule 3 is what makes a deny on "**/.ssh/**" meaningful: without it, a
-// coarse `"edit": "allow"` would silently outrank the narrower path rule.
+// The explicit path-deny floor is what makes a deny on "**/.ssh/**"
+// meaningful: without it, a coarse `"edit": "allow"` would silently
+// outrank the narrower path rule.
 func (e *Engine) Resolve(r Request) Decision {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	p := e.perm
+	if d, ok := e.pathDenyFloor(p, r); ok {
+		return d
+	}
 	if e.yolo {
 		return Decision{Level: Allow, Rule: "yolo", Source: "yolo"}
 	}
-	p := e.perm
 	def := Level(orDefault(p.Default, config.PermAsk))
 
 	// A deny from any dimension wins over session grants.
@@ -207,7 +241,7 @@ func (e *Engine) Resolve(r Request) Decision {
 		return Decision{Level: def, Rule: "default", Source: "default"}
 
 	case "edit", "patch", "apply_patch", "write":
-		if d, ok := matchPathRule(p.Paths, r.Path); ok {
+		if d, ok := e.matchPathRule(p.Paths, firstTargetPath(r)); ok {
 			return e.guardDecision(r, d)
 		}
 		coarse := p.Edit
@@ -223,7 +257,7 @@ func (e *Engine) Resolve(r Request) Decision {
 		return e.guardDecision(r, Decision{Level: def, Rule: "default", Source: "default"})
 
 	case "read", "grep", "glob", "list", "tree", "code_symbols":
-		if d, ok := matchPathRule(p.Paths, r.Path); ok {
+		if d, ok := e.matchPathRule(p.Paths, r.Path); ok {
 			return d
 		}
 		if l := lvlOf(p.Read); l != "" {
@@ -262,8 +296,8 @@ func (e *Engine) Resolve(r Request) Decision {
 
 // denyScan looks for an explicit deny in any dimension relevant to r.
 func (e *Engine) denyScan(p *config.Permission, r Request) (Decision, bool) {
-	if r.Path != "" {
-		if d, ok := matchPathRule(p.Paths, r.Path); ok && d.Level == Deny {
+	for _, path := range targetPaths(r) {
+		if d, ok := e.matchPathRule(p.Paths, path); ok && d.Level == Deny {
 			return d, true
 		}
 	}
@@ -283,19 +317,109 @@ func (e *Engine) denyScan(p *config.Permission, r Request) (Decision, bool) {
 	return Decision{}, false
 }
 
-// guardDecision upgrades allow->ask when the target escapes the project root.
+func (e *Engine) pathDenyFloor(p *config.Permission, r Request) (Decision, bool) {
+	for _, path := range targetPaths(r) {
+		if d, ok := e.matchPathDeny(p.Paths, path); ok {
+			return d, true
+		}
+		for _, candidate := range e.pathCandidates(path) {
+			for _, pattern := range e.protectedPaths {
+				if pathPatternMatches(pattern, candidate) {
+					return Decision{Level: Deny, Rule: "path:" + pattern, Source: "policy"}, true
+				}
+			}
+		}
+	}
+	return Decision{}, false
+}
+
+func targetPaths(r Request) []string {
+	paths := append([]string(nil), r.Paths...)
+	if r.Path != "" {
+		seen := false
+		for _, path := range paths {
+			if path == r.Path {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			paths = append(paths, r.Path)
+		}
+	}
+	return paths
+}
+
+func firstTargetPath(r Request) string {
+	paths := targetPaths(r)
+	if len(paths) == 0 {
+		return ""
+	}
+	return paths[0]
+}
+
+func (e *Engine) pathCandidates(path string) []string {
+	if path == "" {
+		return nil
+	}
+	candidates := []string{path}
+	if !filepath.IsAbs(path) && e.root != "" {
+		candidates = append(candidates, filepath.Join(e.root, path))
+	}
+	return candidates
+}
+
+func (e *Engine) matchPathRule(rules map[string]string, path string) (Decision, bool) {
+	for _, candidate := range e.pathCandidates(path) {
+		if d, ok := matchPathRule(rules, candidate); ok {
+			return d, true
+		}
+	}
+	return Decision{}, false
+}
+
+func (e *Engine) matchPathDeny(rules map[string]string, path string) (Decision, bool) {
+	for _, candidate := range e.pathCandidates(path) {
+		if d, ok := matchPathDeny(rules, candidate); ok {
+			return d, true
+		}
+	}
+	return Decision{}, false
+}
+
+// guardDecision auto-approves write targets inside the workspace-write fence
+// and retains the existing approval guard for every target outside it.
 func (e *Engine) guardDecision(r Request, d Decision) Decision {
-	if d.Level == Deny || r.Path == "" || e.root == "" {
+	if d.Level == Deny {
 		return d
 	}
-	abs, err := filepath.Abs(r.Path)
-	if err != nil {
-		return Decision{Level: Ask, Rule: "path unresolvable", Source: "guard"}
+	paths := targetPaths(r)
+	if len(paths) == 0 || e.root == "" {
+		return d
 	}
-	rel, err := filepath.Rel(e.root, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		// Never silently auto-approve writes outside the project.
-		return Decision{Level: Ask, Rule: "outside project root", Source: "guard"}
+	if e.sandboxWrites {
+		for _, path := range paths {
+			resolved := path
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(e.root, resolved)
+			}
+			inside, err := config.PathWithinRoot(e.sandboxRoot, resolved)
+			if err != nil || !inside {
+				return Decision{Level: Ask, Rule: "outside workspace sandbox", Source: "guard"}
+			}
+		}
+		return Decision{Level: Allow, Rule: "workspace sandbox", Source: "sandbox"}
+	}
+	for _, path := range paths {
+		resolved := path
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(e.root, resolved)
+		}
+		inside, err := config.PathWithinRoot(e.root, resolved)
+		if err != nil || !inside {
+			// Never silently auto-approve writes outside the project.
+			return Decision{Level: Ask, Rule: "outside project root", Source: "guard"}
+		}
 	}
 	return d
 }
@@ -352,6 +476,33 @@ func mostSpecific(rules map[string]string, subject string, match func(pat, s str
 	return "", "", false
 }
 
+func matchPathDeny(rules map[string]string, path string) (Decision, bool) {
+	if len(rules) == 0 {
+		return Decision{}, false
+	}
+	denies := make(map[string]string)
+	for pattern, level := range rules {
+		if level == config.PermDeny {
+			denies[pattern] = level
+		}
+	}
+	return matchPathRule(denies, path)
+}
+
+func pathPatternMatches(pattern, path string) bool {
+	if path == "" {
+		return false
+	}
+	subject := filepath.ToSlash(path)
+	if glob.MatchPath(pattern, subject) {
+		return true
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return glob.MatchPath(pattern, filepath.ToSlash(abs))
+	}
+	return false
+}
+
 // matchPathRule resolves a path against the Paths rules.
 func matchPathRule(rules map[string]string, path string) (Decision, bool) {
 	if path == "" {
@@ -359,14 +510,7 @@ func matchPathRule(rules map[string]string, path string) (Decision, bool) {
 	}
 	subject := filepath.ToSlash(path)
 	lvl, pat, ok := mostSpecific(rules, subject, func(pat, s string) bool {
-		if glob.MatchPath(pat, s) {
-			return true
-		}
-		// Also try the absolute form so "**/.ssh/**" matches a relative arg.
-		if abs, err := filepath.Abs(s); err == nil {
-			return glob.MatchPath(pat, filepath.ToSlash(abs))
-		}
-		return false
+		return pathPatternMatches(pat, s)
 	})
 	if !ok {
 		return Decision{}, false

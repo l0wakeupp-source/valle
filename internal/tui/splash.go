@@ -54,11 +54,9 @@ func (m *Model) splash() string {
 	left := m.splashText(m.splashTextWidth())
 	art := m.splashArt()
 	if art == nil {
-		m.photoBox = photoKey{}
 		return left
 	}
-	out, artTop := joinSplash(left, art, m.contentWidth(), m.viewport.Height)
-	m.photoRow = artTop
+	out, _ := joinSplash(left, art, m.contentWidth(), m.viewport.Height)
 	return out
 }
 
@@ -73,12 +71,8 @@ func (m *Model) splashArtWidth() int {
 		return 0
 	}
 	// Half-blocks lose detail as they grow — each cell is still just two
-	// colours — so the block art is capped. A real image only gets sharper,
-	// so let it use whatever room is going.
+	// colours — so the block art is capped.
 	cap := 40
-	if m.imageProto != imageNone {
-		cap = 64
-	}
 	if spare > cap {
 		spare = cap
 	}
@@ -105,58 +99,13 @@ func (m *Model) SplashArtLines() []string { return m.splashArt() }
 // SplashArtWidth is the mascot's column budget (test helper).
 func (m *Model) SplashArtWidth() int { return m.splashArtWidth() }
 
-// splashArt renders the mascot, or nil when there is no room.
-//
-// A terminal with graphics support gets the real photo; everything else gets
-// the half-block rendering. Both occupy the same cell box, so the layout does
-// not care which one it received.
+// splashArt renders the pixelated mascot, or nil when there is no room.
 func (m *Model) splashArt() []string {
 	aw := m.splashArtWidth()
 	if aw == 0 {
 		return nil
 	}
-	if lines := m.photoArt(aw, artHeightFor(aw)); lines != nil {
-		return lines
-	}
 	return renderArt(aw)
-}
-
-// photoArt emits a real image sized to cols x rows cells, or nil when the
-// terminal cannot display one.
-//
-// The escape is written into the first line and the remaining lines are
-// spaces: the image is drawn without moving the cursor, so the blank rows
-// reserve the space it occupies and keep the surrounding layout honest.
-// photoArt reserves a cols x rows hole for the real image, or nil when the
-// terminal cannot draw one.
-//
-// The escape itself is NOT returned. Bubble Tea's renderer runs every line
-// through ansi.Truncate to stop wrapping, which throws away the ~130KB
-// payload of a graphics escape and leaves a stub that draws nothing. The
-// image is therefore written directly to the terminal, out of band, and the
-// frame only reserves the blank cells it will occupy.
-func (m *Model) photoArt(cols, rows int) []string {
-	if m.imageProto == imageNone || len(rickPNG) == 0 {
-		return nil
-	}
-	if m.imageProto != imageKitty && m.imageProto != imageITerm {
-		return nil // sixel needs an encoder; the block art is good enough
-	}
-	m.photoBox = photoKey{proto: m.imageProto, cols: cols, rows: rows}
-
-	lines := make([]string, rows)
-	blank := strings.Repeat(" ", cols)
-	for i := range lines {
-		lines[i] = blank
-	}
-	return lines
-}
-
-// photoKey identifies a placed image. The protocol is part of it: the same
-// cell box produces completely different bytes for kitty and iTerm2.
-type photoKey struct {
-	proto      imageProto
-	cols, rows int
 }
 
 // joinSplash places the art to the right of the text, each block centred
@@ -279,7 +228,7 @@ func (m *Model) splashText(w int) string {
 	switch {
 	case !m.hasAnyProvider():
 		b.WriteString("\n  " + s.Warning.Render("no provider connected") +
-			s.Faint.Render("  ·  run ") + s.Accent.Render("/auth") + "\n")
+			s.Faint.Render("  ·  run ") + s.Accent.Render("/auth") + s.Faint.Render(" or ") + s.Accent.Render("/webproviders") + "\n")
 	case m.resumable != "":
 		// rick starts fresh; surface the earlier session instead of
 		// resuming it silently. Fall back to shorter forms before dropping

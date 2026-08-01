@@ -91,6 +91,7 @@ type cacheKey struct {
 	provider   string
 	query      string
 	maxResults int
+	variant    string
 }
 
 type cacheEntry struct {
@@ -116,15 +117,20 @@ var (
 const maxSearchResponseBytes = 4 << 20
 
 func cacheGet(provider string, query string, maxResults int) ([]searchResult, bool) {
+	return cacheGetVariant(provider, query, maxResults, "")
+}
+
+func cacheGetVariant(provider string, query string, maxResults int, variant string) ([]searchResult, bool) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	elem, ok := cacheMap[cacheKey{provider, query, maxResults}]
+	key := cacheKey{provider: provider, query: query, maxResults: maxResults, variant: variant}
+	elem, ok := cacheMap[key]
 	if !ok {
 		return nil, false
 	}
 	entry := elem.Value.(*cacheEntry)
 	if time.Now().After(entry.expiresAt) {
-		delete(cacheMap, cacheKey{provider, query, maxResults})
+		delete(cacheMap, key)
 		cacheLRU.Remove(elem)
 		return nil, false
 	}
@@ -133,9 +139,13 @@ func cacheGet(provider string, query string, maxResults int) ([]searchResult, bo
 }
 
 func cachePut(provider, query string, maxResults int, results []searchResult, ttl time.Duration) {
+	cachePutVariant(provider, query, maxResults, results, ttl, "")
+}
+
+func cachePutVariant(provider, query string, maxResults int, results []searchResult, ttl time.Duration, variant string) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	key := cacheKey{provider, query, maxResults}
+	key := cacheKey{provider: provider, query: query, maxResults: maxResults, variant: variant}
 	if elem, ok := cacheMap[key]; ok {
 		cacheLRU.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
@@ -281,11 +291,7 @@ func (WebSearchTool) Name() string   { return "websearch" }
 func (WebSearchTool) ReadOnly() bool { return true }
 
 func (WebSearchTool) Description() string {
-	return "Search the web with automatic provider fallback.\n" +
-		"Tries Bing, DuckDuckGo Lite, Brave, SearXNG, then DuckDuckGo Instant Answer.\n" +
-		"No API key required.\n" +
-		"Use this for current events, facts, or any information beyond the model's training data.\n" +
-		"Returns titles, URLs, and snippets for fast research."
+	return "Search the web with automatic fallback. Use for current or post-training information; returns titles, URLs, and snippets."
 }
 
 func (WebSearchTool) Schema() map[string]any {
@@ -300,14 +306,59 @@ func (WebSearchTool) Schema() map[string]any {
 				"type":        "number",
 				"description": "Maximum results to return (default 5, max 10)",
 			},
+			"provider": map[string]any{
+				"type":        "string",
+				"description": "Provider name, auto, or parallel",
+			},
+			"region": map[string]any{
+				"type":        "string",
+				"description": "DuckDuckGo region code, for example us-en or wt-wt",
+			},
+			"safe_search": map[string]any{
+				"type":        "string",
+				"description": "DuckDuckGo safe search: off, moderate, or strict",
+			},
+			"time_range": map[string]any{
+				"type":        "string",
+				"description": "Freshness filter: day, week, month, or year",
+			},
+			"ddg_backend": map[string]any{
+				"type":        "string",
+				"description": "DuckDuckGo backend: lite, instant, or auto",
+			},
+			"exa_type": map[string]any{
+				"type":        "string",
+				"description": "Exa search type: auto, fast, or deep",
+			},
+			"livecrawl": map[string]any{
+				"type":        "string",
+				"description": "Exa live crawling: fallback, preferred, always, or never",
+			},
+			"include_domains": map[string]any{
+				"type":        "array",
+				"description": "Provider-level domain allowlist",
+			},
+			"exclude_domains": map[string]any{
+				"type":        "array",
+				"description": "Provider-level domain denylist",
+			},
 		},
 		"required": []string{"query"},
 	}
 }
 
 type searchArgs struct {
-	Query      string `json:"query"`
-	MaxResults int    `json:"max_results"`
+	Query          string   `json:"query"`
+	MaxResults     int      `json:"max_results"`
+	Provider       string   `json:"provider"`
+	Region         string   `json:"region"`
+	SafeSearch     string   `json:"safe_search"`
+	TimeRange      string   `json:"time_range"`
+	DDGBackend     string   `json:"ddg_backend"`
+	ExaType        string   `json:"exa_type"`
+	Livecrawl      string   `json:"livecrawl"`
+	IncludeDomains []string `json:"include_domains"`
+	ExcludeDomains []string `json:"exclude_domains"`
 }
 
 type searchResult struct {
@@ -317,98 +368,120 @@ type searchResult struct {
 }
 
 func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
-	var a searchArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	var args searchArgs
+	if err := json.Unmarshal(in, &args); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
-	if a.Query == "" {
+	args.Query = strings.TrimSpace(args.Query)
+	if args.Query == "" {
 		return Errf("query is required"), nil
 	}
-	if a.MaxResults <= 0 {
-		a.MaxResults = 5
+	if args.MaxResults <= 0 {
+		args.MaxResults = 5
 	}
-	if a.MaxResults > 10 {
-		a.MaxResults = 10
+	if args.MaxResults > 10 {
+		args.MaxResults = 10
 	}
 	maxSession := 10
 	if t.Restrictions != nil && t.Restrictions.MaxSearchesPerSession > 0 {
 		maxSession = t.Restrictions.MaxSearchesPerSession
 	}
-	sessionID := tc.SessionID
-	allowed, n := checkBudget(sessionID, maxSession)
+	allowed, n := checkBudget(tc.SessionID, maxSession)
 	if !allowed {
 		return Result{
 			Output: fmt.Sprintf("search budget exhausted (max %d per session)", maxSession),
 			Title:  "web search (budget exceeded)",
-			Meta:   map[string]any{"query": a.Query, "results": 0, "budget_exceeded": true},
+			Meta:   map[string]any{"query": args.Query, "results": 0, "budget_exceeded": true},
 		}, nil
 	}
-	if t.Restrictions != nil && t.Restrictions.MaxResults > 0 && a.MaxResults > t.Restrictions.MaxResults {
-		a.MaxResults = t.Restrictions.MaxResults
+	if t.Restrictions != nil && t.Restrictions.MaxResults > 0 && args.MaxResults > t.Restrictions.MaxResults {
+		args.MaxResults = t.Restrictions.MaxResults
 	}
 
-	providers := []struct {
-		name string
-		fn   func(context.Context, string, int) ([]searchResult, error)
-	}{
-		{"bing", bingSearch},
-		{"ddglite", duckDuckGoLite},
-		{"brave", braveSearch},
-		{"searxng", searXNGSearch},
-		{"ddginstant", duckDuckGoInstant},
+	options, err := t.searchOptions(args)
+	if err != nil {
+		return Errf("invalid search options: %v", err), nil
+	}
+	forced := strings.ToLower(strings.TrimSpace(args.Provider))
+	if forced == "" && t.Restrictions != nil {
+		forced = strings.ToLower(strings.TrimSpace(t.Restrictions.Provider))
+	}
+	if forced == "ddg" {
+		forced = "duckduckgo"
+	}
+	if forced == "lite" {
+		forced = "duckduckgo"
+	}
+	providers := t.configuredProviders(options, forced)
+	if len(providers) == 0 {
+		return Errf("no enabled web search providers are configured"), nil
 	}
 
 	searchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	filteredOut := false
+	variant := options.cacheVariant()
+	for _, provider := range providers {
+		variant += "&" + provider.name + "=" + providerConfig(t.Restrictions, provider.name).BaseURL
+	}
+	parallel := forced == "parallel"
+	if !parallel && t.Restrictions != nil && t.Restrictions.Parallel != nil {
+		parallel = *t.Restrictions.Parallel
+	}
+	maxParallel := defaultMaxParallel
+	if t.Restrictions != nil && t.Restrictions.MaxParallel > 0 {
+		maxParallel = t.Restrictions.MaxParallel
+	}
+
+	var batches []providerBatch
+	if parallel {
+		batches = t.runParallelProviders(searchCtx, providers, args.Query, args.MaxResults, maxParallel, variant)
+	} else {
+		batches = make([]providerBatch, 0, len(providers))
+		for _, provider := range providers {
+			batch := t.runProvider(searchCtx, provider, args.Query, args.MaxResults, variant)
+			batches = append(batches, batch)
+			if batch.err != nil && (errors.Is(batch.err, context.Canceled) || errors.Is(batch.err, context.DeadlineExceeded)) {
+				break
+			}
+			if len(batch.results) > 0 {
+				break
+			}
+		}
+	}
+
 	var lastErr error
-	for _, p := range providers {
-		if cached, ok := cacheGet(p.name, a.Query, a.MaxResults); ok {
-			original := len(cached)
-			filtered := filterResults(cached, t.Restrictions)
-			if len(filtered) == 0 {
-				filteredOut = true
-				continue
-			}
-			return formatResultsFiltered(a.Query, filtered, original, t.Restrictions), nil
-		}
-
-		results, err := t.tryWithRetry(searchCtx, p.fn, a.Query, a.MaxResults)
-		if err != nil {
-			lastErr = fmt.Errorf("%s: %w", p.name, err)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return Errf("web search canceled: %v", err), nil
-			}
-			continue
-		}
-		if len(results) > 0 {
-			ttl, ok := cacheTTL[p.name]
-			if !ok {
-				ttl = 300 * time.Second
-			}
-			cachePut(p.name, a.Query, a.MaxResults, results, ttl)
-
-			original := len(results)
-			results = filterResults(results, t.Restrictions)
-			if len(results) == 0 {
-				filteredOut = true
-				continue
-			}
-			res := formatResultsFiltered(a.Query, results, original, t.Restrictions)
-			if n >= 3 {
-				res.Output = fmt.Sprintf("[note: %d searches in this turn]\n%s", n, res.Output)
-			}
-			return res, nil
+	providerNames := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		providerNames = append(providerNames, batch.name)
+		if batch.err != nil {
+			lastErr = fmt.Errorf("%s: %w", batch.name, batch.err)
 		}
 	}
-
-	if filteredOut {
-		return Errf("all search results were filtered out by domain restrictions for query: %s", a.Query), nil
+	merged := mergeSearchResults(batches, args.MaxResults)
+	if len(merged) == 0 {
+		if errors.Is(searchCtx.Err(), context.Canceled) || errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+			return Errf("web search canceled: %v", searchCtx.Err()), nil
+		}
+		if lastErr != nil {
+			return Errf("all web search providers failed for query: %s (last error: %v)", args.Query, lastErr), nil
+		}
+		return Errf("all web search results were empty for query: %s", args.Query), nil
 	}
-	if lastErr != nil {
-		return Errf("all web search providers failed for query: %s (last error: %v)", a.Query, lastErr), nil
+	original := len(merged)
+	filtered := filterResults(merged, t.Restrictions)
+	if len(filtered) == 0 {
+		return Errf("all search results were filtered out by domain restrictions for query: %s", args.Query), nil
 	}
-	return Errf("all web search providers failed for query: %s (try rephrasing or searching again later)", a.Query), nil
+	result := formatResultsFiltered(args.Query, filtered, original, t.Restrictions)
+	if n >= 3 {
+		result.Output = fmt.Sprintf("[note: %d searches in this turn]\n%s", n, result.Output)
+	}
+	if result.Meta == nil {
+		result.Meta = map[string]any{}
+	}
+	result.Meta["providers"] = providerNames
+	result.Meta["parallel"] = parallel
+	return result, nil
 }
 
 func (t WebSearchTool) tryWithRetry(ctx context.Context, fn func(context.Context, string, int) ([]searchResult, error), query string, maxResults int) ([]searchResult, error) {

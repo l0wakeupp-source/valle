@@ -1,0 +1,13 @@
+{
+  "AbstractText": "Go is a statically typed, compiled programming language.",
+  "AbstractURL": "https://en.wikipedia.org/wiki/Go_(programming_language)",
+  "Heading": "Go (programming language)",
+  "Results": [
+    {"FirstURL": "https://go.dev/", "Text": "The Go programming language"}
+  ],
+  "RelatedTopics": [
+    {"FirstURL": "", "Text": "", "Topics": [
+      {"FirstURL": "https://pkg.go.dev/", "Text": "Go Packages"}
+    ]}
+  ]
+}

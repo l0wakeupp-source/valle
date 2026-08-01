@@ -57,9 +57,14 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdModels()
 	case "auth":
 		return m.openAuth()
+	case "web", "webprovider", "webproviders":
+		return m.openWebProviders()
 	case "config":
 		return m.cmdConfig()
 	case "theme", "themes":
+		if args != "" {
+			return m.applyTheme(args)
+		}
 		return m.cmdThemes()
 	case "undo":
 		return m.cmdUndo()

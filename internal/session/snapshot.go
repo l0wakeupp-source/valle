@@ -117,9 +117,9 @@ func (s *Snapshotter) git(args ...string) (string, error) {
 // Snapshot commits the current work tree state and returns the commit hash.
 //
 // A snapshot is a checkpoint of the tree AS IT IS NOW; the agent calls it
-// before each mutating tool. Commits that would be empty are skipped, so a
-// tool that touches nothing (a bash command that only reads, say) does not
-// create a no-op checkpoint that undo would then uselessly step through.
+// before each mutating tool batch. Commits that would be empty are skipped, so
+// a batch that touches nothing does not create a no-op checkpoint that undo
+// would then uselessly step through.
 func (s *Snapshotter) Snapshot(label string) (string, error) {
 	if !s.Enabled() {
 		return "", nil
@@ -136,6 +136,10 @@ func (s *Snapshotter) snapshotLocked(label string) (string, error) {
 	// Skip an empty commit unless this is the very first snapshot.
 	if len(s.history) > 0 {
 		if out, err := s.git("diff", "--cached", "--quiet"); err == nil && out == "" {
+			if s.cursor < len(s.history) {
+				s.history = s.history[:s.cursor+1]
+				s.cursor = len(s.history)
+			}
 			return "", nil // nothing changed since the last checkpoint
 		}
 	}
@@ -150,7 +154,7 @@ func (s *Snapshotter) snapshotLocked(label string) (string, error) {
 	}
 	// A new snapshot truncates the redo tail.
 	if s.cursor < len(s.history) {
-		s.history = s.history[:s.cursor]
+		s.history = s.history[:s.cursor+1]
 	}
 	s.history = append(s.history, Snapshot{ID: hash, Label: label, Created: time.Now()})
 	if len(s.history) > maxSnapshotHistory {
@@ -182,17 +186,17 @@ func (s *Snapshotter) restoreLocked(hash string) error {
 	if !s.enabled {
 		return fmt.Errorf("snapshots are disabled")
 	}
-	// Point the index at the target commit, then materialise it. Using
-	// read-tree + checkout-index also removes files the commit did not have.
-	if out, err := s.git("read-tree", hash); err != nil {
+	if out, err := s.git("reset", "--hard", hash); err != nil {
 		return fmt.Errorf("restore: %s", out)
 	}
-	if out, err := s.git("checkout-index", "-a", "-f"); err != nil {
-		// Fall back to a plain checkout when checkout-index is unhappy.
-		if out2, err2 := s.git("checkout", hash, "--", "."); err2 != nil {
-			return fmt.Errorf("restore: %s / %s", out, out2)
+	for index, snapshot := range s.history {
+		if snapshot.ID == hash {
+			s.cursor = index
+			return nil
 		}
 	}
+	s.history = nil
+	s.cursor = 0
 	return nil
 }
 
@@ -266,11 +270,11 @@ func (s *Snapshotter) Redo() (Snapshot, error) {
 
 // sameAsWorkTree reports whether a commit's tree matches the files on disk.
 func (s *Snapshotter) sameAsWorkTree(hash string) bool {
-	if _, err := s.git("add", "-A", "--", "."); err != nil {
+	if _, err := s.git("diff", "--quiet", hash, "--", "."); err != nil {
 		return false
 	}
-	out, err := s.git("diff", "--cached", "--quiet", hash)
-	return err == nil && out == ""
+	untracked, err := s.git("ls-files", "--others", "--exclude-standard", "--", ".")
+	return err == nil && strings.TrimSpace(untracked) == ""
 }
 
 // LoadHistory restores snapshot bookkeeping from a resumed session.

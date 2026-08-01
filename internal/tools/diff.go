@@ -145,15 +145,15 @@ func hirschbergDiff(a, b []string, oldOffset, newOffset int) []DiffOp {
 
 func lcsLengths(a, b []string) []int {
 	previous := make([]int, len(b)+1)
-	for i := len(a) - 1; i >= 0; i-- {
+	for _, lineA := range a {
 		current := make([]int, len(b)+1)
-		for j := len(b) - 1; j >= 0; j-- {
-			if a[i] == b[j] {
-				current[j] = previous[j+1] + 1
-			} else if previous[j] >= current[j+1] {
-				current[j] = previous[j]
+		for j, lineB := range b {
+			if lineA == lineB {
+				current[j+1] = previous[j] + 1
+			} else if previous[j+1] >= current[j] {
+				current[j+1] = previous[j+1]
 			} else {
-				current[j] = current[j+1]
+				current[j+1] = current[j]
 			}
 		}
 		previous = current

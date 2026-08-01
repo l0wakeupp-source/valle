@@ -41,6 +41,14 @@ func TestSessionMetadataOperationsPersistAndDeleteCompanion(t *testing.T) {
 		t.Fatalf("metadata did not persist: %+v", loaded)
 	}
 
+	metas, err := store.List("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].LastPrompt != "find this message" {
+		t.Fatalf("lightweight metadata = %+v, want last prompt without loading transcript", metas)
+	}
+
 	if err := store.Delete(sess.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +58,7 @@ func TestSessionMetadataOperationsPersistAndDeleteCompanion(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store.Dir(), sess.ID+".meta.json")); !os.IsNotExist(err) {
 		t.Fatalf("metadata companion still exists, stat error: %v", err)
 	}
-	metas, err := store.List("")
+	metas, err = store.List("")
 	if err != nil {
 		t.Fatal(err)
 	}

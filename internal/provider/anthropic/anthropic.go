@@ -60,17 +60,29 @@ func (c *Client) Models() []provider.ModelInfo {
 // ---------- wire types ----------
 
 type wireBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"`
-	Signature string          `json:"signature,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   any             `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
-	Source    wireImageSource `json:"source,omitempty"`
+	Type         string          `json:"type"`
+	Text         string          `json:"text,omitempty"`
+	Thinking     string          `json:"thinking,omitempty"`
+	Signature    string          `json:"signature,omitempty"`
+	ID           string          `json:"id,omitempty"`
+	Name         string          `json:"name,omitempty"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	ToolUseID    string          `json:"tool_use_id,omitempty"`
+	Content      any             `json:"content,omitempty"`
+	IsError      bool            `json:"is_error,omitempty"`
+	Source       wireImageSource `json:"source,omitempty"`
+	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+}
+
+type cacheControl struct {
+	Type string `json:"type"`
+}
+
+type wireTool struct {
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"input_schema"`
+	CacheControl *cacheControl  `json:"cache_control,omitempty"`
 }
 
 type wireMessage struct {
@@ -79,14 +91,48 @@ type wireMessage struct {
 }
 
 type wireRequest struct {
-	Model       string                `json:"model"`
-	MaxTokens   int                   `json:"max_tokens"`
-	System      string                `json:"system,omitempty"`
-	Messages    []wireMessage         `json:"messages"`
-	Tools       []provider.ToolSchema `json:"tools,omitempty"`
-	Stream      bool                  `json:"stream"`
-	Temperature *float64              `json:"temperature,omitempty"`
-	Thinking    *wireThinking         `json:"thinking,omitempty"`
+	Model       string        `json:"model"`
+	MaxTokens   int           `json:"max_tokens"`
+	System      []wireBlock   `json:"system,omitempty"`
+	Messages    []wireMessage `json:"messages"`
+	Tools       []wireTool    `json:"tools,omitempty"`
+	Stream      bool          `json:"stream"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	Thinking    *wireThinking `json:"thinking,omitempty"`
+}
+
+func wireSystem(system, stable string) []wireBlock {
+	if strings.TrimSpace(system) == "" {
+		return nil
+	}
+	if stable != "" && strings.HasPrefix(system, stable) && strings.TrimSpace(stable) != "" {
+		blocks := []wireBlock{{
+			Type: "text", Text: stable,
+			CacheControl: &cacheControl{Type: "ephemeral"},
+		}}
+		if suffix := strings.TrimPrefix(system, stable); strings.TrimSpace(suffix) != "" {
+			blocks = append(blocks, wireBlock{Type: "text", Text: suffix})
+		}
+		return blocks
+	}
+	return []wireBlock{{
+		Type: "text", Text: system,
+		CacheControl: &cacheControl{Type: "ephemeral"},
+	}}
+}
+
+func wireTools(tools []provider.ToolSchema) []wireTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]wireTool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, wireTool{
+			Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema,
+		})
+	}
+	out[len(out)-1].CacheControl = &cacheControl{Type: "ephemeral"}
+	return out
 }
 
 // wireThinking is Anthropic's extended-thinking block.
@@ -174,9 +220,9 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	body := wireRequest{
 		Model:       req.Model,
 		MaxTokens:   maxTok,
-		System:      req.System,
+		System:      wireSystem(req.System, req.SystemStable),
 		Messages:    toWire(req.Messages),
-		Tools:       req.Tools,
+		Tools:       wireTools(req.Tools),
 		Stream:      true,
 		Temperature: req.Temperature,
 	}

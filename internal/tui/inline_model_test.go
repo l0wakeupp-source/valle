@@ -37,6 +37,33 @@ func newModelChoiceTestModel() *Model {
 	}
 }
 
+func TestTabCompletesSelectedSlashCommand(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.input = textarea.New()
+	m.input.SetValue("/sess")
+
+	if !m.completeSlashCommand() {
+		t.Fatal("slash command was not considered completable")
+	}
+	if got := m.input.Value(); got != "/sessions" {
+		t.Fatalf("completed command = %q, want /sessions", got)
+	}
+}
+
+func TestTabCompletesTheHighlightedSlashCommand(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.input = textarea.New()
+	m.input.SetValue("/m")
+	m.slashCursor = 1
+
+	if !m.completeSlashCommand() {
+		t.Fatal("slash command was not considered completable")
+	}
+	if got := m.input.Value(); got != "/models" {
+		t.Fatalf("highlighted completion = %q, want /models", got)
+	}
+}
+
 func TestPromptHistoryUsesArrowKeys(t *testing.T) {
 	m := newModelChoiceTestModel()
 	m.input = textarea.New()
@@ -111,35 +138,24 @@ func TestPromptHistoryTakesPriorityOverActivityFocus(t *testing.T) {
 	}
 }
 
-func TestMouseCaptureIsScopedToInteractiveSurfaces(t *testing.T) {
+func TestMouseCaptureRemainsEnabledForTranscriptScrolling(t *testing.T) {
 	m := newModelChoiceTestModel()
-	if m.wantsMouseCapture() {
-		t.Fatal("ordinary transcript/input view requested mouse capture")
+	if !m.wantsMouseCapture() {
+		t.Fatal("chat view disabled mouse capture, so wheel input can become prompt-history keys")
 	}
 	if m.mouseEnabled {
-		t.Fatal("ordinary transcript/input view started with mouse capture")
+		t.Fatal("test model should not claim runtime mouse state before Update")
 	}
 
-	m.teamViews = map[string]*SwarmView{
-		"swarm": {
-			SwarmID:  "swarm",
-			Name:     "team",
-			Active:   true,
-			AgentOrd: []string{"agent"},
-			Agents: map[string]*AgentView{
-				"agent": {Name: "agent", Status: swarm.StatusWorking},
-			},
-		},
-	}
 	m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 	if !m.mouseEnabled {
-		t.Fatal("activity prompt did not enable mouse capture")
+		t.Fatal("chat view did not enable mouse capture after an update")
 	}
 
-	m.teamViews["swarm"].Agents["agent"].Status = swarm.StatusIdle
+	m.teamViews = map[string]*SwarmView{}
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if m.mouseEnabled {
-		t.Fatal("mouse capture remained enabled after activity became idle")
+	if !m.mouseEnabled {
+		t.Fatal("mouse capture was disabled after activity became idle")
 	}
 }
 

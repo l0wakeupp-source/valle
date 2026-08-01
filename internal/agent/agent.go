@@ -6,7 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -80,28 +83,30 @@ type Snapshotter interface {
 
 // Config wires an agent run.
 type Config struct {
-	Provider    provider.Provider
-	Model       string
-	System      string
-	MaxTokens   int
-	Temperature *float64
-	Reasoning   provider.ReasoningEffort
-	Tools       tools.ToolSet
-	ToolFilter  func(string) bool
-	Perms       *permission.Engine
-	Ask         PermissionAsker
-	Cwd         string
-	SessionID   string
-	AgentName   string
-	Depth       int
-	MaxTurns    int
-	Snapshotter Snapshotter
-	Parallel    bool // allow concurrent read-only tools
-	Plugins     *plugin.Registry
-	Goals       *goal.Store
-	Creds       *config.Credentials // for key rotation on rate-limit
-	Registry    *Registry           // optional live hierarchy registry
-	AgentID     string              // registry ID for this run
+	Provider     provider.Provider
+	Model        string
+	System       string
+	SystemStable string
+	MaxTokens    int
+	Temperature  *float64
+	Reasoning    provider.ReasoningEffort
+	Tools        tools.ToolSet
+	ToolFilter   func(string) bool
+	Perms        *permission.Engine
+	Ask          PermissionAsker
+	Cwd          string
+	SandboxRoot  string
+	SessionID    string
+	AgentName    string
+	Depth        int
+	MaxTurns     int
+	Snapshotter  Snapshotter
+	Parallel     bool // allow concurrent read-only tools
+	Plugins      *plugin.Registry
+	Goals        *goal.Store
+	Creds        *config.Credentials // for key rotation on rate-limit
+	Registry     *Registry           // optional live hierarchy registry
+	AgentID      string              // registry ID for this run
 }
 
 // Runner executes the loop.
@@ -113,6 +118,9 @@ type Runner struct {
 func New(cfg Config) *Runner {
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = 50
+	}
+	if cfg.SandboxRoot == "" && cfg.Perms != nil {
+		cfg.SandboxRoot = cfg.Perms.SandboxRoot()
 	}
 	return &Runner{cfg: cfg}
 }
@@ -190,13 +198,14 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		}
 
 		req := provider.Request{
-			Model:       r.cfg.Model,
-			System:      r.cfg.System,
-			Messages:    msgs,
-			Tools:       schemas,
-			MaxTokens:   r.cfg.MaxTokens,
-			Temperature: r.cfg.Temperature,
-			Reasoning:   r.cfg.Reasoning,
+			Model:        r.cfg.Model,
+			System:       r.cfg.System,
+			SystemStable: r.cfg.SystemStable,
+			Messages:     msgs,
+			Tools:        schemas,
+			MaxTokens:    r.cfg.MaxTokens,
+			Temperature:  r.cfg.Temperature,
+			Reasoning:    r.cfg.Reasoning,
 		}
 
 		ch := make(chan provider.Event, 256)
@@ -324,7 +333,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		}
 
 		for _, call := range calls {
-			key := call.Name + "\x00" + string(call.Input)
+			key := call.Name + "\x00" + canonicalToolInput(call.Input)
 			repeatedCalls[key]++
 			if repeatedCalls[key] > 2 {
 				err := fmt.Errorf("agent: repeated tool call limit reached for %s", call.Name)
@@ -427,6 +436,15 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 			serialIdx = append(serialIdx, i)
 		}
 	}
+	if r.cfg.Snapshotter != nil {
+		for _, i := range serialIdx {
+			t, ok := r.cfg.Tools.Get(calls[i].Name)
+			if ok && !t.ReadOnly() {
+				_, _ = r.cfg.Snapshotter.Snapshot(calls[i].Name)
+				break
+			}
+		}
+	}
 
 	emitStart := func(i int) {
 		emit(Event{Kind: EvToolStart, Tool: &ToolEvent{
@@ -523,11 +541,6 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		}
 	}
 
-	// Snapshot before the first mutation of a turn.
-	if !t.ReadOnly() && r.cfg.Snapshotter != nil {
-		_, _ = r.cfg.Snapshotter.Snapshot(call.Name)
-	}
-
 	input := call.Input
 
 	// plugin hook: tool.execute.before
@@ -594,6 +607,137 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 	return provider.ToolResultBlock(call.ID, ev.Output, ev.IsError), ev
 }
 
+func canonicalToolInput(input json.RawMessage) string {
+	decoder := json.NewDecoder(strings.NewReader(string(input)))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return string(input)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return string(input)
+	}
+	canonical, err := canonicalJSONValue(value)
+	if err != nil {
+		return string(input)
+	}
+	return canonical
+}
+
+func canonicalJSONValue(value any) (string, error) {
+	switch value := value.(type) {
+	case nil:
+		return "null", nil
+	case bool:
+		return fmt.Sprintf("bool:%t", value), nil
+	case string:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return "string:" + string(encoded), nil
+	case json.Number:
+		normalized, ok := normalizeJSONNumber(string(value))
+		if !ok {
+			return "", fmt.Errorf("invalid JSON number %q", value)
+		}
+		return "number:" + normalized, nil
+	case []any:
+		var builder strings.Builder
+		builder.WriteString("array:[")
+		for index, item := range value {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			canonical, err := canonicalJSONValue(item)
+			if err != nil {
+				return "", err
+			}
+			builder.WriteString(canonical)
+		}
+		builder.WriteByte(']')
+		return builder.String(), nil
+	case map[string]any:
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		var builder strings.Builder
+		builder.WriteString("object:{")
+		for index, key := range keys {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			encodedKey, err := json.Marshal(key)
+			if err != nil {
+				return "", err
+			}
+			canonical, err := canonicalJSONValue(value[key])
+			if err != nil {
+				return "", err
+			}
+			builder.Write(encodedKey)
+			builder.WriteByte(':')
+			builder.WriteString(canonical)
+		}
+		builder.WriteByte('}')
+		return builder.String(), nil
+	default:
+		return "", fmt.Errorf("unsupported JSON value %T", value)
+	}
+}
+
+func normalizeJSONNumber(raw string) (string, bool) {
+	if raw == "" {
+		return "", false
+	}
+	negative := raw[0] == '-'
+	if negative {
+		raw = raw[1:]
+	}
+
+	exponent := new(big.Int)
+	if exponentIndex := strings.IndexAny(raw, "eE"); exponentIndex >= 0 {
+		exponentText := raw[exponentIndex+1:]
+		if _, ok := exponent.SetString(exponentText, 10); !ok {
+			return "", false
+		}
+		raw = raw[:exponentIndex]
+	}
+
+	integerPart := raw
+	fractionPart := ""
+	if decimalIndex := strings.IndexByte(raw, '.'); decimalIndex >= 0 {
+		integerPart = raw[:decimalIndex]
+		fractionPart = raw[decimalIndex+1:]
+	}
+	digits := integerPart + fractionPart
+	leadingZeros := 0
+	for leadingZeros < len(digits) && digits[leadingZeros] == '0' {
+		leadingZeros++
+	}
+	if leadingZeros == len(digits) {
+		return "0", true
+	}
+	digits = digits[leadingZeros:]
+	for len(digits) > 1 && digits[len(digits)-1] == '0' {
+		digits = digits[:len(digits)-1]
+	}
+
+	decimalPosition := new(big.Int).SetInt64(int64(len(integerPart)))
+	decimalPosition.Add(decimalPosition, exponent)
+	decimalPosition.Sub(decimalPosition, big.NewInt(int64(leadingZeros)))
+	decimalPosition.Sub(decimalPosition, big.NewInt(int64(len(digits))))
+	if negative {
+		return "-" + digits + "e" + decimalPosition.String(), true
+	}
+	return digits + "e" + decimalPosition.String(), true
+}
+
 // describe converts a tool call into a permission request with a readable
 // title and preview body.
 func describe(call provider.ToolCall, cwd string) permission.Request {
@@ -631,6 +775,12 @@ func describe(call provider.ToolCall, cwd string) permission.Request {
 	case "apply_patch":
 		req.Title = "apply patch"
 		body := str("patch")
+		if paths, err := tools.PatchPaths(body); err == nil {
+			req.Paths = paths
+			if len(paths) > 0 {
+				req.Path = paths[0]
+			}
+		}
 		if len(body) > 4000 {
 			body = body[:4000] + "\n…"
 		}

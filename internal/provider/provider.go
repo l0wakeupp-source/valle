@@ -94,12 +94,15 @@ type ToolSchema struct {
 
 // Request is a single completion request.
 type Request struct {
-	Model       string
-	System      string
-	Messages    []Message
-	Tools       []ToolSchema
-	MaxTokens   int
-	Temperature *float64
+	Model  string
+	System string
+	// SystemStable is an optional prefix of System that remains reusable
+	// across requests. Providers that support prompt caching may mark it.
+	SystemStable string
+	Messages     []Message
+	Tools        []ToolSchema
+	MaxTokens    int
+	Temperature  *float64
 	// Reasoning is the requested thinking level. Providers translate it into
 	// their own dialect and ignore it when the model does not reason.
 	Reasoning ReasoningEffort

@@ -36,7 +36,7 @@ import (
 	"rick/internal/usage"
 )
 
-var Version = "0.1.3"
+var Version = "0.1.4"
 
 func main() {
 	var (
@@ -134,7 +134,8 @@ type opts struct {
 // plus command-line overrides.
 //
 // Precedence is config < profile < individual flags, so `--sandbox off` beats
-// a profile that asked for read-only, and `--yolo` beats everything.
+// a profile that asked for read-only, and `--yolo` skips prompting except for
+// the explicit dangerous-path blocklist floor.
 func resolveSecurity(loaded *config.Loaded, o opts) (*permission.Engine, *sandbox.Holder, error) {
 	cfg := loaded.Config
 	// Permission policy: an explicit profile replaces the configured block.
@@ -152,7 +153,6 @@ func resolveSecurity(loaded *config.Loaded, o opts) (*permission.Engine, *sandbo
 
 	perms := permission.New(perm, loaded.ProjectRoot)
 	perms.SetProfile(profileName)
-	perms.SetYolo(o.yolo)
 
 	// Sandbox: combine the global block with whatever the permission set
 	// carries. Merging (rather than replacing) matters because a profile's
@@ -192,9 +192,13 @@ func resolveSecurity(loaded *config.Loaded, o opts) (*permission.Engine, *sandbo
 			return nil, nil, fmt.Errorf("unknown sandbox enforcement %q (want auto, os or static)", o.enforcement)
 		}
 	}
-	// yolo turns off permission prompts, not the kernel fence: the sandbox
-	// stays exactly as configured so an unattended run cannot wreck the host.
-	policy = policy.Normalize(loaded.ProjectRoot)
+	// yolo turns off permission prompts, not the kernel fence or dangerous-path
+	// blocklist: an unattended run cannot wreck the host or touch protected paths.
+	policy = policy.Normalize(policy.Workspace)
+	perms.SetSandboxRoot(policy.Workspace, policy.Mode == sandbox.ModeWorkspace)
+	perms.SetProtectedPaths(policy.DenyPaths)
+	perms.SetYolo(o.yolo)
+	loaded.SandboxRoot = policy.Workspace
 
 	return perms, sandbox.NewHolder(policy), nil
 }
@@ -354,8 +358,8 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 		Perms: perms, Sandbox: sandboxHolder, Store: store, Snapshots: snaps, Providers: provs,
 		MCP: mcpMgr, Plugins: plugins, Skills: skills, Agent: o.agent, Credentials: creds,
 		Cwd: abs, Version: "v" + Version, ResumeID: resume, InitialMsg: o.prompt,
-		ImageProto: tui.DetectImageSupport(), SwarmManager: swarm.NewSwarmManager(),
-		Goals: goals, Usage: usageTracker, AgentRegistry: agentRegistry,
+		SwarmManager: swarm.NewSwarmManager(),
+		Goals:        goals, Usage: usageTracker, AgentRegistry: agentRegistry,
 	}, nil
 }
 

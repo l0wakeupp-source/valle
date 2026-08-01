@@ -3,12 +3,14 @@ package tools
 import (
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 const defaultToolInputLimit = 16 << 20
 const defaultSearchOutputLimit = 4 << 20
 
 type boundedBuffer struct {
+	mu        sync.Mutex
 	data      bytes.Buffer
 	limit     int
 	total     int
@@ -16,6 +18,8 @@ type boundedBuffer struct {
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.total += len(p)
 	if b.limit <= b.data.Len() {
 		b.truncated = b.truncated || len(p) > 0
@@ -35,16 +39,34 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (b *boundedBuffer) String() string { return b.data.String() }
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data.String()
+}
 
-func (b *boundedBuffer) Len() int { return b.data.Len() }
+func (b *boundedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data.Len()
+}
 
-func (b *boundedBuffer) Total() int { return b.total }
+func (b *boundedBuffer) Total() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.total
+}
 
-func (b *boundedBuffer) Truncated() bool { return b.truncated }
+func (b *boundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
 
 func (b *boundedBuffer) Output() string {
-	output := b.String()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	output := b.data.String()
 	if !b.truncated {
 		return output
 	}

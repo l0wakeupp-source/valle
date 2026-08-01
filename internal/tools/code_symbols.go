@@ -21,11 +21,7 @@ func (CodeSymbolsTool) Name() string { return "code_symbols" }
 func (CodeSymbolsTool) ReadOnly() bool { return true }
 
 func (CodeSymbolsTool) Description() string {
-	return "Navigate code symbols in Go files. Actions:\n" +
-		"- symbols: list all top-level declarations (funcs, types, vars, consts) in a file\n" +
-		"- definition: find the definition site of a symbol by name\n" +
-		"- references: find all references to a symbol in the package\n" +
-		"Only Go source is supported. For other files, use 'grep' to find symbol usages."
+	return "Navigate symbols in Go files: list declarations, find a definition, or find references. Use grep for other files."
 }
 
 func (CodeSymbolsTool) Schema() map[string]any {

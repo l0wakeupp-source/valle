@@ -90,9 +90,8 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 
 		perms := agent.SubagentPermissions(spec, m.deps.Perms, m.deps.Loaded.ProjectRoot)
 
-		sys := spec.Prompt +
-			agent.Environment(m.deps.Cwd, modelID, kind, "") +
-			agent.ProjectContext(m.deps.Loaded.ProjectRoot, m.deps.Loaded.Config.Instructions)
+		stableSys := spec.Prompt + agent.ProjectContext(m.deps.Loaded.ProjectRoot, m.deps.Loaded.Config.Instructions)
+		sys := stableSys + agent.Environment(m.deps.Cwd, modelID, kind, "")
 
 		// Report progress into the parent transcript.
 		if p := m.program; p != nil {
@@ -121,21 +120,22 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 		}
 
 		cfg := agent.Config{
-			Provider:   prov,
-			Model:      modelID,
-			System:     sys,
-			MaxTokens:  m.deps.Loaded.Config.MaxTokens,
-			Tools:      m.deps.Registry,
-			ToolFilter: agent.SubagentToolFilter(toolSpec, m.toolFilter()),
-			Perms:      perms,
-			Ask:        m.makeAsker(),
-			Cwd:        m.deps.Cwd,
-			SessionID:  m.sessionID(),
-			AgentName:  kind,
-			Depth:      depth,
-			MaxTurns:   30,
-			Plugins:    m.deps.Plugins,
-			Parallel:   true,
+			Provider:     prov,
+			Model:        modelID,
+			System:       sys,
+			SystemStable: stableSys,
+			MaxTokens:    m.deps.Loaded.Config.MaxTokens,
+			Tools:        m.deps.Registry,
+			ToolFilter:   agent.SubagentToolFilter(toolSpec, m.toolFilter()),
+			Perms:        perms,
+			Ask:          m.makeAsker(),
+			Cwd:          m.deps.Cwd,
+			SessionID:    m.sessionID(),
+			AgentName:    kind,
+			Depth:        depth,
+			MaxTurns:     30,
+			Plugins:      m.deps.Plugins,
+			Parallel:     true,
 		}
 
 		toolCount := 0
@@ -214,14 +214,14 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			return "", err
 		}
 		perms := agent.SubagentPermissions(spec, m.deps.Perms, m.deps.Loaded.ProjectRoot)
-		sys := spec.Prompt + agent.Environment(m.deps.Cwd, modelID, kind, "") +
-			agent.ProjectContext(m.deps.Loaded.ProjectRoot, m.deps.Loaded.Config.Instructions)
+		stableSys := spec.Prompt + agent.ProjectContext(m.deps.Loaded.ProjectRoot, m.deps.Loaded.Config.Instructions)
+		sys := stableSys + agent.Environment(m.deps.Cwd, modelID, kind, "")
 		toolSpec := spec
 		if m.deps.Perms != nil && m.deps.Perms.Yolo() {
 			toolSpec.ReadOnly = false
 		}
 		cfg := agent.Config{
-			Provider: prov, Model: modelID, System: sys,
+			Provider: prov, Model: modelID, System: sys, SystemStable: stableSys,
 			MaxTokens: m.deps.Loaded.Config.MaxTokens, Tools: m.deps.Registry,
 			ToolFilter: agent.SubagentToolFilter(toolSpec, m.toolFilter()), Perms: perms,
 			Ask: m.makeAsker(), Cwd: m.deps.Cwd, SessionID: m.sessionID(),

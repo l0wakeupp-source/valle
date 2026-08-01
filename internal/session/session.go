@@ -50,17 +50,18 @@ type Snapshot struct {
 
 // Meta is the lightweight listing entry.
 type Meta struct {
-	ID       string    `json:"id"`
-	Title    string    `json:"title"`
-	Cwd      string    `json:"cwd"`
-	Model    string    `json:"model"`
-	Parent   string    `json:"parent,omitempty"`
-	Category string    `json:"category,omitempty"`
-	Favorite bool      `json:"favorite,omitempty"`
-	Messages int       `json:"messages"`
-	Created  time.Time `json:"created"`
-	Updated  time.Time `json:"updated"`
-	ByteSize int64     `json:"byte_size"`
+	ID         string    `json:"id"`
+	Title      string    `json:"title"`
+	Cwd        string    `json:"cwd"`
+	Model      string    `json:"model"`
+	Parent     string    `json:"parent,omitempty"`
+	Category   string    `json:"category,omitempty"`
+	Favorite   bool      `json:"favorite,omitempty"`
+	Messages   int       `json:"messages"`
+	Created    time.Time `json:"created"`
+	Updated    time.Time `json:"updated"`
+	ByteSize   int64     `json:"byte_size"`
+	LastPrompt string    `json:"last_prompt,omitempty"`
 }
 
 // Store is a directory of session files.
@@ -471,9 +472,19 @@ func (s *Store) SetCategory(id, category string) error {
 }
 
 func metaFrom(s *Session) Meta {
+	lastPrompt := ""
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == provider.RoleUser {
+			lastPrompt = s.Messages[i].Text()
+			break
+		}
+	}
+	if len(lastPrompt) > 1000 {
+		lastPrompt = lastPrompt[:1000]
+	}
 	return Meta{
 		ID: s.ID, Title: s.Title, Cwd: s.Cwd, Model: s.Model,
 		Parent: s.Parent, Category: s.Category, Messages: len(s.Messages), Created: s.Created, Updated: s.Updated,
-		Favorite: s.Favorite,
+		Favorite: s.Favorite, LastPrompt: lastPrompt,
 	}
 }

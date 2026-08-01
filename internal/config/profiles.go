@@ -309,6 +309,9 @@ func mergeSandbox(base, over *SandboxConfig) *SandboxConfig {
 		return &cp
 	}
 	out := *base
+	if over.Root != "" {
+		out.Root = over.Root
+	}
 	if over.Mode != "" {
 		out.Mode = over.Mode
 	}

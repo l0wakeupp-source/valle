@@ -15,7 +15,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"rick/internal/config"
-	"rick/internal/provider"
 	"rick/internal/session"
 )
 
@@ -90,7 +89,6 @@ type resumeModel struct {
 	store    *session.Store
 	metas    []session.Meta
 	filtered []session.Meta
-	preview  *session.Session
 
 	cursor       int
 	width        int
@@ -179,7 +177,6 @@ func newResumeModel(styles *Styles) (*resumeModel, error) {
 		sortMode:   sortDate,
 	}
 	m.sortAndFilter()
-	m.refreshSelection()
 	return m, nil
 }
 
@@ -616,7 +613,6 @@ func (m *resumeModel) reload(status string) {
 
 func (m *resumeModel) refreshSelection() {
 	if len(m.filtered) == 0 {
-		m.preview = nil
 		m.selected = ""
 		return
 	}
@@ -627,12 +623,6 @@ func (m *resumeModel) refreshSelection() {
 		m.cursor = len(m.filtered) - 1
 	}
 	m.selected = m.filtered[m.cursor].ID
-	preview, err := m.store.Load(m.selected)
-	if err == nil {
-		m.preview = preview
-	} else {
-		m.preview = nil
-	}
 }
 
 func (m *resumeModel) selectedMeta() session.Meta {
@@ -696,7 +686,7 @@ func (m *resumeModel) sortAndFilter() {
 }
 
 func (m *resumeModel) matchesQuery(meta session.Meta, query string) bool {
-	fields := []string{meta.Title, meta.Cwd, meta.Model, meta.Category, meta.ID}
+	fields := []string{meta.Title, meta.Cwd, meta.Model, meta.Category, meta.ID, meta.LastPrompt}
 	for _, field := range fields {
 		lower := strings.ToLower(field)
 		if strings.Contains(lower, query) {
@@ -948,11 +938,9 @@ func (m *resumeModel) detailView(width int) string {
 	if meta.ID == m.currentID {
 		b.WriteString(s.Success.Render("● last active here") + "\n")
 	}
-	if m.preview != nil {
-		if latest := latestUserPreview(m.preview); latest != "" {
-			b.WriteString("\n" + s.Faint.Render("last prompt") + "\n")
-			b.WriteString(s.Base.Render(wrapPreview(latest, width, 5)))
-		}
+	if meta.LastPrompt != "" {
+		b.WriteString("\n" + s.Faint.Render("last prompt") + "\n")
+		b.WriteString(s.Base.Render(wrapPreview(meta.LastPrompt, width, 5)))
 	}
 	lines := strings.Split(strings.TrimRight(b.String(), "\n"), "\n")
 	lines = append(lines, "")
@@ -1034,18 +1022,6 @@ func editLabel(mode resumeEditMode) string {
 	default:
 		return "input"
 	}
-}
-
-func latestUserPreview(sess *session.Session) string {
-	for i := len(sess.Messages) - 1; i >= 0; i-- {
-		if sess.Messages[i].Role == provider.RoleUser {
-			text := strings.TrimSpace(sess.Messages[i].Text())
-			if text != "" {
-				return text
-			}
-		}
-	}
-	return ""
 }
 
 func wrapPreview(text string, width, lines int) string {

@@ -291,7 +291,7 @@ func testTools(tmp string) {
 	// read
 	rd := tools.ReadTool{}
 	res, _ := rd.Run(ctx, tc, json.RawMessage(`{"path":"sample.go"}`))
-	check("read returns numbered lines", strings.Contains(res.Output, "    1|package main"), res.Output)
+	check("read returns numbered lines", strings.Contains(res.Output, "1|package main"), res.Output)
 	check("read is not an error", !res.IsError)
 
 	resMissing, _ := rd.Run(ctx, tc, json.RawMessage(`{"path":"nope.go"}`))
@@ -900,7 +900,7 @@ func testTUI(root string) {
 	// tab completion
 	m.InputSetValue("/mod")
 	m = key(m, "tab")
-	check("tab completes a slash command", strings.HasPrefix(m.InputValue(), "/models"), m.InputValue())
+	check("tab completes a slash command", strings.HasPrefix(m.InputValue(), "/model"), m.InputValue())
 	m.InputSetValue("")
 
 	// --- commands ---
@@ -916,7 +916,7 @@ func testTUI(root string) {
 	m.InputSetValue("/themes")
 	m = key(m, "enter")
 	check("/themes prints a numbered list", !m.ModalOpen() && m.PendingKind() != 0, "no pending choice")
-	check("theme list names every theme", m.PendingCount() == len(themes.Names()),
+	check("theme list names every theme", m.PendingCount() == len(themes.Names())+1,
 		fmt.Sprint(m.PendingCount()))
 	m.InputSetValue("rick-black") // answering by name also works
 	m = key(m, "enter")

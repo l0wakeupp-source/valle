@@ -9,7 +9,7 @@ import "rick/internal/config"
 func FromConfig(c *config.SandboxConfig, workspace string) Policy {
 	p := Default()
 	if c == nil {
-		return p.Normalize(workspace)
+		return p.Normalize(config.SandboxRoot(nil, workspace))
 	}
 
 	if m, ok := ParseMode(c.Mode); ok {
@@ -47,7 +47,7 @@ func FromConfig(c *config.SandboxConfig, workspace string) Policy {
 		p.Limits.FileSizeMB = c.FileSizeMB
 	}
 
-	return p.Normalize(workspace)
+	return p.Normalize(config.SandboxRoot(c, workspace))
 }
 
 // ToConfig renders a Policy back into its JSON shape, for /config display and
@@ -55,6 +55,7 @@ func FromConfig(c *config.SandboxConfig, workspace string) Policy {
 func ToConfig(p Policy) *config.SandboxConfig {
 	network, keep := p.Network, p.KeepCredentials
 	return &config.SandboxConfig{
+		Root:            p.Workspace,
 		Mode:            string(p.Mode),
 		Enforcement:     string(p.Enforcement),
 		Network:         &network,

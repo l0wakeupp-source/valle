@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+const defaultToolOutputLimit = 15 << 10
+
+func runBoundedCommand(ctx context.Context, cwd, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = cwd
+	out := boundedBuffer{limit: defaultToolOutputLimit}
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.Output(), err
+}
+
 // GitTool provides structured access to git operations: status, diff, log, branches.
 type GitTool struct{}
 
@@ -21,12 +33,7 @@ func (GitTool) Name() string { return "git" }
 func (GitTool) ReadOnly() bool { return true }
 
 func (GitTool) Description() string {
-	return "Structured git operations. Actions:\n" +
-		"- status: short status of changed files\n" +
-		"- diff: unstaged changes (optionally --staged or a specific file)\n" +
-		"- log: recent commits (default last 10)\n" +
-		"- branches: list local branches\n" +
-		"- changed_files: list files changed since a ref (default HEAD~1)"
+	return "Structured git operations: status, diff, log, branches, or changed_files."
 }
 
 func (GitTool) Schema() map[string]any {
@@ -47,7 +54,7 @@ type gitArgs struct {
 	Since  string `json:"since"`
 }
 
-func (GitTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
+func (GitTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a gitArgs
 	if err := decodeArgs(in, &a); err != nil {
 		return Errf("invalid arguments: %v", err), nil
@@ -61,7 +68,7 @@ func (GitTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, e
 
 	switch a.Action {
 	case "status":
-		return gitRun(tc.Cwd, "status", "--short", "--branch")
+		return gitRun(ctx, tc.Cwd, "status", "--short", "--branch")
 	case "diff":
 		args := []string{"diff"}
 		if a.Staged {
@@ -73,26 +80,24 @@ func (GitTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, e
 		} else {
 			args = append(args, ".")
 		}
-		return gitRun(tc.Cwd, args...)
+		return gitRun(ctx, tc.Cwd, args...)
 	case "log":
-		return gitRun(tc.Cwd, "log", "--oneline", "-n", a.Count)
+		return gitRun(ctx, tc.Cwd, "log", "--oneline", "-n", a.Count)
 	case "branches":
-		return gitRun(tc.Cwd, "branch", "--list", "--no-color")
+		return gitRun(ctx, tc.Cwd, "branch", "--list", "--no-color")
 	case "changed_files":
-		return gitRun(tc.Cwd, "diff", "--name-only", a.Since, "--", ".")
+		return gitRun(ctx, tc.Cwd, "diff", "--name-only", a.Since, "--", ".")
 	default:
 		return Errf("unknown action %q", a.Action), nil
 	}
 }
 
-func gitRun(cwd string, args ...string) (Result, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = cwd
-	out, err := cmd.CombinedOutput()
+func gitRun(ctx context.Context, cwd string, args ...string) (Result, error) {
+	out, err := runBoundedCommand(ctx, cwd, "git", args...)
 	if err != nil {
-		return Errf("git %s: %s\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out))), nil
+		return Errf("git %s: %s\n%s", strings.Join(args, " "), err, strings.TrimSpace(out)), nil
 	}
-	s := strings.TrimSpace(string(out))
+	s := strings.TrimSpace(out)
 	if s == "" {
 		return Result{Output: "(no output)", Title: "git " + strings.Join(args[:min(2, len(args))], " ")}, nil
 	}
@@ -134,13 +139,11 @@ func (DiagnosticsTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 		a.Scope = "."
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "build", a.Scope)
-	cmd.Dir = tc.Cwd
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(ctx, tc.Cwd, "go", "build", a.Scope)
 	if err == nil {
 		return Result{Output: fmt.Sprintf("no errors in %s", a.Scope), Title: "diagnostics"}, nil
 	}
-	return Result{Output: fmt.Sprintf("go build %s:\n%s", a.Scope, strings.TrimSpace(string(out))), Title: "build errors"}, nil
+	return Result{Output: fmt.Sprintf("go build %s:\n%s", a.Scope, strings.TrimSpace(out)), Title: "build errors"}, nil
 }
 
 // TestTool runs scoped Go tests with failures-only output.
@@ -184,14 +187,12 @@ func (TestTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result
 	}
 	args = append(args, a.Scope)
 
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = tc.Cwd
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(ctx, tc.Cwd, "go", args...)
 
 	if err == nil {
 		return Result{Output: fmt.Sprintf("PASS: go test %s", a.Scope), Title: "test " + a.Scope}, nil
 	}
-	return Result{Output: fmt.Sprintf("FAIL: go test %s\n%s", a.Scope, strings.TrimSpace(string(out))), Title: "test " + a.Scope}, nil
+	return Result{Output: fmt.Sprintf("FAIL: go test %s\n%s", a.Scope, strings.TrimSpace(out)), Title: "test " + a.Scope}, nil
 }
 
 // TreeTool provides a token-capped directory listing.
@@ -237,34 +238,44 @@ func (TreeTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 }
 
 func buildTree(root string, depth int, pattern string, indent string) (string, error) {
-	if depth <= 0 {
-		return "", nil
+	var out boundedBuffer
+	out.limit = defaultToolOutputLimit
+	if err := buildTreeInto(root, depth, pattern, indent, &out); err != nil {
+		return "", err
+	}
+	return out.Output(), nil
+}
+
+func buildTreeInto(root string, depth int, pattern string, indent string, out *boundedBuffer) error {
+	if depth <= 0 || out.Truncated() {
+		return nil
 	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	var b strings.Builder
 	for _, e := range entries {
+		if out.Truncated() {
+			return nil
+		}
 		if strings.HasPrefix(e.Name(), ".") || e.Name() == "node_modules" || e.Name() == "vendor" {
 			continue
 		}
-		full := root + "/" + e.Name()
+		full := filepath.Join(root, e.Name())
 		if e.IsDir() {
-			fmt.Fprintf(&b, "%s%s/\n", indent, e.Name())
-			sub, err := buildTree(full, depth-1, pattern, indent+"  ")
-			if err == nil && sub != "" {
-				b.WriteString(sub)
+			fmt.Fprintf(out, "%s%s/\n", indent, e.Name())
+			if err := buildTreeInto(full, depth-1, pattern, indent+"  ", out); err != nil {
+				continue
 			}
 		} else {
 			if pattern != "" && !matchGlob(e.Name(), pattern) {
 				continue
 			}
-			fmt.Fprintf(&b, "%s%s\n", indent, e.Name())
+			fmt.Fprintf(out, "%s%s\n", indent, e.Name())
 		}
 	}
-	return b.String(), nil
+	return nil
 }
 
 func matchGlob(name, pattern string) bool {
@@ -372,12 +383,7 @@ func (MemoryTool) Name() string { return "memory" }
 func (MemoryTool) ReadOnly() bool { return false }
 
 func (MemoryTool) Description() string {
-	return "Persistent project memory. Actions:\n" +
-		"- store: save a fact with a key\n" +
-		"- get: retrieve a fact by key\n" +
-		"- list: show all stored keys\n" +
-		"- delete: remove a key\n" +
-		"Stored in .rick/memory/ as JSON files."
+	return "Persistent project memory in .rick/memory/: store, get, list, or delete facts."
 }
 
 func (MemoryTool) Schema() map[string]any {

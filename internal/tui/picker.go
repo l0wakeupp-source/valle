@@ -20,6 +20,7 @@ var slashCommands = []slashCmd{
 	{"/new", "start a fresh session"},
 	{"/sessions", "browse, resume, fork, rename sessions"},
 	{"/auth", "connect a provider (api key / oauth / custom endpoint)"},
+	{"/webproviders", "configure web-search providers and routing"},
 	{"/model", "switch directly to a model"},
 	{"/models", "switch model"},
 	{"/update", "update Rick to the latest GitHub release"},
@@ -153,6 +154,19 @@ func (m *Model) moveSlashCursor(delta int) bool {
 	if m.slashCursor < 0 {
 		m.slashCursor += len(matches)
 	}
+	m.refresh()
+	return true
+}
+
+func (m *Model) completeSlashCommand() bool {
+	selected, ok := m.slashSelection()
+	if !ok {
+		return false
+	}
+	m.input.SetValue(selected)
+	m.input.CursorEnd()
+	m.slashCursor = 0
+	m.resizeAfterInputEdit()
 	m.refresh()
 	return true
 }

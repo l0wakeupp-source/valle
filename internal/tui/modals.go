@@ -402,6 +402,10 @@ func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
 	if m.running || m.agentCh != nil {
 		m.interrupt()
 	}
+	m.compactionRunID++
+	m.compactionActive = false
+	m.autoCompactPending = false
+	m.lastAutoCompact = time.Time{}
 	m.agentCh = nil
 	m.agentCancel = nil
 	m.resetSwarmRuntime()
@@ -430,6 +434,10 @@ func (m *Model) doResume(id string) {
 	if m.running || m.agentCh != nil {
 		m.interrupt()
 	}
+	m.compactionRunID++
+	m.compactionActive = false
+	m.autoCompactPending = false
+	m.lastAutoCompact = time.Time{}
 	m.resetSwarmRuntime()
 	sess, err := m.deps.Store.Load(id)
 	if err != nil {
@@ -574,12 +582,22 @@ func (m *Model) cmdRedo() (tea.Model, tea.Cmd) {
 
 // ---------- compaction ----------
 
+const autoCompactCooldown = 2 * time.Minute
+
+func addProviderUsage(total *provider.Usage, delta provider.Usage) {
+	total.InputTokens += delta.InputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.CacheReadTokens += delta.CacheReadTokens
+	total.CacheWriteTokens += delta.CacheWriteTokens
+}
+
 func (m *Model) maybeAutoCompact() {
 	cfg := m.deps.Loaded.Config
 	if cfg.AutoCompact != nil && !*cfg.AutoCompact {
 		return
 	}
-	if m.ctxWindow <= 0 || len(m.history) <= 6 || m.autoCompactPending || !m.lastAutoCompact.IsZero() {
+	if m.ctxWindow <= 0 || len(m.history) <= 6 || m.autoCompactPending ||
+		(!m.lastAutoCompact.IsZero() && time.Since(m.lastAutoCompact) < autoCompactCooldown) {
 		return
 	}
 	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
@@ -592,6 +610,10 @@ func (m *Model) maybeAutoCompact() {
 func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	if m.running {
 		m.setStatus("cannot compact while working")
+		return m, nil
+	}
+	if m.compactionActive {
+		m.setStatus("compaction already in progress")
 		return m, nil
 	}
 	if len(m.history) < 4 {
@@ -620,6 +642,9 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	tail := append([]provider.Message(nil), m.history[len(m.history)-keep:]...)
 
 	m.setStatus("compacting…")
+	m.compactionActive = true
+	m.compactionRunID++
+	runID := m.compactionRunID
 
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -634,22 +659,32 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 		ch := make(chan provider.Event, 128)
 		go prov.Stream(ctx, req, ch)
 
-		var sb strings.Builder
+		var (
+			sb    strings.Builder
+			usage provider.Usage
+		)
 		for ev := range ch {
 			switch ev.Kind {
 			case provider.EventText:
 				sb.WriteString(ev.Text)
+			case provider.EventUsage:
+				if ev.Usage != nil {
+					addProviderUsage(&usage, *ev.Usage)
+				}
 			case provider.EventError:
-				return compactDoneMsg{err: ev.Err}
+				return compactDoneMsg{runID: runID, err: ev.Err, modelID: modelID, usage: usage}
 			}
 		}
-		return compactDoneMsg{summary: sb.String(), tail: tail}
+		return compactDoneMsg{runID: runID, summary: sb.String(), tail: tail, modelID: modelID, usage: usage}
 	}
 }
 
 type compactDoneMsg struct {
+	runID   uint64
 	summary string
 	tail    []provider.Message
+	modelID string
+	usage   provider.Usage
 	err     error
 }
 
