@@ -517,7 +517,7 @@ func (m *Model) authModelBody(w int) string {
 		if ctxLen > 0 {
 			line += s.Faint.Render("  " + humanTokens(ctxLen))
 		}
-		if style, _ := provider.DetectReasoning(mm.ID); style != provider.ReasoningStyleNone {
+		if style, _ := provider.DetectReasoningForProvider(m.auth.draftID, mm.ID); style != provider.ReasoningStyleNone && style != provider.ReasoningStyleUnknown {
 			line += s.Secondary.Render("  reasoning")
 		}
 		if mm.Free {
