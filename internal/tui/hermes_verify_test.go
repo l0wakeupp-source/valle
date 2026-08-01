@@ -44,11 +44,12 @@ func TestTokenSplitCacheFields(t *testing.T) {
 		t.Fatalf("expected ✏30 (cache write) in split, got: %q", split)
 	}
 
-	// Cache reads should count toward occupancy
-	m.usage = session.Usage{Input: 500, CacheRead: 2000, Output: 100}
+	// Cache reads and writes should both count toward occupancy.
+	m.usage = session.Usage{Input: 500, CacheRead: 2000, CacheWrite: 400, Output: 100}
+	m.ctxWindow = 10000
 	pct := m.contextPct()
-	// (500 + 2000 + 100) / 100000 = 2.6% -> should report ~3%
-	if pct < 2 || pct > 5 {
-		t.Fatalf("contextPct with cache reads: got %d, want ~3", pct)
+	// (500 + 2000 + 400 + 100) / 10000 = 30%.
+	if pct != 30 {
+		t.Fatalf("contextPct with cache reads and writes: got %d, want 30", pct)
 	}
 }

@@ -251,6 +251,8 @@ func under(root, abs string) bool {
 	if root == "" {
 		return false
 	}
+	root = resolvedPath(root)
+	abs = resolvedPath(abs)
 	rel, err := filepath.Rel(root, abs)
 	if err != nil {
 		return false
@@ -259,6 +261,29 @@ func under(root, abs string) bool {
 		return true
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func resolvedPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	var suffix []string
+	current := abs
+	for {
+		if real, err := filepath.EvalSymlinks(current); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				real = filepath.Join(real, suffix[i])
+			}
+			return filepath.Clean(real)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }
 
 // Describe renders a one-line human summary for the status bar.
@@ -303,7 +328,7 @@ func (p Policy) Detail(applied string) string {
 	l := p.Limits
 	fmt.Fprintf(&b, "limits:      mem %s · cpu %s · procs %s · file %s",
 		mb(l.MemoryMB), secs(l.CPUSeconds), count(l.Processes), mb(l.FileSizeMB))
-	if !p.KeepCredentials {
+	if p.Mode != ModeTrusted && p.Mode != ModeOff && !p.KeepCredentials {
 		b.WriteString("\ncredentials: scrubbed from the command environment")
 	}
 	return b.String()

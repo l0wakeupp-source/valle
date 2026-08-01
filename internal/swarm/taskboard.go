@@ -386,7 +386,11 @@ func (b *TaskBoard) isBlockedTaskLocked(task *Task, visiting map[string]bool) bo
 
 func (b *TaskBoard) trimCompletedLocked() {
 	completed := 0
+	referenced := make(map[string]bool)
 	for _, task := range b.tasks {
+		for _, dependency := range task.DependsOn {
+			referenced[dependency] = true
+		}
 		if isTaskTerminal(task.Status) {
 			completed++
 		}
@@ -396,7 +400,7 @@ func (b *TaskBoard) trimCompletedLocked() {
 		var oldest time.Time
 		for _, id := range b.order {
 			task := b.tasks[id]
-			if task == nil || !isTaskTerminal(task.Status) {
+			if task == nil || referenced[id] || !isTaskTerminal(task.Status) {
 				continue
 			}
 			if oldestID == "" || task.UpdatedAt.Before(oldest) {

@@ -544,11 +544,17 @@ func (m *Model) startAgentWithMessage(userMsg provider.Message) tea.Cmd {
 
 func (m *Model) runShell(cmdline string) (tea.Model, tea.Cmd) {
 	m.appendMsg(ChatMsg{Kind: MsgUser, Text: "!" + cmdline, Time: time.Now()})
+	m.shellSeq++
+	callID := fmt.Sprintf("shell-%d", m.shellSeq)
 	m.appendMsg(ChatMsg{
 		Kind: MsgTool, ToolName: "bash", ToolTitle: cmdline,
-		ToolRunning: true, Time: time.Now(),
+		CallID: callID, ToolRunning: true, Time: time.Now(),
 	})
 	idx := len(m.msgs) - 1
+	if m.pendingTools == nil {
+		m.pendingTools = make(map[string]int)
+	}
+	m.pendingTools[callID] = idx
 	request := permission.Request{Tool: "bash", Title: cmdline, Command: cmdline, Body: cmdline}
 	level := permission.Allow
 	if m.deps.Perms != nil {
@@ -556,7 +562,7 @@ func (m *Model) runShell(cmdline string) (tea.Model, tea.Cmd) {
 	}
 	if level == permission.Deny {
 		return m, func() tea.Msg {
-			return shellDoneMsg{idx: idx, err: fmt.Errorf("permission denied by policy: %s", cmdline)}
+			return shellDoneMsg{callID: callID, err: fmt.Errorf("permission denied by policy: %s", cmdline)}
 		}
 	}
 
@@ -566,28 +572,28 @@ func (m *Model) runShell(cmdline string) (tea.Model, tea.Cmd) {
 		if level == permission.Ask {
 			decision = m.makeAsker()(ctx, request)
 			if decision == agent.DecideReject {
-				return shellDoneMsg{idx: idx, err: fmt.Errorf("permission denied: %s", cmdline)}
+				return shellDoneMsg{callID: callID, err: fmt.Errorf("permission denied: %s", cmdline)}
 			}
 			if decision == agent.DecideAlways && m.deps.Perms != nil {
 				m.deps.Perms.GrantSession(permission.SessionKey(request))
 			}
 		}
 		if m.deps.Registry == nil {
-			return shellDoneMsg{idx: idx, err: fmt.Errorf("bash tool is unavailable")}
+			return shellDoneMsg{callID: callID, err: fmt.Errorf("bash tool is unavailable")}
 		}
 		tool, ok := m.deps.Registry.Get("bash")
 		if !ok {
-			return shellDoneMsg{idx: idx, err: fmt.Errorf("bash tool is unavailable")}
+			return shellDoneMsg{callID: callID, err: fmt.Errorf("bash tool is unavailable")}
 		}
 		input, _ := json.Marshal(map[string]string{"command": cmdline, "description": cmdline})
 		result, err := tool.Run(ctx, tools.Context{Cwd: m.deps.Cwd, SessionID: m.sessionID(), Agent: m.agentName}, input)
 		if err != nil {
-			return shellDoneMsg{idx: idx, err: err}
+			return shellDoneMsg{callID: callID, err: err}
 		}
 		if result.IsError {
-			return shellDoneMsg{idx: idx, err: fmt.Errorf("%s", result.Output)}
+			return shellDoneMsg{callID: callID, err: fmt.Errorf("%s", result.Output)}
 		}
-		return shellDoneMsg{idx: idx, output: result.Output}
+		return shellDoneMsg{callID: callID, output: result.Output}
 	}
 }
 
@@ -677,7 +683,8 @@ func (m *Model) permissionView() string {
 
 // shellDoneMsg is delivered when a shell command finishes.
 type shellDoneMsg struct {
-	idx    int
+	callID string
+	idx    int // legacy fallback for messages produced by older callers
 	output string
 	err    error
 }

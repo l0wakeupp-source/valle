@@ -144,9 +144,11 @@ func (m *Model) drainAgent(runID uint64) (tea.Model, tea.Cmd) {
 	if m.agentCh == nil {
 		return m, nil
 	}
+	processed := false
 	for i := 0; i < 64; i++ {
 		select {
 		case ev, ok := <-m.agentCh:
+			processed = true
 			if !ok {
 				if m.agentCh != nil {
 					return m, m.finishRun(fmt.Errorf("agent event stream ended unexpectedly"))
@@ -157,11 +159,15 @@ func (m *Model) drainAgent(runID uint64) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 		default:
-			m.refresh()
+			if processed {
+				m.refresh()
+			}
 			return m, m.drainCmd(runID)
 		}
 	}
-	m.refresh()
+	if processed {
+		m.refresh()
+	}
 	return m, m.drainCmd(runID)
 }
 
@@ -225,8 +231,8 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			// Anthropic reports:
 			//   InputTokens = cache miss (new tokens billed at full price)
 			//   CacheReadTokens = cache hit (discounted, previously cached)
-			//   CacheCreationTokens = cache write (newly written to cache)
-			// The context occupancy is the total tokens sent: miss + hit.
+			// CacheCreationTokens = cache write (newly written to cache)
+			// Context occupancy is the total request footprint: miss + hit + write.
 			m.usage.Input = ev.Usage.InputTokens
 			m.usage.Output = ev.Usage.OutputTokens
 			m.usage.CacheRead = ev.Usage.CacheReadTokens
@@ -414,15 +420,48 @@ func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
 	return out
 }
 
-const maxHistoryMessages = 500
+const (
+	maxHistoryMessages = 500
+	maxHistoryBytes    = 2 << 20
+)
 
 func capHistory(history []provider.Message) []provider.Message {
-	if len(history) <= maxHistoryMessages {
+	if len(history) <= maxHistoryMessages && historyByteSize(history) <= maxHistoryBytes {
 		return history
 	}
-	removed := len(history) - maxHistoryMessages + 1
-	summary := provider.Message{Role: provider.RoleSystem, Content: []provider.ContentBlock{{Type: "text", Text: fmt.Sprintf("Earlier conversation compacted: %d messages omitted.", removed)}}}
+
+	removed := 0
+	remainingBytes := historyByteSize(history)
+	for removed < len(history)-1 && (len(history)-removed+1 > maxHistoryMessages || remainingBytes > maxHistoryBytes) {
+		remainingBytes -= messageByteSize(history[removed])
+		removed++
+	}
+	if removed == 0 {
+		return history
+	}
+
+	summaryText := fmt.Sprintf("Earlier conversation compacted: %d messages omitted.", removed)
+	summary := provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "text", Text: summaryText}}}
 	return append([]provider.Message{summary}, history[removed:]...)
+}
+
+func historyByteSize(history []provider.Message) int {
+	total := 0
+	for _, message := range history {
+		total += messageByteSize(message)
+	}
+	return total
+}
+
+func messageByteSize(message provider.Message) int {
+	total := len(message.Role) + 16
+	for _, block := range message.Content {
+		total += len(block.Type) + len(block.Text) + len(block.Signature)
+		total += len(block.ID) + len(block.Name) + len(block.Input)
+		total += len(block.ToolUseID) + len(block.Content)
+		total += len(block.Source) + len(block.MediaType) + len(block.Data) + 32
+	}
+	return total
 }
 
 func (m *Model) interrupt() {

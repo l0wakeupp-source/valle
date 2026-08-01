@@ -19,6 +19,8 @@ type unixSession struct {
 	limits  Limits
 	pgid    int
 	once    sync.Once
+	mu      sync.Mutex
+	reaped  bool
 }
 
 func (s *unixSession) AfterStart(cmd *exec.Cmd) error {
@@ -41,11 +43,23 @@ func (s *unixSession) Applied() string {
 
 func (s *unixSession) Close() {
 	s.once.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.reaped {
+			return
+		}
 		if s.pgid > 0 {
 			// A negative pid signals the entire process group.
 			_ = syscall.Kill(-s.pgid, syscall.SIGKILL)
 		}
 	})
+}
+
+func (s *unixSession) Reaped() {
+	s.mu.Lock()
+	s.reaped = true
+	s.pgid = 0
+	s.mu.Unlock()
 }
 
 func limitSummary(l Limits) string {

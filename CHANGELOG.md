@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.51 — 2026-08-02
+
+### Performance
+
+- Reduced avoidable allocations and bounded memory use across TUI event draining, resume search, tool file reads, OSV auditing, security findings, and swarm coordination.
+- Added regression coverage for the RAM/CPU optimization paths.
+
 ## v0.1.5 — 2026-08-01
 
 ### Reasoning / Thinking

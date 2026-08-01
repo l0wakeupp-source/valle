@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -60,18 +61,18 @@ func (c *Client) Models() []provider.ModelInfo {
 // ---------- wire types ----------
 
 type wireBlock struct {
-	Type         string          `json:"type"`
-	Text         string          `json:"text,omitempty"`
-	Thinking     string          `json:"thinking,omitempty"`
-	Signature    string          `json:"signature,omitempty"`
-	ID           string          `json:"id,omitempty"`
-	Name         string          `json:"name,omitempty"`
-	Input        json.RawMessage `json:"input,omitempty"`
-	ToolUseID    string          `json:"tool_use_id,omitempty"`
-	Content      any             `json:"content,omitempty"`
-	IsError      bool            `json:"is_error,omitempty"`
-	Source       wireImageSource `json:"source,omitempty"`
-	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+	Type         string           `json:"type"`
+	Text         string           `json:"text,omitempty"`
+	Thinking     string           `json:"thinking,omitempty"`
+	Signature    string           `json:"signature,omitempty"`
+	ID           string           `json:"id,omitempty"`
+	Name         string           `json:"name,omitempty"`
+	Input        json.RawMessage  `json:"input,omitempty"`
+	ToolUseID    string           `json:"tool_use_id,omitempty"`
+	Content      any              `json:"content,omitempty"`
+	IsError      bool             `json:"is_error,omitempty"`
+	Source       *wireImageSource `json:"source,omitempty"`
+	CacheControl *cacheControl    `json:"cache_control,omitempty"`
 }
 
 type cacheControl struct {
@@ -91,14 +92,15 @@ type wireMessage struct {
 }
 
 type wireRequest struct {
-	Model       string        `json:"model"`
-	MaxTokens   int           `json:"max_tokens"`
-	System      []wireBlock   `json:"system,omitempty"`
-	Messages    []wireMessage `json:"messages"`
-	Tools       []wireTool    `json:"tools,omitempty"`
-	Stream      bool          `json:"stream"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	Thinking    *wireThinking `json:"thinking,omitempty"`
+	Model        string        `json:"model"`
+	MaxTokens    int           `json:"max_tokens"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+	System       []wireBlock   `json:"system,omitempty"`
+	Messages     []wireMessage `json:"messages"`
+	Tools        []wireTool    `json:"tools,omitempty"`
+	Stream       bool          `json:"stream"`
+	Temperature  *float64      `json:"temperature,omitempty"`
+	Thinking     *wireThinking `json:"thinking,omitempty"`
 }
 
 func wireSystem(system, stable string) []wireBlock {
@@ -178,7 +180,7 @@ func toWire(msgs []provider.Message) []wireMessage {
 				if b.Source == "base64" && b.Data != "" {
 					wm.Content = append(wm.Content, wireBlock{
 						Type: "image",
-						Source: wireImageSource{
+						Source: &wireImageSource{
 							Type:      "base64",
 							MediaType: b.MediaType,
 							Data:      b.Data,
@@ -218,13 +220,14 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		maxTok = 8192
 	}
 	body := wireRequest{
-		Model:       req.Model,
-		MaxTokens:   maxTok,
-		System:      wireSystem(req.System, req.SystemStable),
-		Messages:    toWire(req.Messages),
-		Tools:       wireTools(req.Tools),
-		Stream:      true,
-		Temperature: req.Temperature,
+		Model:        req.Model,
+		MaxTokens:    maxTok,
+		CacheControl: &cacheControl{Type: "ephemeral"},
+		System:       wireSystem(req.System, req.SystemStable),
+		Messages:     toWire(req.Messages),
+		Tools:        wireTools(req.Tools),
+		Stream:       true,
+		Temperature:  req.Temperature,
 	}
 
 	// Extended thinking, when the model supports it and a level is asked for.
@@ -319,11 +322,29 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			data.WriteString(strings.TrimSpace(line[len("data:"):]))
 		}
 	}
-	flush()
+	if !flush() {
+		return
+	}
 
 	if err := sc.Err(); err != nil && ctx.Err() == nil {
 		emit(provider.Event{Kind: provider.EventError, Err: err})
 		return
+	}
+	indices := make([]int, 0, len(blocks))
+	for index := range blocks {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		b := blocks[index]
+		input := strings.TrimSpace(b.json.String())
+		if input == "" {
+			input = "{}"
+		}
+		if !emit(provider.Event{Kind: provider.EventToolCall,
+			ToolCall: &provider.ToolCall{ID: b.id, Name: b.name, Input: json.RawMessage(input)}}) {
+			return
+		}
 	}
 	emit(provider.Event{Kind: provider.EventUsage, Usage: &usage})
 	emit(provider.Event{Kind: provider.EventDone, StopReason: stopReason})

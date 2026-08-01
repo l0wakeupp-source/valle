@@ -265,8 +265,14 @@ func (s *Swarm) Report() string {
 	fmt.Fprintf(&b, "Topology: %s\n", s.Topology)
 	fmt.Fprintf(&b, "Board entries: %d\n", s.Board.Len())
 
+	s.mu.RLock()
+	agents := make(map[string]*Agent, len(s.Agents))
+	for name, agent := range s.Agents {
+		agents[name] = agent
+	}
+	s.mu.RUnlock()
 	fmt.Fprintf(&b, "Agents:\n")
-	for name, ag := range s.Agents {
+	for name, ag := range agents {
 		status := ag.GetStatus()
 		msgCount := len(ag.GetMessages())
 		fmt.Fprintf(&b, "  %s [%s] (%d messages)\n", name, status, msgCount)

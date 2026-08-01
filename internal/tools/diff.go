@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // DiffOp is one line-level operation in a diff.
@@ -145,8 +146,9 @@ func hirschbergDiff(a, b []string, oldOffset, newOffset int) []DiffOp {
 
 func lcsLengths(a, b []string) []int {
 	previous := make([]int, len(b)+1)
+	current := make([]int, len(b)+1)
 	for _, lineA := range a {
-		current := make([]int, len(b)+1)
+		clear(current)
 		for j, lineB := range b {
 			if lineA == lineB {
 				current[j+1] = previous[j] + 1
@@ -156,7 +158,7 @@ func lcsLengths(a, b []string) []int {
 				current[j+1] = current[j]
 			}
 		}
-		previous = current
+		previous, current = current, previous
 	}
 	return previous
 }
@@ -258,6 +260,29 @@ func UnifiedDiff(name, oldText, newText string, contextLines int) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// UnifiedDiffLimited preserves the beginning of a diff while keeping large
+// edit results from consuming the entire next model turn.
+func UnifiedDiffLimited(name, oldText, newText string, contextLines, maxBytes int) string {
+	full := UnifiedDiff(name, oldText, newText, contextLines)
+	if maxBytes <= 0 || len(full) <= maxBytes {
+		return full
+	}
+	suffix := fmt.Sprintf("\n… <diff truncated; %d bytes omitted>", len(full)-maxBytes)
+	bodyLimit := maxBytes - len(suffix)
+	if bodyLimit < 1 {
+		return suffix[1:]
+	}
+	cut := bodyLimit
+	for cut > 0 && !utf8.RuneStart(full[cut]) {
+		cut--
+	}
+	if line := strings.LastIndex(full[:cut], "\n"); line > 0 {
+		cut = line
+	}
+	body := full[:cut]
+	return body + fmt.Sprintf("\n… <diff truncated; %d bytes omitted>", len(full)-len(body))
 }
 
 // DiffStat returns added/removed line counts.

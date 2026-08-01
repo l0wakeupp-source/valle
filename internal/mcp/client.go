@@ -180,9 +180,40 @@ func (c *Client) refreshTools(ctx context.Context) error {
 		return fmt.Errorf("mcp %s: tools/list decode: %w", c.Name, err)
 	}
 	c.mu.Lock()
+	for i := range out.Tools {
+		out.Tools[i].InputSchema = withoutSchemaDialect(out.Tools[i].InputSchema)
+	}
 	c.tools = out.Tools
 	c.mu.Unlock()
 	return nil
+}
+
+func withoutSchemaDialect(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return schema
+	}
+	return normalizeSchemaValue(schema).(map[string]any)
+}
+
+func normalizeSchemaValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		compact := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			if key != "$schema" {
+				compact[key] = normalizeSchemaValue(nested)
+			}
+		}
+		return compact
+	case []any:
+		compact := make([]any, len(typed))
+		for i, nested := range typed {
+			compact[i] = normalizeSchemaValue(nested)
+		}
+		return compact
+	default:
+		return value
+	}
 }
 
 // Tools returns the advertised tool list.
@@ -307,6 +338,33 @@ func (c *Client) readStdio() {
 		if len(line) == 0 {
 			continue
 		}
+		var envelope struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Method  string          `json:"method"`
+		}
+		if json.Unmarshal(line, &envelope) != nil {
+			continue
+		}
+		if envelope.Method != "" {
+			// A server request is not a response to one of our pending calls.
+			// We do not expose callbacks yet, but answer it so the peer cannot
+			// wait forever.
+			if len(envelope.ID) > 0 && string(envelope.ID) != "null" {
+				response := map[string]any{
+					"jsonrpc": "2.0",
+					"id":      json.RawMessage(envelope.ID),
+					"error": map[string]any{
+						"code":    -32601,
+						"message": "method not supported",
+					},
+				}
+				if data, err := json.Marshal(response); err == nil {
+					_ = c.writeStdio(append(data, '\n'))
+				}
+			}
+			continue
+		}
 		var resp rpcResponse
 		if json.Unmarshal(line, &resp) != nil || resp.ID == 0 {
 			continue
@@ -381,24 +439,44 @@ func (c *Client) httpCall(ctx context.Context, req rpcRequest) (json.RawMessage,
 	if err != nil {
 		return nil, err
 	}
-	// Servers may reply as SSE; take the first data: line.
-	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("event:")) || bytes.Contains(body, []byte("\ndata:")) {
+	// Servers may reply as SSE. Inspect every data event and ignore
+	// notifications or server requests until the response for this request
+	// arrives; accepting the first event can return the wrong result.
+	var candidates [][]byte
+	trimmed := bytes.TrimSpace(body)
+	if bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) || bytes.Contains(body, []byte("\ndata:")) {
 		for _, line := range strings.Split(string(body), "\n") {
 			if strings.HasPrefix(line, "data:") {
-				body = []byte(strings.TrimSpace(line[5:]))
-				break
+				data := strings.TrimSpace(line[len("data:"):])
+				if data != "" && data != "[DONE]" {
+					candidates = append(candidates, []byte(data))
+				}
 			}
 		}
+	} else {
+		candidates = append(candidates, trimmed)
 	}
-
-	var rpcResp rpcResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return nil, fmt.Errorf("mcp %s: bad response: %w", c.Name, err)
+	for _, candidate := range candidates {
+		var envelope struct {
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(candidate, &envelope); err != nil {
+			continue
+		}
+		if envelope.Method != "" || envelope.ID == nil || *envelope.ID != req.ID {
+			continue
+		}
+		var rpcResp rpcResponse
+		if err := json.Unmarshal(candidate, &rpcResp); err != nil {
+			return nil, fmt.Errorf("mcp %s: bad response: %w", c.Name, err)
+		}
+		if rpcResp.Error != nil {
+			return nil, rpcResp.Error
+		}
+		return rpcResp.Result, nil
 	}
-	if rpcResp.Error != nil {
-		return nil, rpcResp.Error
-	}
-	return rpcResp.Result, nil
+	return nil, fmt.Errorf("mcp %s: response id mismatch for %s", c.Name, req.Method)
 }
 
 // Close shuts the connection down.

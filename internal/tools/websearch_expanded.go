@@ -701,12 +701,19 @@ func ddgLiteSnippetMatches(body string) []string {
 }
 
 func extractHTMLPairs(body, element string) [][2]string {
-	lower := strings.ToLower(body)
+	lower := []byte(body)
+	for i, c := range lower {
+		if c >= 'A' && c <= 'Z' {
+			lower[i] = c + ('a' - 'A')
+		}
+	}
 	open := "<" + element
 	close := "</" + element + ">"
+	openBytes := []byte(open)
+	closeBytes := []byte(close)
 	pairs := make([][2]string, 0)
 	for start := 0; start < len(body); {
-		relative := strings.Index(lower[start:], open)
+		relative := bytes.Index(lower[start:], openBytes)
 		if relative < 0 {
 			break
 		}
@@ -716,7 +723,7 @@ func extractHTMLPairs(body, element string) [][2]string {
 			break
 		}
 		tagEnd := tagStart + tagEndRelative
-		endRelative := strings.Index(lower[tagEnd+1:], close)
+		endRelative := bytes.Index(lower[tagEnd+1:], closeBytes)
 		if endRelative < 0 {
 			break
 		}

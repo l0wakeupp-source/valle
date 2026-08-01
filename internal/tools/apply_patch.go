@@ -90,6 +90,8 @@ func (ApplyPatchTool) Run(_ context.Context, tc Context, in json.RawMessage) (Re
 	if len(files) == 0 {
 		return Errf("patch contained no file sections"), nil
 	}
+	fileWriteMu.Lock()
+	defer fileWriteMu.Unlock()
 
 	// Stage everything, then commit; a failure leaves the tree untouched.
 	type staged struct {
@@ -122,12 +124,18 @@ func (ApplyPatchTool) Run(_ context.Context, tc Context, in json.RawMessage) (Re
 			if err != nil {
 				return Errf("apply_patch: cannot delete %s: %v", f.path, err), nil
 			}
+			if !wasRead(abs) {
+				return Errf("apply_patch: refusing to delete %s: read it first", f.path), nil
+			}
 			plan = append(plan, staged{path: abs, action: actionDelete, old: string(raw)})
 
 		case actionMove:
 			raw, err := os.ReadFile(abs)
 			if err != nil {
 				return Errf("apply_patch: cannot move %s: %v", f.path, err), nil
+			}
+			if !wasRead(abs) {
+				return Errf("apply_patch: refusing to move %s: read it first", f.path), nil
 			}
 			content := string(raw)
 			if len(f.lines) > 0 {
@@ -145,6 +153,9 @@ func (ApplyPatchTool) Run(_ context.Context, tc Context, in json.RawMessage) (Re
 			raw, err := os.ReadFile(abs)
 			if err != nil {
 				return Errf("apply_patch: cannot read %s: %v", f.path, err), nil
+			}
+			if !wasRead(abs) {
+				return Errf("apply_patch: refusing to update %s: read it first", f.path), nil
 			}
 			content, err := applyHunks(string(raw), f.lines)
 			if err != nil {

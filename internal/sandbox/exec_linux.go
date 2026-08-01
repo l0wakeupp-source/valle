@@ -46,7 +46,7 @@ func (linuxBackend) Prepare(cmd *exec.Cmd, p Policy) (Session, error) {
 	s := &unixSession{limits: p.Limits, applied: "rlimit + process group"}
 
 	if bw := bwrapPath(); bw != "" && p.Mode != ModeTrusted {
-		args := bwrapArgs(p)
+		args := bwrapArgs(p, cmd.Dir)
 		args = append(args, cmd.Path)
 		args = append(args, cmd.Args[1:]...)
 		cmd.Path = bw
@@ -69,7 +69,7 @@ func (linuxBackend) Prepare(cmd *exec.Cmd, p Policy) (Session, error) {
 }
 
 // bwrapArgs renders the policy as a bubblewrap command line.
-func bwrapArgs(p Policy) []string {
+func bwrapArgs(p Policy, dir string) []string {
 	args := []string{
 		"--die-with-parent",
 		"--unshare-uts", "--unshare-ipc", "--unshare-pid", "--unshare-cgroup-try",
@@ -111,7 +111,15 @@ func bwrapArgs(p Policy) []string {
 	}
 
 	if p.Workspace != "" {
-		args = append(args, "--chdir", p.Workspace)
+		if dir == "" {
+			dir = p.Workspace
+		}
+		args = append(args, "--chdir", dir)
+	}
+	for _, denied := range p.DenyPaths {
+		if denied != "" {
+			args = append(args, "--tmpfs", denied)
+		}
 	}
 	return args
 }

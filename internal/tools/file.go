@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,6 +26,10 @@ var fileState struct {
 	readAt map[string]int64 // abs path -> mtime unix nano at read time
 }
 
+var fileWriteMu sync.Mutex
+
+const maxEditDiffBytes = 24 << 10
+
 func init() { fileState.readAt = map[string]int64{} }
 
 func markRead(path string) {
@@ -35,10 +41,14 @@ func markRead(path string) {
 }
 
 func wasRead(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
 	fileState.Lock()
 	defer fileState.Unlock()
-	_, ok := fileState.readAt[path]
-	return ok
+	readAt, ok := fileState.readAt[path]
+	return ok && readAt == st.ModTime().UnixNano()
 }
 
 // ResetFileState clears read tracking (new session).
@@ -159,20 +169,22 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 	if inputLimit <= 0 {
 		inputLimit = defaultToolInputLimit
 	}
+	if st.Size() > int64(inputLimit) {
+		return Errf("%s exceeds the read input limit of %d bytes", relTo(tc.Cwd, p), inputLimit), nil
+	}
 	file, err := os.Open(p)
 	if err != nil {
 		return Errf("%v", err), nil
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, int64(inputLimit)+1))
-	if err != nil {
-		return Errf("%v", err), nil
+	prefix := make([]byte, 8000)
+	prefixBytes, prefixErr := io.ReadFull(file, prefix)
+	if prefixErr != nil && prefixErr != io.EOF && prefixErr != io.ErrUnexpectedEOF {
+		return Errf("%v", prefixErr), nil
 	}
-	if len(data) > inputLimit {
-		return Errf("%s exceeds the read input limit of %d bytes", relTo(tc.Cwd, p), inputLimit), nil
-	}
-	if isBinary(data) {
-		return Errf("%s appears to be a binary file (%d bytes)", relTo(tc.Cwd, p), len(data)), nil
+	prefix = prefix[:prefixBytes]
+	if isBinary(prefix) {
+		return Errf("%s appears to be a binary file (%d bytes)", relTo(tc.Cwd, p), st.Size()), nil
 	}
 
 	offset := a.Offset
@@ -184,40 +196,67 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		limit = 2000
 	}
 
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
-	total := len(lines)
+	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), file), 32<<10)
+	requestedEnd := offset - 1 + limit
+	lineCount := 0
+	bytesRead := 0
+	outputEnd := 0
+	outputTruncated := false
+	var b strings.Builder
+	written := 0
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			bytesRead += len(line)
+			if bytesRead > inputLimit {
+				return Errf("%s exceeds the read input limit of %d bytes", relTo(tc.Cwd, p), inputLimit), nil
+			}
+			lineCount++
+			if strings.HasSuffix(line, "\r\n") {
+				line = line[:len(line)-2]
+			} else if strings.HasSuffix(line, "\n") {
+				line = line[:len(line)-1]
+			}
+			if lineCount >= offset && lineCount <= requestedEnd && !outputTruncated {
+				if len(line) > 2000 {
+					line = line[:2000] + " …<truncated>"
+				}
+				lineNumber := strconv.Itoa(lineCount)
+				fmt.Fprintf(&b, "%s|%s\n", lineNumber, line)
+				written += len(lineNumber) + len(line) + 2
+				outputEnd = lineCount
+				if written > maxBytes {
+					fmt.Fprintf(&b, "\n<output truncated at %d bytes; continue with offset=%d>\n", maxBytes, lineCount+1)
+					outputTruncated = true
+				}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Errf("%v", readErr), nil
+		}
+	}
+	total := lineCount
+	if total == 0 {
+		total = 1
+		if offset == 1 {
+			b.WriteString("1|\n")
+			outputEnd = 1
+		}
+	}
 	if offset > total {
 		return Result{
 			Output: fmt.Sprintf("<file %s has %d lines; offset %d is past the end>", relTo(tc.Cwd, p), total, offset),
 			Title:  relTo(tc.Cwd, p),
 		}, nil
 	}
-	end := offset - 1 + limit
-	if end > total {
-		end = total
-	}
-
-	var b strings.Builder
-	written := 0
-	for i := offset - 1; i < end; i++ {
-		line := lines[i]
-		if len(line) > 2000 {
-			line = line[:2000] + " …<truncated>"
-		}
-		lineNumber := strconv.Itoa(i + 1)
-		fmt.Fprintf(&b, "%s|%s\n", lineNumber, line)
-		written += len(lineNumber) + len(line) + 2
-		if written > maxBytes {
-			fmt.Fprintf(&b, "\n<output truncated at %d bytes; continue with offset=%d>\n", maxBytes, i+2)
-			end = i + 1
-			break
-		}
-	}
 	markRead(p)
 
 	foot := ""
-	if end < total {
-		foot = fmt.Sprintf("\n<showing lines %d-%d of %d; continue with offset=%d>", offset, end, total, end+1)
+	if outputEnd < total && !outputTruncated {
+		foot = fmt.Sprintf("\n<showing lines %d-%d of %d; continue with offset=%d>", offset, outputEnd, total, outputEnd+1)
 	}
 	return Result{
 		Output: b.String() + foot,
@@ -288,6 +327,8 @@ func (WriteTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result,
 		return Errf("path is required"), nil
 	}
 	p := resolvePath(tc.Cwd, a.Path)
+	fileWriteMu.Lock()
+	defer fileWriteMu.Unlock()
 
 	old := ""
 	existed := false
@@ -366,6 +407,8 @@ func (EditTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 		return Errf("old_string and new_string are identical"), nil
 	}
 	p := resolvePath(tc.Cwd, a.Path)
+	fileWriteMu.Lock()
+	defer fileWriteMu.Unlock()
 
 	raw, err := os.ReadFile(p)
 	if err != nil {
@@ -387,7 +430,7 @@ func (EditTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 
 	return Result{
 		Output: fmt.Sprintf("edited %s (%d replacement(s))\n\n%s",
-			relTo(tc.Cwd, p), n, UnifiedDiff(relTo(tc.Cwd, p), content, newContent, 3)),
+			relTo(tc.Cwd, p), n, UnifiedDiffLimited(relTo(tc.Cwd, p), content, newContent, 3, maxEditDiffBytes)),
 		Title: fmt.Sprintf("edit %s", relTo(tc.Cwd, p)),
 		Meta:  map[string]any{"path": p, "old": content, "new": newContent, "count": n},
 	}, nil

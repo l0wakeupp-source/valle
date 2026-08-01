@@ -104,6 +104,11 @@ func (p *SwarmProcess) Start(ctx context.Context) (string, error) {
 		runners[name] = runner
 	}
 	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.runners = nil
+		p.mu.Unlock()
+	}()
 
 	var workersDone chan struct{}
 	if len(runners) > 0 {

@@ -9,11 +9,70 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 const defaultToolOutputLimit = 15 << 10
+const maxFetchBytes = 8 << 10
+const fetchCacheTTL = 30 * time.Second
+const maxFetchCacheEntries = 32
+
+var hrefRe = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)
+var fetchNoiseRe = regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</(script|style)>`)
+
+type fetchCacheEntry struct {
+	created time.Time
+	result  Result
+}
+
+var fetchCache = struct {
+	sync.Mutex
+	entries map[string]fetchCacheEntry
+}{entries: make(map[string]fetchCacheEntry)}
+
+func fetchCacheKey(url, extract string) string {
+	return url + "\x00" + extract
+}
+
+func cachedFetchResult(key string) (Result, bool) {
+	fetchCache.Lock()
+	defer fetchCache.Unlock()
+	entry, ok := fetchCache.entries[key]
+	if !ok || time.Since(entry.created) >= fetchCacheTTL {
+		if ok {
+			delete(fetchCache.entries, key)
+		}
+		return Result{}, false
+	}
+	entry.result.Meta = map[string]any{"cached": true}
+	return entry.result, true
+}
+
+func storeFetchResult(key string, result Result) {
+	fetchCache.Lock()
+	defer fetchCache.Unlock()
+	if _, exists := fetchCache.entries[key]; !exists && len(fetchCache.entries) >= maxFetchCacheEntries {
+		var oldestKey string
+		var oldest time.Time
+		for existingKey, entry := range fetchCache.entries {
+			if oldestKey == "" || entry.created.Before(oldest) {
+				oldestKey, oldest = existingKey, entry.created
+			}
+		}
+		delete(fetchCache.entries, oldestKey)
+	}
+	result.Meta = nil
+	fetchCache.entries[key] = fetchCacheEntry{created: time.Now(), result: result}
+}
+
+func resetFetchCache() {
+	fetchCache.Lock()
+	fetchCache.entries = make(map[string]fetchCacheEntry)
+	fetchCache.Unlock()
+}
 
 func runBoundedCommand(ctx context.Context, cwd, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -312,6 +371,8 @@ func (FetchTool) Schema() map[string]any {
 	}, "url")
 }
 
+var fetchHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 func (FetchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a struct {
 		URL     string `json:"url"`
@@ -323,20 +384,29 @@ func (FetchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resul
 	if !strings.HasPrefix(a.URL, "http://") && !strings.HasPrefix(a.URL, "https://") {
 		return Errf("only HTTP/HTTPS URLs allowed"), nil
 	}
+	extract := strings.ToLower(strings.TrimSpace(a.Extract))
+	if extract == "" {
+		extract = "text"
+	}
+	if extract != "text" && extract != "links" {
+		return Errf("extract must be 'text' or 'links'"), nil
+	}
+	cacheKey := fetchCacheKey(a.URL, extract)
+	if result, ok := cachedFetchResult(cacheKey); ok {
+		return result, nil
+	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, "GET", a.URL, nil)
 	if err != nil {
 		return Errf("request: %v", err), nil
 	}
 	req.Header.Set("User-Agent", "rick-agent/1.0")
-	resp, err := client.Do(req)
+	resp, err := fetchHTTPClient.Do(req)
 	if err != nil {
 		return Errf("fetch: %v", err), nil
 	}
 	defer resp.Body.Close()
 
-	const maxFetchBytes = 8 << 10
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes+1))
 	if err != nil {
 		return Errf("read response: %v", err), nil
@@ -348,25 +418,50 @@ func (FetchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resul
 	if truncated {
 		body = body[:maxFetchBytes]
 	}
-	content := strings.TrimSpace(string(body))
+	content := extractFetchedContent(string(body), resp.Header.Get("Content-Type"), extract)
 	if truncated {
 		content += "\n… <response capped at 8 KiB>"
 	}
+	result := Result{Output: content, Title: a.URL}
+	if extract == "links" {
+		result.Title = "links: " + a.URL
+	}
+	storeFetchResult(cacheKey, result)
+	return result, nil
+}
 
-	if a.Extract == "links" {
+func extractFetchedContent(body, contentType, extract string) string {
+	isHTML := strings.Contains(strings.ToLower(contentType), "html") || strings.Contains(strings.ToLower(body), "<html")
+	if extract == "links" {
+		if isHTML {
+			return extractHTMLLinks(body)
+		}
 		var links []string
-		for _, line := range strings.Split(content, "\n") {
+		for _, line := range strings.Split(body, "\n") {
 			if idx := strings.Index(line, "http"); idx >= 0 {
-				end := strings.IndexAny(line[idx:], " \t\"'>")
+				end := strings.IndexAny(line[idx:], " 	\"'>")
 				if end > 0 {
 					links = append(links, line[idx:idx+end])
 				}
 			}
 		}
-		return Result{Output: strings.Join(links, "\n"), Title: "links: " + a.URL}, nil
+		return strings.Join(links, "\n")
 	}
+	if isHTML {
+		body = fetchNoiseRe.ReplaceAllString(body, " ")
+		body = tagRe.ReplaceAllString(body, " ")
+	}
+	return cleanHTML(body)
+}
 
-	return Result{Output: content, Title: a.URL}, nil
+func extractHTMLLinks(body string) string {
+	var links []string
+	for _, match := range hrefRe.FindAllStringSubmatch(body, -1) {
+		if len(match) > 1 && (strings.HasPrefix(match[1], "http://") || strings.HasPrefix(match[1], "https://")) {
+			links = append(links, match[1])
+		}
+	}
+	return strings.Join(links, "\n")
 }
 
 // MemoryTool persists and retrieves project facts (decisions, conventions).

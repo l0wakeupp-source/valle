@@ -629,7 +629,7 @@ func formatResultsFiltered(query string, results []searchResult, original int, c
 	for i, r := range results {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, r.Title)
 		fmt.Fprintf(&b, "   %s\n", r.URL)
-		if r.Snippet != "" {
+		if r.Snippet != "" && !strings.EqualFold(strings.TrimSpace(r.Title), strings.TrimSpace(r.Snippet)) {
 			fmt.Fprintf(&b, "   %s\n", r.Snippet)
 		}
 		b.WriteString("\n")
@@ -1049,6 +1049,7 @@ func duckDuckGoInstant(ctx context.Context, query string, maxResults int) ([]sea
 }
 
 func cleanHTML(s string) string {
+	s = tagRe.ReplaceAllString(s, "")
 	s = cleanHTMLReplacer.Replace(s)
 
 	var b strings.Builder

@@ -145,10 +145,9 @@ func (f DeviceFlow) Poll(ctx context.Context, deviceCode string, interval int) (
 			if err := json.Unmarshal(body, &tok); err != nil {
 				return nil, fmt.Errorf("device flow: bad token response: %w", err)
 			}
-			if tok.AccessToken == "" {
-				return nil, fmt.Errorf("device flow: token endpoint returned no access_token")
+			if tok.AccessToken != "" {
+				return &tok, nil
 			}
-			return &tok, nil
 		}
 
 		// Error — decide whether to retry or give up.

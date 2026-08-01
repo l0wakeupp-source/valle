@@ -9,10 +9,11 @@ import (
 
 func TestWireRequestAddsPromptCacheBreakpoints(t *testing.T) {
 	body := wireRequest{
-		Model:     "claude-test",
-		MaxTokens: 128,
-		System:    wireSystem("stable instructions\nvolatile environment", "stable instructions"),
-		Messages:  []wireMessage{{Role: provider.RoleUser, Content: []wireBlock{{Type: "text", Text: "hello"}}}},
+		Model:        "claude-test",
+		MaxTokens:    128,
+		CacheControl: &cacheControl{Type: "ephemeral"},
+		System:       wireSystem("stable instructions\nvolatile environment", "stable instructions"),
+		Messages:     []wireMessage{{Role: provider.RoleUser, Content: []wireBlock{{Type: "text", Text: "hello"}}}},
 		Tools: wireTools([]provider.ToolSchema{
 			{Name: "read", Description: "read files", InputSchema: map[string]any{"type": "object"}},
 			{Name: "write", Description: "write files", InputSchema: map[string]any{"type": "object"}},
@@ -26,6 +27,9 @@ func TestWireRequestAddsPromptCacheBreakpoints(t *testing.T) {
 	}
 
 	var decoded struct {
+		CacheControl *struct {
+			Type string `json:"type"`
+		} `json:"cache_control"`
 		System []struct {
 			Type         string `json:"type"`
 			Text         string `json:"text"`
@@ -42,6 +46,9 @@ func TestWireRequestAddsPromptCacheBreakpoints(t *testing.T) {
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("decode request: %v", err)
+	}
+	if decoded.CacheControl == nil || decoded.CacheControl.Type != "ephemeral" {
+		t.Fatalf("top-level cache control = %#v, want ephemeral", decoded.CacheControl)
 	}
 
 	if len(decoded.System) != 2 || decoded.System[0].Type != "text" || decoded.System[0].Text != "stable instructions" ||

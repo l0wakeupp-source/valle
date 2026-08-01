@@ -407,7 +407,7 @@ func (m *Model) contextGauge() string {
 	if m.ctxWindow <= 0 {
 		return ""
 	}
-	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
+	used := m.usage.Input + m.usage.CacheRead + m.usage.CacheWrite + m.usage.Output
 	if used <= 0 {
 		return ""
 	}
@@ -494,7 +494,7 @@ func (m *Model) contextPct() int {
 	if m.ctxWindow <= 0 {
 		return 0
 	}
-	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
+	used := m.usage.Input + m.usage.CacheRead + m.usage.CacheWrite + m.usage.Output
 	if used <= 0 {
 		return 0
 	}

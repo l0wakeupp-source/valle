@@ -330,20 +330,20 @@ func mergeSandbox(base, over *SandboxConfig) *SandboxConfig {
 	if len(over.DenyHosts) > 0 {
 		out.DenyHosts = over.DenyHosts
 	}
-	if len(over.WritableRoots) > 0 {
-		out.WritableRoots = append(append([]string{}, out.WritableRoots...), over.WritableRoots...)
+	if over.WritableRoots != nil {
+		out.WritableRoots = append([]string{}, over.WritableRoots...)
 	}
-	if len(over.ReadableRoots) > 0 {
-		out.ReadableRoots = append(append([]string{}, out.ReadableRoots...), over.ReadableRoots...)
+	if over.ReadableRoots != nil {
+		out.ReadableRoots = append([]string{}, over.ReadableRoots...)
 	}
-	if len(over.DenyPaths) > 0 {
-		out.DenyPaths = append(append([]string{}, out.DenyPaths...), over.DenyPaths...)
+	if over.DenyPaths != nil {
+		out.DenyPaths = append([]string{}, over.DenyPaths...)
 	}
-	if len(over.AllowEnv) > 0 {
-		out.AllowEnv = append(append([]string{}, out.AllowEnv...), over.AllowEnv...)
+	if over.AllowEnv != nil {
+		out.AllowEnv = append([]string{}, over.AllowEnv...)
 	}
-	if len(over.DenyEnv) > 0 {
-		out.DenyEnv = append(append([]string{}, out.DenyEnv...), over.DenyEnv...)
+	if over.DenyEnv != nil {
+		out.DenyEnv = append([]string{}, over.DenyEnv...)
 	}
 	if over.MemoryMB > 0 {
 		out.MemoryMB = over.MemoryMB

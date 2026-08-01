@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // CodeSymbolsTool provides LSP-like code navigation: go-to-definition, find references,
@@ -105,7 +106,7 @@ func listSymbols(fset *token.FileSet, f *ast.File, path, cwd string) (Result, er
 	if b.Len() == 0 {
 		return Result{Output: "(no top-level symbols found)", Title: relTo(cwd, path)}, nil
 	}
-	return Result{Output: strings.TrimRight(b.String(), "\n"), Title: relTo(cwd, path)}, nil
+	return Result{Output: capCodeSymbolsOutput(strings.TrimRight(b.String(), "\n")), Title: relTo(cwd, path)}, nil
 }
 
 func findDefinition(fset *token.FileSet, f *ast.File, symbol, path, cwd string) (Result, error) {
@@ -158,7 +159,24 @@ func findReferences(fset *token.FileSet, f *ast.File, symbol, path, cwd string) 
 	if len(refs) == 0 {
 		return Result{Output: fmt.Sprintf("no references to %q in %s", symbol, relTo(cwd, path)), Title: symbol}, nil
 	}
-	return Result{Output: fmt.Sprintf("%s — %s", relTo(cwd, path), strings.Join(refs, ", ")), Title: symbol}, nil
+	return Result{Output: capCodeSymbolsOutput(fmt.Sprintf("%s — %s", relTo(cwd, path), strings.Join(refs, ", "))), Title: symbol}, nil
+}
+
+const maxCodeSymbolsOutputBytes = 16 << 10
+
+func capCodeSymbolsOutput(output string) string {
+	if len(output) <= maxCodeSymbolsOutputBytes {
+		return output
+	}
+	suffix := fmt.Sprintf("\n… <symbols output truncated at %d bytes>", maxCodeSymbolsOutputBytes)
+	limit := maxCodeSymbolsOutputBytes - len(suffix)
+	for limit > 0 && !utf8.RuneStart(output[limit]) {
+		limit--
+	}
+	if line := strings.LastIndex(output[:limit], "\n"); line > 0 {
+		limit = line
+	}
+	return output[:limit] + suffix
 }
 
 func fieldListStr(fl *ast.FieldList) string {

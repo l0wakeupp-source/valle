@@ -228,7 +228,7 @@ func (m *Model) activityAt(y int) (activityItem, bool) {
 	if m.activityCursor >= activityVisibleRows {
 		start = m.activityCursor - activityVisibleRows + 1
 	}
-	index := start + y - top
+	index := start + y - itemTop
 	if index < 0 || index >= len(items) {
 		return activityItem{}, false
 	}

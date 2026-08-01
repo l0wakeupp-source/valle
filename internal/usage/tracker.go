@@ -79,9 +79,11 @@ func (t *Tracker) Load() error {
 		}
 		return err
 	}
-	if err := json.Unmarshal(raw, &t.data); err != nil {
+	var decoded map[string]map[string]ModelUsage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return err
 	}
+	t.data = decoded
 	t.dirty = false
 	t.lastPersist = time.Time{}
 	return nil

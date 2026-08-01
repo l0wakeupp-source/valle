@@ -696,8 +696,8 @@ func hostOf(u string) string {
 func snippet(b []byte) string {
 	s := strings.TrimSpace(string(b))
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > 160 {
-		s = s[:160] + "…"
+	if len([]rune(s)) > 160 {
+		s = string([]rune(s)[:160]) + "…"
 	}
 	if s == "" {
 		s = "(empty response)"

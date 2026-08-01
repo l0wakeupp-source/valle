@@ -461,6 +461,7 @@ func (m *Model) doResume(id string) {
 		m.deps.Snapshots.LoadHistory(sess.Snapshots)
 	}
 	m.msgs = messagesToChat(sess.Messages)
+	m.tx.invalidateAll(m.contentWidth())
 	m.refresh()
 	m.setStatus(fmt.Sprintf("resumed %q (%d messages)", sess.Title, len(sess.Messages)))
 }
@@ -498,14 +499,34 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 }
 
 func compactHistory(history []provider.Message) []provider.Message {
-	out := make([]provider.Message, len(history))
-	for i, msg := range history {
-		out[i] = msg
-		out[i].Content = append([]provider.ContentBlock(nil), msg.Content...)
-		for j, block := range out[i].Content {
-			if block.Type == "tool_result" {
-				out[i].Content[j].Content = compactToolOutput(block.Content, historyToolOutputChars)
+	lastThinkingMessage := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		for _, block := range history[i].Content {
+			if block.Type == "thinking" {
+				lastThinkingMessage = i
+				break
 			}
+		}
+		if lastThinkingMessage >= 0 {
+			break
+		}
+	}
+
+	out := make([]provider.Message, 0, len(history))
+	for i, msg := range history {
+		compacted := msg
+		compacted.Content = make([]provider.ContentBlock, 0, len(msg.Content))
+		for _, block := range msg.Content {
+			if block.Type == "thinking" && i != lastThinkingMessage {
+				continue
+			}
+			if block.Type == "tool_result" {
+				block.Content = compactToolOutput(block.Content, historyToolOutputChars)
+			}
+			compacted.Content = append(compacted.Content, block)
+		}
+		if len(compacted.Content) > 0 {
+			out = append(out, compacted)
 		}
 	}
 	return out
@@ -583,6 +604,7 @@ func (m *Model) cmdRedo() (tea.Model, tea.Cmd) {
 // ---------- compaction ----------
 
 const autoCompactCooldown = 2 * time.Minute
+const compactionMaxTokens = 2048
 
 func addProviderUsage(total *provider.Usage, delta provider.Usage) {
 	total.InputTokens += delta.InputTokens
@@ -600,11 +622,32 @@ func (m *Model) maybeAutoCompact() {
 		(!m.lastAutoCompact.IsZero() && time.Since(m.lastAutoCompact) < autoCompactCooldown) {
 		return
 	}
-	used := m.usage.Input + m.usage.CacheRead + m.usage.Output
-	if used > m.ctxWindow*70/100 {
+	used := m.usage.Input + m.usage.CacheRead + m.usage.CacheWrite + m.usage.Output
+	threshold := contextCompactionThreshold(m.ctxWindow, cfg.ContextReserve)
+	if used > threshold {
 		m.autoCompactPending = true
-		m.setStatus("context above 70% — compacting after this turn")
+		m.setStatus("context reserve reached — compacting after this turn")
 	}
+}
+
+func contextCompactionThreshold(contextWindow, reserve int) int {
+	if contextWindow <= 0 {
+		return 0
+	}
+	if reserve <= 0 {
+		return contextWindow * 70 / 100
+	}
+	if reserve >= contextWindow {
+		return 0
+	}
+	return contextWindow - reserve
+}
+
+func compactionTokenLimit(configured int) int {
+	if configured > 0 && configured < compactionMaxTokens {
+		return configured
+	}
+	return compactionMaxTokens
 }
 
 func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
@@ -640,6 +683,7 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	}
 	head := append([]provider.Message(nil), m.history[:len(m.history)-keep]...)
 	tail := append([]provider.Message(nil), m.history[len(m.history)-keep:]...)
+	summaryMaxTokens := compactionTokenLimit(m.deps.Loaded.Config.MaxTokens)
 
 	m.setStatus("compacting…")
 	m.compactionActive = true
@@ -654,7 +698,7 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 			Model:     modelID,
 			System:    agent.CompactPrompt,
 			Messages:  append(head, provider.UserText("Summarise the conversation above now.")),
-			MaxTokens: 4096,
+			MaxTokens: summaryMaxTokens,
 		}
 		ch := make(chan provider.Event, 128)
 		go prov.Stream(ctx, req, ch)

@@ -100,6 +100,7 @@ type nopSession struct{}
 func (nopSession) AfterStart(*exec.Cmd) error { return nil }
 func (nopSession) Applied() string            { return "none (static analysis only)" }
 func (nopSession) Close()                     {}
+func (nopSession) Reaped()                    {}
 
 // Available reports whether OS-level confinement can be applied here.
 func Available(p Policy) bool { return backendFor(p).Available() }
@@ -114,7 +115,18 @@ func BackendName(p Policy) string { return backendFor(p).Name() }
 // behaviour depends on Enforcement: EnforceOS refuses to run, EnforceAuto
 // proceeds and records the downgrade in Outcome.Applied.
 func Run(ctx context.Context, p Policy, spec Spec) Outcome {
-	if violations := Analyze(p, spec.Command); len(violations) > 0 {
+	analysisPolicy := p
+	if spec.Dir != "" {
+		absDir, err := filepath.Abs(spec.Dir)
+		if err != nil {
+			return Outcome{ExitCode: -1, Applied: "blocked by policy", Err: err}
+		}
+		if p.Confined() && p.Workspace != "" && !under(p.Workspace, absDir) {
+			return Outcome{ExitCode: -1, Applied: "blocked by policy", Err: fmt.Errorf("sandbox: working directory %s is outside the workspace", absDir)}
+		}
+		analysisPolicy.Workspace = absDir
+	}
+	if violations := Analyze(analysisPolicy, spec.Command); len(violations) > 0 {
 		return Outcome{ExitCode: -1, Applied: "blocked by policy", Err: violationError(violations)}
 	}
 
@@ -181,6 +193,9 @@ func Run(ctx context.Context, p Policy, spec Spec) Outcome {
 	}()
 
 	err := cmd.Wait()
+	if reaper, ok := session.(interface{ Reaped() }); ok {
+		reaper.Reaped()
+	}
 	close(reaped)
 	elapsed := time.Since(start)
 

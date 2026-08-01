@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -254,12 +253,21 @@ func dibToPNG(dibData []byte) (string, error) {
 	biBitCount := binary.LittleEndian.Uint16(dibData[14:16])
 	biCompression := binary.LittleEndian.Uint32(dibData[16:20])
 
+	if biSize < 40 || uint64(biSize) > uint64(len(dibData)) {
+		return "", fmt.Errorf("invalid DIB header size: %d", biSize)
+	}
 	if biPlanes != 1 {
 		return "", fmt.Errorf("unsupported planes: %d", biPlanes)
 	}
 
 	// Handle top-down DIB (negative height)
 	topDown := false
+	if biWidth <= 0 || biHeight == 0 || biHeight == -1<<31 {
+		return "", fmt.Errorf("invalid DIB dimensions: %dx%d", biWidth, biHeight)
+	}
+	if biWidth > 100000 || biHeight > 100000 || biHeight < -100000 {
+		return "", fmt.Errorf("DIB dimensions are too large: %dx%d", biWidth, biHeight)
+	}
 	if biHeight < 0 {
 		topDown = true
 		biHeight = -biHeight
@@ -281,6 +289,11 @@ func dibToPNG(dibData []byte) (string, error) {
 
 	// Pixel data offset = header size + optional color table
 	pixelOffset := int(biSize)
+	if biCompression == 3 && biSize == 40 {
+		// BITMAPINFOHEADER bitfields store three masks immediately after the
+		// header and before the pixel array.
+		pixelOffset += 12
+	}
 	if biBitCount <= 8 {
 		// Color table
 		numColors := binary.LittleEndian.Uint32(dibData[32:36])
@@ -291,14 +304,19 @@ func dibToPNG(dibData []byte) (string, error) {
 	}
 
 	// Row size is padded to 4 bytes
-	rowSize := ((int(biWidth) * int(biBitCount)) + 31) / 32 * 4
+	rowSize := ((int64(biWidth) * int64(biBitCount)) + 31) / 32 * 4
+	totalPixels := rowSize * int64(biHeight)
+	if rowSize <= 0 || totalPixels < 0 || int64(pixelOffset) > int64(len(dibData)) || totalPixels > int64(len(dibData)-pixelOffset) {
+		return "", fmt.Errorf("DIB pixel data is truncated")
+	}
 
 	for y := 0; y < int(biHeight); y++ {
 		srcY := y
 		if !topDown {
 			srcY = int(biHeight) - 1 - y
 		}
-		srcRow := dibData[pixelOffset+srcY*rowSize:]
+		srcStart := int64(pixelOffset) + int64(srcY)*rowSize
+		srcRow := dibData[int(srcStart):int(srcStart+rowSize)]
 		for x := 0; x < int(biWidth); x++ {
 			var c color.RGBA
 			if biBitCount == 24 {
@@ -311,6 +329,9 @@ func dibToPNG(dibData []byte) (string, error) {
 				c.G = srcRow[x*4+1]
 				c.R = srcRow[x*4+2]
 				c.A = srcRow[x*4+3]
+				if c.A == 0 {
+					c.A = 255
+				}
 			}
 			img.Set(x, y, c)
 		}
@@ -325,7 +346,7 @@ func dibToPNG(dibData []byte) (string, error) {
 	}
 	defer f.Close()
 
-	if err := png.Encode(f, img); err != nil {
+	if err := png.Encode(f, ensureOpaque(img)); err != nil {
 		return "", fmt.Errorf("encode PNG: %w", err)
 	}
 
@@ -336,6 +357,11 @@ func dibToPNG(dibData []byte) (string, error) {
 func ensureOpaque(img image.Image) image.Image {
 	bounds := img.Bounds()
 	opaque := image.NewRGBA(bounds)
-	draw.Draw(opaque, bounds, img, bounds.Min, draw.Src)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			opaque.SetRGBA(x, y, color.RGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: 255})
+		}
+	}
 	return opaque
 }

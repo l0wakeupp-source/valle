@@ -119,6 +119,46 @@ func (c *Credentials) Set(id string, cred Credential) {
 	c.Providers[id] = cred
 }
 
+// Get returns a copy of one credential.
+func (c *Credentials) Get(id string) (Credential, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cred, ok := c.Providers[id]
+	return cloneCredential(cred), ok
+}
+
+// Snapshot returns a deep copy safe for use outside the credentials lock.
+func (c *Credentials) Snapshot() map[string]Credential {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]Credential, len(c.Providers))
+	for id, cred := range c.Providers {
+		out[id] = cloneCredential(cred)
+	}
+	return out
+}
+
+func cloneCredential(cred Credential) Credential {
+	cred.Models = append([]string(nil), cred.Models...)
+	cred.VisionModels = append([]string(nil), cred.VisionModels...)
+	cred.APIKeys = append([]string(nil), cred.APIKeys...)
+	if cred.ContextWindows != nil {
+		cred.ContextWindows = cloneMap(cred.ContextWindows)
+	}
+	if cred.ContextSources != nil {
+		cred.ContextSources = cloneMap(cred.ContextSources)
+	}
+	return cred
+}
+
+func cloneMap[T any](in map[string]T) map[string]T {
+	out := make(map[string]T, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
 // Remove deletes a credential.
 func (c *Credentials) Remove(id string) {
 	c.mu.Lock()
@@ -140,10 +180,14 @@ func (c *Credentials) allKeysLocked(id string) []string {
 		return nil
 	}
 	if len(cred.APIKeys) > 0 {
-		return append([]string(nil), cred.APIKeys...)
+		keys := make([]string, len(cred.APIKeys))
+		for i, key := range cred.APIKeys {
+			keys[i] = catalog.CleanSecret(key)
+		}
+		return keys
 	}
 	if cred.APIKey != "" {
-		return []string{cred.APIKey}
+		return []string{catalog.CleanSecret(cred.APIKey)}
 	}
 	return nil
 }
@@ -166,7 +210,7 @@ func (c *Credentials) currentKeyLocked(id string) string {
 	}
 	if mode == "round-robin" || mode == "failover" {
 		idx := c.rotationIndex[id] % len(keys)
-		return keys[idx]
+		return catalog.CleanSecret(keys[idx])
 	}
 	return catalog.CleanSecret(keys[0])
 }
@@ -214,6 +258,8 @@ func (c *Credentials) ensureRotation() {
 
 // IDs lists configured provider ids, sorted.
 func (c *Credentials) IDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := make([]string, 0, len(c.Providers))
 	for id := range c.Providers {
 		out = append(out, id)
@@ -226,13 +272,17 @@ func (c *Credentials) IDs() []string {
 // never override an explicit provider block in rick.json — a project that
 // pins its own endpoint keeps it.
 func MergeCredentials(cfg *Config, creds *Credentials) {
-	if creds == nil || len(creds.Providers) == 0 {
+	if creds == nil {
+		return
+	}
+	providers := creds.Snapshot()
+	if len(providers) == 0 {
 		return
 	}
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]Provider{}
 	}
-	for id, cred := range creds.Providers {
+	for id, cred := range providers {
 		if cred.Disabled {
 			continue
 		}
@@ -253,7 +303,10 @@ func MergeCredentials(cfg *Config, creds *Credentials) {
 // FirstConfiguredModel picks a sensible default model after login: the
 // credential's preferred model, else its first fetched model.
 func FirstConfiguredModel(creds *Credentials, id string) string {
-	cred, ok := creds.Providers[id]
+	if creds == nil {
+		return ""
+	}
+	cred, ok := creds.Get(id)
 	if !ok {
 		return ""
 	}

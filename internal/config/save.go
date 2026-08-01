@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
+
+var patchMu sync.Mutex
 
 // SaveThemeChoice persists the selected theme to the global tui.json.
 func SaveThemeChoice(name string) error {
@@ -40,10 +43,13 @@ func SaveWebSearchConfig(cfg WebSearchConfig) error {
 // never silently drop configuration it does not understand. The write goes
 // through a temp file so an interrupted save cannot truncate the original.
 func patchGlobal(name, key string, value any) error {
+	patchMu.Lock()
+	defer patchMu.Unlock()
 	dir := GlobalDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	_ = os.Chmod(dir, 0o700)
 	// A .jsonc variant is loaded in preference to .json, so writing the plain
 	// file would leave the value permanently shadowed. We cannot rewrite the
 	// .jsonc either: marshalling it back through encoding/json would strip
@@ -68,8 +74,21 @@ func patchGlobal(name, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+	tmpFile, err := os.CreateTemp(dir, "."+name+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0o600); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(append(data, '\n')); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

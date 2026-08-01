@@ -161,17 +161,13 @@ func (e *Engine) ClearSessionGrants() {
 // SessionKey is the stable key used for session grants.
 func SessionKey(r Request) string {
 	if r.Tool == "bash" {
-		return "bash:" + firstWords(r.Command, 2)
+		return "bash:" + normalizeCommand(r.Command)
 	}
 	return r.Tool
 }
 
-func firstWords(s string, n int) string {
-	f := strings.Fields(s)
-	if len(f) > n {
-		f = f[:n]
-	}
-	return strings.Join(f, " ")
+func normalizeCommand(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func sessionGrantKey(grants map[string]bool, r Request) (string, bool) {
@@ -181,15 +177,6 @@ func sessionGrantKey(grants map[string]bool, r Request) (string, bool) {
 	}
 	if r.Tool != "bash" {
 		return "", false
-	}
-	for grant, enabled := range grants {
-		if !enabled || !strings.HasPrefix(grant, "bash:") {
-			continue
-		}
-		command := strings.TrimPrefix(grant, "bash:")
-		if command == firstWords(r.Command, 1) || command == firstWords(r.Command, 2) {
-			return grant, true
-		}
 	}
 	return "", false
 }
@@ -235,13 +222,13 @@ func (e *Engine) Resolve(r Request) Decision {
 
 	switch r.Tool {
 	case "bash":
-		if lvl, pat, ok := matchBash(p.Bash, r.Command); ok {
+		if lvl, pat, ok := matchBash(p.Bash, r.Command, def); ok {
 			return Decision{Level: lvl, Rule: "bash:" + pat, Source: "policy"}
 		}
 		return Decision{Level: def, Rule: "default", Source: "default"}
 
 	case "edit", "patch", "apply_patch", "write":
-		if d, ok := e.matchPathRule(p.Paths, firstTargetPath(r)); ok {
+		if d, ok := e.matchWritePathRules(p.Paths, r); ok {
 			return e.guardDecision(r, d)
 		}
 		coarse := p.Edit
@@ -307,7 +294,7 @@ func (e *Engine) denyScan(p *config.Permission, r Request) (Decision, bool) {
 		}
 	}
 	if r.Tool == "bash" {
-		if d, pat, ok := matchBash(p.Bash, r.Command); ok && d == Deny {
+		if d, pat, ok := matchBash(p.Bash, r.Command, Level(orDefault(p.Default, config.PermAsk))); ok && d == Deny {
 			return Decision{Level: d, Rule: "bash:" + pat, Source: "policy"}, true
 		}
 	}
@@ -378,6 +365,26 @@ func (e *Engine) matchPathRule(rules map[string]string, path string) (Decision, 
 	return Decision{}, false
 }
 
+func (e *Engine) matchWritePathRules(rules map[string]string, r Request) (Decision, bool) {
+	paths := targetPaths(r)
+	if len(paths) == 0 || len(rules) == 0 {
+		return Decision{}, false
+	}
+	worst := Decision{Level: Allow, Rule: "path", Source: "policy"}
+	found := false
+	for _, path := range paths {
+		d, ok := e.matchPathRule(rules, path)
+		if !ok {
+			continue
+		}
+		found = true
+		if stricter(worst.Level, d.Level) != worst.Level {
+			worst = d
+		}
+	}
+	return worst, found
+}
+
 func (e *Engine) matchPathDeny(rules map[string]string, path string) (Decision, bool) {
 	for _, candidate := range e.pathCandidates(path) {
 		if d, ok := matchPathDeny(rules, candidate); ok {
@@ -390,12 +397,15 @@ func (e *Engine) matchPathDeny(rules map[string]string, path string) (Decision, 
 // guardDecision auto-approves write targets inside the workspace-write fence
 // and retains the existing approval guard for every target outside it.
 func (e *Engine) guardDecision(r Request, d Decision) Decision {
-	if d.Level == Deny {
+	if d.Level == Deny || (d.Level == Ask && d.Source == "policy" && strings.HasPrefix(d.Rule, "path:")) {
 		return d
 	}
 	paths := targetPaths(r)
-	if len(paths) == 0 || e.root == "" {
+	if len(paths) == 0 {
 		return d
+	}
+	if e.root == "" {
+		return Decision{Level: Ask, Rule: "workspace root unavailable", Source: "guard"}
 	}
 	if e.sandboxWrites {
 		for _, path := range paths {
@@ -545,7 +555,7 @@ func matchToolRule(rules map[string]string, tool string) (Decision, bool) {
 //
 // Every sub-command of a compound line must be permitted; the strictest level
 // wins, so `git status && sudo reboot` resolves to deny.
-func matchBash(patterns map[string]string, cmd string) (Level, string, bool) {
+func matchBash(patterns map[string]string, cmd string, fallback Level) (Level, string, bool) {
 	if len(patterns) == 0 {
 		return "", "", false
 	}
@@ -561,6 +571,14 @@ func matchBash(patterns map[string]string, cmd string) (Level, string, bool) {
 		}
 		lvl, pat, ok := mostSpecific(patterns, sub, glob.Match)
 		if !ok {
+			if fallback != "" {
+				found = true
+				if s := stricter(strictest, fallback); s != strictest {
+					strictest, winner = s, "default"
+				} else if winner == "" {
+					winner = "default"
+				}
+			}
 			continue
 		}
 		found = true
@@ -589,13 +607,24 @@ func SplitCommands(cmd string) []string {
 	var out []string
 	var cur strings.Builder
 	var quote byte
+	escaped := false
 	for i := 0; i < len(cmd); i++ {
 		c := cmd[i]
 		if quote != 0 {
 			cur.WriteByte(c)
-			if c == quote && (i == 0 || cmd[i-1] != '\\') {
+			if c == quote && (quote == '\'' || i == 0 || cmd[i-1] != '\\') {
 				quote = 0
 			}
+			continue
+		}
+		if escaped {
+			cur.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			cur.WriteByte(c)
+			escaped = true
 			continue
 		}
 		switch c {

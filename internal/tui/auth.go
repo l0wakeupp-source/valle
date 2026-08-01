@@ -63,6 +63,8 @@ type authState struct {
 	statusLine    string
 	busy          bool
 	confirmRemove bool
+	probeCancel   context.CancelFunc
+	probeGen      int // generation counter to ignore stale probe results
 
 	// OAuth device-code flow state
 	oauthCancel   context.CancelFunc
@@ -122,7 +124,7 @@ func (m *Model) rebuildAuthRows() {
 
 	// Saved credentials (including custom providers).
 	for _, id := range creds.IDs() {
-		cred := creds.Providers[id]
+		cred, _ := creds.Get(id)
 		label := cred.Label
 		if label == "" {
 			if e, ok := catalog.Get(id); ok {
@@ -419,7 +421,7 @@ func maskKey(s string) string {
 
 func (m *Model) authEditBody(w int) string {
 	s := m.styles
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	var b strings.Builder
 
 	b.WriteString(s.Base.Render(m.auth.draftID) + s.Success.Render("  ✓ connected") + "\n\n")
@@ -467,7 +469,7 @@ func (m *Model) authEditBody(w int) string {
 
 func (m *Model) authSelectableModels() []catalog.Model {
 	models := catalog.FilterChatModels(m.auth.models)
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	if !cred.OnlyFree {
 		return models
 	}
@@ -483,7 +485,7 @@ func (m *Model) authSelectableModels() []catalog.Model {
 
 func (m *Model) authModelBody(w int) string {
 	s := m.styles
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	models := m.authSelectableModels()
 	var b strings.Builder
 	b.WriteString(s.Muted.Render(fmt.Sprintf("%d models available from %s:", len(models), m.auth.draftID)))
@@ -626,9 +628,17 @@ func authBackspaceEdits(stage authStage, input string) bool {
 func (m *Model) authBack() (tea.Model, tea.Cmd) {
 	a := &m.auth
 	a.statusLine = ""
+	if a.probeCancel != nil {
+		a.probeCancel()
+		a.probeCancel = nil
+	}
+	if a.stage == authProbing {
+		a.probeGen++
+	}
+	a.busy = false
 	switch a.stage {
 	case authList:
-		a.active = false
+		*a = authState{}
 		m.input.Focus()
 		m.refresh()
 	case authEditMenu, authAddName, authProbing, authDeviceCode, authEnterKey, authEnterModel:
@@ -653,6 +663,7 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 			m.rebuildAuthRows()
 		}
 	case authOAuthWaiting:
+		a.oauthGen++
 		if a.oauthCancel != nil {
 			a.oauthCancel()
 			a.oauthCancel = nil
@@ -768,10 +779,11 @@ func (m *Model) authSelectRow(r authRow) (tea.Model, tea.Cmd) {
 	a.statusLine = ""
 	a.draftID = r.id
 	a.custom = r.custom
+	a.confirmRemove = false
 	a.target, _ = catalog.Get(r.id)
 
 	// Already saved: offer the edit menu.
-	if _, ok := m.creds.Providers[r.id]; ok {
+	if _, ok := m.creds.Get(r.id); ok {
 		a.stage = authEditMenu
 		a.cursor = 0
 		return m, nil
@@ -837,7 +849,7 @@ func (m *Model) authInputKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 				m.rebuildAuthRows()
 				return m, nil
 			}
-			cred := m.creds.Providers[a.draftID]
+			cred, _ := m.creds.Get(a.draftID)
 			cred.Default = val
 			if len(cred.Models) == 0 {
 				cred.Models = []string{val}
@@ -1204,6 +1216,11 @@ func openBrowser(url string) {
 // authStartProbe contacts the endpoint to detect its protocol and models.
 func (m *Model) authStartProbe() (tea.Model, tea.Cmd) {
 	a := &m.auth
+	if a.probeCancel != nil {
+		a.probeCancel()
+	}
+	a.probeGen++
+	gen := a.probeGen
 	if a.stage != authProbing {
 		a.returnTo = a.stage
 	}
@@ -1213,16 +1230,18 @@ func (m *Model) authStartProbe() (tea.Model, tea.Cmd) {
 	a.statusLine = ""
 
 	id, url, key := a.draftID, a.draftURL, a.draftKey
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	a.probeCancel = cancel
 	return m, tea.Batch(m.spinnerCmd(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		res := catalog.Probe(ctx, url, key)
-		return authProbeMsg{id: id, key: key, res: res}
+		return authProbeMsg{gen: gen, id: id, key: key, res: res}
 	})
 }
 
 // authProbeMsg carries a completed probe back into Update.
 type authProbeMsg struct {
+	gen int
 	id  string
 	key string
 	res catalog.ProbeResult
@@ -1230,6 +1249,10 @@ type authProbeMsg struct {
 
 func (m *Model) applyAuthProbe(msg authProbeMsg) {
 	a := &m.auth
+	if msg.gen != a.probeGen {
+		return
+	}
+	a.probeCancel = nil
 	a.busy = false
 
 	if msg.res.Err != nil {
@@ -1282,7 +1305,7 @@ func (m *Model) applyAuthProbe(msg authProbeMsg) {
 	// Start from the existing record. A connectivity probe refreshes endpoint
 	// metadata; it must not erase APIKeys, rotation mode, the selected model,
 	// disabled state, or user labels/custom fields.
-	cred := m.creds.Providers[msg.id]
+	cred, _ := m.creds.Get(msg.id)
 	oldCred := cred
 	cred.Type = msg.res.Flavor
 	if len(cred.APIKeys) == 0 {
@@ -1354,7 +1377,7 @@ func (m *Model) authModelKey(key string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		chosen := models[a.cursor].ID
-		cred := m.creds.Providers[a.draftID]
+		cred, _ := m.creds.Get(a.draftID)
 		cred.Default = chosen
 		m.creds.Set(a.draftID, cred)
 		_ = m.creds.Save()
@@ -1371,7 +1394,7 @@ func (m *Model) authModelKey(key string) (tea.Model, tea.Cmd) {
 
 func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
-	cred := m.creds.Providers[a.draftID]
+	cred, _ := m.creds.Get(a.draftID)
 	a.statusLine = ""
 	if key == "up" || key == "ctrl+p" {
 		if a.cursor > 0 {
@@ -1431,6 +1454,7 @@ func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 		}
 		m.reloadProviders()
 		a.stage = authList
+		m.rebuildAuthRows()
 		a.statusLine = ""
 	}
 	return m, nil
@@ -1444,11 +1468,15 @@ func (m *Model) authEditKey(key string) (tea.Model, tea.Cmd) {
 // auth-store scratch buffer, and mutating it here used to make unrelated
 // provider settings disappear on refresh/remove flows.
 func (m *Model) reloadProviders() {
+	if m.deps.Loaded == nil {
+		return
+	}
 	cfg := m.deps.Loaded.Config
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]config.Provider{}
 	}
-	for id, cred := range m.creds.Providers {
+	creds := m.creds.Snapshot()
+	for id, cred := range creds {
 		if cred.Disabled {
 			continue
 		}
@@ -1462,11 +1490,11 @@ func (m *Model) reloadProviders() {
 
 	provs := map[string]provider.Provider{}
 	for id, p := range cfg.Providers {
-		if cred, hasCredential := m.creds.Providers[id]; hasCredential && cred.Disabled {
+		if cred, hasCredential := creds[id]; hasCredential && cred.Disabled {
 			continue
 		}
 		if _, pinned := m.pinnedProviders[id]; !pinned {
-			if _, hasCredential := m.creds.Providers[id]; !hasCredential {
+			if _, hasCredential := creds[id]; !hasCredential {
 				continue
 			}
 		}
@@ -1492,7 +1520,7 @@ func (m *Model) reloadProviders() {
 				continue
 			}
 			c := openai.New(id, p.APIKey, p.BaseURL)
-			if cred, ok := m.creds.Providers[id]; ok && len(cred.Models) > 0 {
+			if cred, ok := creds[id]; ok && len(cred.Models) > 0 {
 				infos := make([]provider.ModelInfo, 0, len(cred.Models))
 				for _, mid := range cred.Models {
 					contextWindow := cred.ContextWindows[mid]
@@ -1533,7 +1561,7 @@ func (m *Model) cmdManageKeys() (tea.Model, tea.Cmd) {
 
 func (m *Model) authKeyMenuBody(w int) string {
 	s := m.styles
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	keys := m.creds.AllKeys(m.auth.draftID)
 
 	var b strings.Builder
@@ -1591,7 +1619,7 @@ func (m *Model) applyKeyManage(value string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applyKeyMode(value string) (tea.Model, tea.Cmd) {
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	mode := "single"
 	switch value {
 	case "1":
@@ -1624,7 +1652,7 @@ func (m *Model) applyKeyAdd(text string) (tea.Model, tea.Cmd) {
 			newKeys = append(newKeys, p)
 		}
 	}
-	cred := m.creds.Providers[m.auth.draftID]
+	cred, _ := m.creds.Get(m.auth.draftID)
 	existing := m.creds.AllKeys(m.auth.draftID)
 	existing = append(existing, newKeys...)
 	if len(existing) == 1 {

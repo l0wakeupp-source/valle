@@ -33,6 +33,24 @@ func TestAutoCompactCooldownExpires(t *testing.T) {
 	}
 }
 
+func TestContextCompactionThresholdUsesConfiguredReserve(t *testing.T) {
+	if got := contextCompactionThreshold(200000, 24000); got != 176000 {
+		t.Fatalf("threshold = %d, want 176000", got)
+	}
+	if got := contextCompactionThreshold(100, 0); got != 70 {
+		t.Fatalf("default threshold = %d, want 70", got)
+	}
+	if got := contextCompactionThreshold(100, 100); got != 0 {
+		t.Fatalf("full reserve threshold = %d, want 0", got)
+	}
+	if got := compactionTokenLimit(16384); got != compactionMaxTokens {
+		t.Fatalf("compaction token limit = %d, want %d", got, compactionMaxTokens)
+	}
+	if got := compactionTokenLimit(512); got != 512 {
+		t.Fatalf("configured small token limit = %d, want 512", got)
+	}
+}
+
 func TestFailedAutoCompactProviderResolutionDoesNotStartCompaction(t *testing.T) {
 	model := &Model{
 		deps:               Deps{Loaded: &config.Loaded{}},
@@ -95,5 +113,19 @@ func TestSystemPromptPlacesProjectContextBeforeVolatileEnvironment(t *testing.T)
 	}
 	if projectIndex > environmentIndex {
 		t.Fatalf("project context follows environment: project=%d environment=%d", projectIndex, environmentIndex)
+	}
+}
+
+func TestCompactHistoryKeepsOnlyLatestThinkingMessage(t *testing.T) {
+	history := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "old"}, {Type: "text", Text: "answer"}}},
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "latest"}, {Type: "text", Text: "final"}}},
+	}
+	compacted := compactHistory(history)
+	if len(compacted[0].Content) != 1 || compacted[0].Content[0].Type != "text" {
+		t.Fatalf("old thinking was retained: %#v", compacted[0].Content)
+	}
+	if len(compacted[1].Content) != 2 || compacted[1].Content[0].Text != "latest" {
+		t.Fatalf("latest thinking was not retained: %#v", compacted[1].Content)
 	}
 }

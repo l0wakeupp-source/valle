@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -145,19 +147,28 @@ type wireTool struct {
 }
 
 type wireRequest struct {
-	Model       string        `json:"model"`
-	Messages    []wireMessage `json:"messages"`
-	Tools       []wireTool    `json:"tools,omitempty"`
-	Stream      bool          `json:"stream"`
-	StreamOpts  *streamOpts   `json:"stream_options,omitempty"`
-	MaxTokens   int           `json:"max_completion_tokens,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
+	Model          string        `json:"model"`
+	Messages       []wireMessage `json:"messages"`
+	Tools          []wireTool    `json:"tools,omitempty"`
+	Stream         bool          `json:"stream"`
+	StreamOpts     *streamOpts   `json:"stream_options,omitempty"`
+	MaxTokens      int           `json:"max_completion_tokens,omitempty"`
+	Temperature    *float64      `json:"temperature,omitempty"`
+	PromptCacheKey string        `json:"prompt_cache_key,omitempty"`
 	// Effort is OpenAI's reasoning control; Qwen-style endpoints use the
 	// boolean instead. Only one is ever set.
 	Effort         string         `json:"reasoning_effort,omitempty"`
 	EnableThinking *bool          `json:"enable_thinking,omitempty"`
 	Thinking       *wireThinking  `json:"thinking,omitempty"`
 	Reasoning      *wireReasoning `json:"reasoning,omitempty"`
+}
+
+func promptCacheKey(model, stableSystem string) string {
+	if strings.TrimSpace(stableSystem) == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(model + "\x00" + stableSystem))
+	return hex.EncodeToString(digest[:])
 }
 
 // wireThinking is GLM's native OpenAI-compatible thinking switch.
@@ -184,8 +195,20 @@ func toWire(system string, msgs []provider.Message) []wireMessage {
 // toWireWithReasoning preserves reasoning_content for providers such as GLM
 // and DeepSeek that require it when a tool call is followed by another turn.
 func toWireWithReasoning(system string, msgs []provider.Message, includeReasoning bool) []wireMessage {
+	return toWireWithStable(system, "", msgs, includeReasoning)
+}
+
+// toWireWithStable keeps the stable prompt in an earlier message than the
+// per-turn tail. Direct OpenAI caching can then retain the stable prefix while
+// the volatile environment and skill instructions continue to be sent.
+func toWireWithStable(system, stable string, msgs []provider.Message, includeReasoning bool) []wireMessage {
 	var out []wireMessage
-	if strings.TrimSpace(system) != "" {
+	if strings.TrimSpace(stable) != "" && strings.HasPrefix(system, stable) {
+		out = append(out, wireMessage{Role: "system", Content: stable})
+		if tail := strings.TrimPrefix(system, stable); strings.TrimSpace(tail) != "" {
+			out = append(out, wireMessage{Role: "system", Content: tail})
+		}
+	} else if strings.TrimSpace(system) != "" {
 		out = append(out, wireMessage{Role: "system", Content: system})
 	}
 	for _, m := range msgs {
@@ -307,13 +330,22 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		preserveReasoning = true
 	}
 	body := wireRequest{
-		Model:       req.Model,
-		Messages:    toWireWithReasoning(req.System, req.Messages, preserveReasoning),
-		Tools:       toWireTools(req.Tools),
-		Stream:      true,
-		StreamOpts:  &streamOpts{IncludeUsage: true},
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:          req.Model,
+		Messages:       toWireWithReasoning(req.System, req.Messages, preserveReasoning),
+		Tools:          toWireTools(req.Tools),
+		Stream:         true,
+		StreamOpts:     &streamOpts{IncludeUsage: true},
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		PromptCacheKey: promptCacheKey(req.Model, req.SystemStable),
+	}
+	if c.ID == "openai" {
+		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning)
+	}
+	if c.ID != "openai" {
+		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
+		// hint. The stable system prefix is still sent to every provider.
+		body.PromptCacheKey = ""
 	}
 
 	// OpenRouter has one normalized reasoning object. Use it for every
@@ -491,7 +523,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 			Error *struct {
-				Message string `json:"error"`
+				Message string `json:"message"`
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
@@ -519,6 +551,11 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 				}
 			}
 			for _, tc := range choice.Delta.ToolCalls {
+				if existing, ok := calls[tc.Index]; ok && tc.ID != "" && existing.id != "" && existing.id != tc.ID {
+					if !flushCalls() {
+						return
+					}
+				}
 				acc, ok := calls[tc.Index]
 				if !ok {
 					acc = &callAccum{}

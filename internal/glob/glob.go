@@ -68,10 +68,19 @@ func Lookup(m map[string]bool, name string) (bool, bool) {
 	if v, ok := m[name]; ok {
 		return v, true
 	}
+	best := ""
+	var value bool
+	bestScore := -1
 	for pat, v := range m {
 		if strings.ContainsAny(pat, "*?") && Match(pat, name) {
-			return v, true
+			score := len(pat) - strings.Count(pat, "*") - strings.Count(pat, "?")
+			if score > bestScore || (score == bestScore && (best == "" || pat < best)) {
+				best, value, bestScore = pat, v, score
+			}
 		}
+	}
+	if best != "" {
+		return value, true
 	}
 	return false, false
 }

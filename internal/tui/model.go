@@ -100,7 +100,8 @@ type Model struct {
 	agentCancel  context.CancelFunc
 	streamBuf    strings.Builder
 	thinkBuf     strings.Builder
-	pendingTools map[string]int    // callID -> index into msgs
+	pendingTools map[string]int // callID -> index into msgs
+	shellSeq     uint64
 	toolOutputs  map[string]string // full tool output, kept out of render entries
 	spinnerTick  int
 
@@ -718,20 +719,31 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.submit(msg.text)
 
 	case shellDoneMsg:
-		if msg.idx < len(m.msgs) {
-			out := msg.output
-			isErr := msg.err != nil
-			if isErr {
-				out += "\n" + msg.err.Error()
+		idx := msg.idx
+		matched := msg.callID == ""
+		if msg.callID != "" {
+			mapped, ok := m.pendingTools[msg.callID]
+			if ok {
+				idx, matched = mapped, true
 			}
-			m.msgs[msg.idx].ToolRunning = false
-			m.msgs[msg.idx].ToolOutput = out
-			m.msgs[msg.idx].ToolErr = isErr
-			// Feed the result into the conversation so the model can see it.
-			m.history = append(m.history,
-				provider.UserText(fmt.Sprintf("I ran this shell command:\n```\n%s\n```\nOutput:\n```\n%s\n```",
-					m.msgs[msg.idx].ToolTitle, truncate(out, 8000))))
+			delete(m.pendingTools, msg.callID)
 		}
+		if !matched || idx < 0 || idx >= len(m.msgs) {
+			m.refresh()
+			return m, nil
+		}
+		out := msg.output
+		isErr := msg.err != nil
+		if isErr {
+			out += "\n" + msg.err.Error()
+		}
+		m.msgs[idx].ToolRunning = false
+		m.msgs[idx].ToolOutput = out
+		m.msgs[idx].ToolErr = isErr
+		// Feed the result into the conversation so the model can see it.
+		m.history = append(m.history,
+			provider.UserText(fmt.Sprintf("I ran this shell command:\n```\n%s\n```\nOutput:\n```\n%s\n```",
+				m.msgs[idx].ToolTitle, truncate(out, 8000))))
 		m.refresh()
 		return m, nil
 
@@ -798,6 +810,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.msgs = append([]ChatMsg{{Kind: MsgSystem,
 			Text: "context compacted\n\n" + summary, Time: time.Now()}},
 			messagesToChat(msg.tail)...)
+		m.tx.invalidateAll(m.contentWidth())
 		// Occupancy only: compaction shrinks the context but the tokens
 		// already spent this session were still spent.
 		m.usage = session.Usage{}
@@ -1036,6 +1049,12 @@ func (m *Model) trimTranscript() {
 	}
 	remove := len(m.msgs) - maxTranscriptMessages
 	m.msgs = append([]ChatMsg{{Kind: MsgSystem, Text: fmt.Sprintf("... %d earlier messages omitted to limit RAM", remove), Time: time.Now()}}, m.msgs[remove:]...)
+	m.pendingTools = make(map[string]int)
+	for i, msg := range m.msgs {
+		if msg.Kind == MsgTool && msg.CallID != "" && msg.ToolRunning {
+			m.pendingTools[msg.CallID] = i
+		}
+	}
 	kept := make(map[string]struct{}, len(m.msgs))
 	for _, msg := range m.msgs {
 		if msg.CallID != "" {
@@ -1047,6 +1066,7 @@ func (m *Model) trimTranscript() {
 			delete(m.toolOutputs, callID)
 		}
 	}
+	m.tx.invalidateAll(m.contentWidth())
 }
 
 func (m *Model) appendMsg(msg ChatMsg) {
@@ -1097,7 +1117,6 @@ func (m *Model) touch(i int) { m.tx.invalidate(i) }
 // to tool blocks, so mouse clicks can toggle expand/collapse.
 func (m *Model) rebuildToolRowMap() {
 	m.toolRowMap = m.toolRowMap[:0]
-	lines := strings.Split(m.chatContent, "\n")
 	row := 0
 	for i := range m.msgs {
 		msg := &m.msgs[i]
@@ -1125,7 +1144,6 @@ func (m *Model) rebuildToolRowMap() {
 		row += nLines
 		row++ // inter-block separator
 	}
-	_ = lines
 }
 
 func (m *Model) rebuildChoiceButtonMap() {

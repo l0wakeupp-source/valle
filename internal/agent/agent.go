@@ -3,8 +3,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"rick/internal/config"
 	"rick/internal/goal"
@@ -177,7 +180,8 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 
 	msgs := append([]provider.Message(nil), history...)
 	var lastErr error
-	repeatedCalls := make(map[string]int)
+	lastCallBatch := ""
+	repeatedCallCount := 0
 
 	schemas := r.cfg.Tools.Schemas(r.cfg.ToolFilter)
 
@@ -225,13 +229,13 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			case provider.EventText:
 				textBuf.WriteString(ev.Text)
 				if !emit(Event{Kind: EvText, Text: ev.Text}) {
-					drain(ch)
+					go drain(ch)
 					return appended, ctx.Err()
 				}
 			case provider.EventThinking:
 				thinkBuf.WriteString(ev.Text)
 				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
-					drain(ch)
+					go drain(ch)
 					return appended, ctx.Err()
 				}
 			case provider.EventToolCall:
@@ -251,6 +255,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 								if ok, _ := goal.CheckBudget(g2); !ok {
 									budgetErr := fmt.Errorf("goal token budget exhausted")
 									emit(Event{Kind: EvError, Err: budgetErr})
+									drain(ch)
 									return appended, budgetErr
 								}
 							}
@@ -296,6 +301,11 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			return appended, streamErr
 		}
 		assistant := provider.Message{Role: provider.RoleAssistant}
+		for i := range calls {
+			if calls[i].ID == "" {
+				calls[i].ID = fmt.Sprintf("rick-tool-%d-%d", time.Now().UnixNano(), i)
+			}
+		}
 		if thinkBuf.Len() > 0 {
 			assistant.Content = append(assistant.Content, provider.ContentBlock{
 				Type: "thinking", Text: thinkBuf.String(),
@@ -332,14 +342,24 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			return appended, nil
 		}
 
-		for _, call := range calls {
-			key := call.Name + "\x00" + canonicalToolInput(call.Input)
-			repeatedCalls[key]++
-			if repeatedCalls[key] > 2 {
-				err := fmt.Errorf("agent: repeated tool call limit reached for %s", call.Name)
-				emit(Event{Kind: EvError, Err: err})
-				return appended, err
+		batchKey := ""
+		for _, c := range calls {
+			batchKey += c.Name + "\x00" + canonicalToolInput(c.Input) + "\x01"
+		}
+		if batchKey == lastCallBatch {
+			repeatedCallCount++
+		} else {
+			lastCallBatch = batchKey
+			repeatedCallCount = 1
+		}
+		if repeatedCallCount > 2 {
+			message := "agent: repeated tool call limit reached"
+			if len(calls) == 1 {
+				message = fmt.Sprintf("agent: repeated tool call limit reached for %s", calls[0].Name)
 			}
+			err := errors.New(message)
+			emit(Event{Kind: EvError, Err: err})
+			return appended, err
 		}
 		results := r.execTools(ctx, calls, emit)
 		if ctx.Err() != nil {
@@ -400,8 +420,7 @@ func isRateLimitError(err error) bool {
 	return strings.Contains(s, "429") ||
 		strings.Contains(s, "rate limit") ||
 		strings.Contains(s, "rate-limit") ||
-		strings.Contains(s, "quota") ||
-		strings.Contains(s, "limit") && strings.Contains(s, "exceeded") ||
+		(strings.Contains(s, "limit") && strings.Contains(s, "exceeded")) ||
 		strings.Contains(s, "too many requests")
 }
 
@@ -568,6 +587,21 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 			input = before.Input
 		}
 	}
+	if !bytes.Equal(input, call.Input) && r.cfg.Perms != nil {
+		modifiedRequest := describe(provider.ToolCall{Name: call.Name, Input: input}, r.cfg.Cwd)
+		switch r.cfg.Perms.Check(modifiedRequest) {
+		case permission.Deny:
+			ev.Output = fmt.Sprintf("permission denied by policy: %s", modifiedRequest.Title)
+			ev.IsError = true
+			return provider.ToolResultBlock(call.ID, ev.Output, true), ev
+		case permission.Ask:
+			if r.cfg.Ask == nil || r.cfg.Ask(ctx, modifiedRequest) == DecideReject {
+				ev.Output = "the user rejected the plugin-modified action"
+				ev.IsError = true
+				return provider.ToolResultBlock(call.ID, ev.Output, true), ev
+			}
+		}
+	}
 
 	tc := tools.Context{
 		Cwd:       r.cfg.Cwd,
@@ -604,7 +638,24 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		}
 	}
 
-	return provider.ToolResultBlock(call.ID, ev.Output, ev.IsError), ev
+	return provider.ToolResultBlock(call.ID, capModelToolOutput(ev.Output), ev.IsError), ev
+}
+
+const maxModelToolResultBytes = 32 << 10
+
+func capModelToolOutput(output string) string {
+	if len(output) <= maxModelToolResultBytes {
+		return output
+	}
+	suffix := fmt.Sprintf("\n… <tool output truncated; %d bytes omitted; narrow the next request to continue>", len(output)-maxModelToolResultBytes)
+	limit := maxModelToolResultBytes - len(suffix)
+	if limit < 1 {
+		return suffix[1:]
+	}
+	for limit > 0 && !utf8.RuneStart(output[limit]) {
+		limit--
+	}
+	return output[:limit] + fmt.Sprintf("\n… <tool output truncated; %d bytes omitted; narrow the next request to continue>", len(output)-limit)
 }
 
 func canonicalToolInput(input json.RawMessage) string {
@@ -785,7 +836,7 @@ func describe(call provider.ToolCall, cwd string) permission.Request {
 			body = body[:4000] + "\n…"
 		}
 		req.Body = body
-	case "read", "grep", "glob", "list":
+	case "read", "grep", "glob", "list", "tree", "code_symbols":
 		req.Path = str("path")
 		req.Title = call.Name + " " + str("path") + str("pattern")
 	case "webfetch", "fetch":

@@ -90,12 +90,18 @@ func (m *Manager) Connect(ctx context.Context, servers map[string]config.MCPServ
 			}
 
 			m.mu.Lock()
-			defer m.mu.Unlock()
 			if err != nil {
 				m.errs[name] = err
+				m.mu.Unlock()
 				return
 			}
+			old := m.clients[name]
 			m.clients[name] = c
+			delete(m.errs, name)
+			m.mu.Unlock()
+			if old != nil {
+				_ = old.Close()
+			}
 		}(name, s)
 	}
 	wg.Wait()

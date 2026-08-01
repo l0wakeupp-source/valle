@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,6 +154,19 @@ func TestCleanHTMLUsesSinglePassNormalization(t *testing.T) {
 	}
 	if got, want := cleanHTML("&copy;"), "&copy;"; got != want {
 		t.Fatalf("cleanHTML preserved entity = %q, want %q", got, want)
+	}
+}
+
+func TestCleanHTMLRemovesGenericMarkup(t *testing.T) {
+	if got := cleanHTML(`<span class="searchmatch">Hello</span>`); got != "Hello" {
+		t.Fatalf("cleanHTML generic markup = %q, want %q", got, "Hello")
+	}
+}
+
+func TestFormatResultsOmitsDuplicateTitleSnippet(t *testing.T) {
+	result := formatResultsFiltered("query", []searchResult{{Title: "same", URL: "https://example.com", Snippet: "same"}}, 1, nil)
+	if strings.Count(result.Output, "same") != 1 {
+		t.Fatalf("formatted result = %q, want one title occurrence", result.Output)
 	}
 }
 

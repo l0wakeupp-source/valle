@@ -87,6 +87,8 @@ func (e ReasoningEffort) Budget(maxTokens int) int {
 	switch e {
 	case ReasoningMinimal:
 		frac = 0.15
+	case ReasoningOn:
+		frac = 0.5
 	case ReasoningLow:
 		frac = 0.25
 	case ReasoningMedium:
@@ -223,7 +225,7 @@ func ReasoningCapabilitiesForProvider(providerID, modelID string, advertised *Mo
 			// us an explicit effort vocabulary.
 			caps.Efforts, caps.Mandatory = fallbackEfforts(providerID, modelID, style)
 		}
-		caps.Mandatory = advertised.ReasoningMandatory
+		caps.Mandatory = caps.Mandatory || advertised.ReasoningMandatory
 		if advertised.ReasoningDefault.Valid() {
 			caps.Default = advertised.ReasoningDefault
 		}

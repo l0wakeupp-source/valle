@@ -122,6 +122,13 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(h Hooks) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for i, existing := range r.plugins {
+		if existing.Name == h.Name {
+			r.plugins[i] = h
+			r.refreshActiveLocked()
+			return
+		}
+	}
 	r.plugins = append(r.plugins, h)
 	if _, exists := r.enabled[h.Name]; !exists {
 		r.enabled[h.Name] = true

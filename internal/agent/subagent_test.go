@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"rick/internal/config"
@@ -40,5 +41,19 @@ func TestSubagentToolFilterExposesReadOnlyToolsOnlyOutsideYolo(t *testing.T) {
 		if !unfiltered(name) {
 			t.Fatalf("yolo-effective subagent hid %q", name)
 		}
+	}
+}
+
+func TestTaskToolSortsSubagentKindsForStableSchemas(t *testing.T) {
+	task := TaskTool{Specs: map[string]SubagentSpec{
+		"zeta":  {Name: "zeta", Description: "z"},
+		"alpha": {Name: "alpha", Description: "a"},
+	}}
+	if got := task.Schema()["properties"].(map[string]any)["subagent_type"].(map[string]any)["enum"].([]string); got[0] != "alpha" || got[1] != "zeta" {
+		t.Fatalf("schema enum = %#v, want sorted names", got)
+	}
+	description := task.Description()
+	if strings.Index(description, "- alpha:") > strings.Index(description, "- zeta:") {
+		t.Fatalf("description kinds are not sorted: %q", description)
 	}
 }

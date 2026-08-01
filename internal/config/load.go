@@ -101,6 +101,9 @@ func mergeInto(cfg *Config, tui *TUI, raw []byte, baseDir, name string) error {
 	}
 
 	isTUIFile := len(name) >= 3 && name[:3] == "tui"
+	if !isTUIFile && containsTUIKey(probe) {
+		isTUIFile = !containsConfigKey(probe)
+	}
 	if isTUIFile {
 		var t TUI
 		if err := json.Unmarshal(clean, &t); err != nil {
@@ -127,6 +130,26 @@ func mergeInto(cfg *Config, tui *TUI, raw []byte, baseDir, name string) error {
 	}
 	mergeConfig(cfg, c, probe)
 	return nil
+}
+
+func containsTUIKey(p map[string]json.RawMessage) bool {
+	for key := range p {
+		switch key {
+		case "theme", "diff", "diff_threshold", "scroll_speed", "notifications", "show_thinking", "tool_details", "hide_status", "hide_tips", "mouse", "links", "keybinds":
+			return true
+		}
+	}
+	return false
+}
+
+func containsConfigKey(p map[string]json.RawMessage) bool {
+	for key := range p {
+		switch key {
+		case "model", "small_model", "providers", "permissions", "sandbox", "tools", "web_search", "max_tokens":
+			return true
+		}
+	}
+	return false
 }
 
 func has(p map[string]json.RawMessage, k string) bool { _, ok := p[k]; return ok }
@@ -560,6 +583,9 @@ func mergeTUI(dst *TUI, src TUI, p map[string]json.RawMessage) {
 	}
 	if has(p, "mouse") {
 		dst.Mouse = src.Mouse
+	}
+	if has(p, "links") {
+		dst.Links = src.Links
 	}
 	if has(p, "keybinds") {
 		k := src.Keybinds

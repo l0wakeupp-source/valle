@@ -67,29 +67,27 @@ func NewSnapshotter(workTree, dataDir string) (*Snapshotter, error) {
 // Enabled returns true once the shadow repo is ready, initializing it on
 // first call. Safe to call every frame; the init runs at most once.
 func (s *Snapshotter) Enabled() bool {
-	if !s.enabled {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.enabled {
-			return true
-		}
-		if _, err := os.Stat(filepath.Join(s.gitDir, "HEAD")); err != nil {
-			if _, err := s.git("init", "--quiet"); err != nil {
-				return false
-			}
-			s.git("config", "user.email", "rick@localhost")
-			s.git("config", "user.name", "rick")
-			s.git("config", "core.autocrlf", "false")
-			s.git("config", "core.safecrlf", "false")
-			excl := filepath.Join(s.gitDir, "info")
-			if err := os.MkdirAll(excl, 0o755); err == nil {
-				_ = os.WriteFile(filepath.Join(excl, "exclude"),
-					[]byte("node_modules/\nvendor/\n.venv/\ntarget/\ndist/\nbuild/\n__pycache__/\n*.exe\n*.dll\n*.so\n*.dylib\n"),
-					0o644)
-			}
-		}
-		s.enabled = true
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.enabled {
+		return true
 	}
+	if _, err := os.Stat(filepath.Join(s.gitDir, "HEAD")); err != nil {
+		if _, err := s.git("init", "--quiet"); err != nil {
+			return false
+		}
+		s.git("config", "user.email", "rick@localhost")
+		s.git("config", "user.name", "rick")
+		s.git("config", "core.autocrlf", "false")
+		s.git("config", "core.safecrlf", "false")
+		excl := filepath.Join(s.gitDir, "info")
+		if err := os.MkdirAll(excl, 0o755); err == nil {
+			_ = os.WriteFile(filepath.Join(excl, "exclude"),
+				[]byte("node_modules/\nvendor/\n.venv/\ntarget/\ndist/\nbuild/\n__pycache__/\n*.exe\n*.dll\n*.so\n*.dylib\n"),
+				0o644)
+		}
+	}
+	s.enabled = true
 	return s.enabled
 }
 
@@ -136,10 +134,6 @@ func (s *Snapshotter) snapshotLocked(label string) (string, error) {
 	// Skip an empty commit unless this is the very first snapshot.
 	if len(s.history) > 0 {
 		if out, err := s.git("diff", "--cached", "--quiet"); err == nil && out == "" {
-			if s.cursor < len(s.history) {
-				s.history = s.history[:s.cursor+1]
-				s.cursor = len(s.history)
-			}
 			return "", nil // nothing changed since the last checkpoint
 		}
 	}

@@ -184,7 +184,7 @@ func (m *Model) fullToolOutput(msg ChatMsg) string {
 }
 
 func compactToolOutput(output string, limit int) string {
-	if limit <= 0 {
+	if limit <= 0 || len(output) <= limit {
 		return output
 	}
 	runes := []rune(output)

@@ -174,9 +174,11 @@ func (m *Model) completeSlashCommand() bool {
 // ---------- @ file picker ----------
 
 type fileEntry struct {
-	path string // relative, slash-separated
-	name string
-	dir  bool
+	path      string // relative, slash-separated
+	name      string
+	lowerPath string
+	lowerName string
+	dir       bool
 }
 
 type filePicker struct {
@@ -315,7 +317,13 @@ func scanProjectFiles(root string) []fileEntry {
 		if err != nil {
 			return nil
 		}
-		out = append(out, fileEntry{path: filepath.ToSlash(rel), name: name})
+		relPath := filepath.ToSlash(rel)
+		out = append(out, fileEntry{
+			path:      relPath,
+			name:      name,
+			lowerPath: strings.ToLower(relPath),
+			lowerName: strings.ToLower(name),
+		})
 		return nil
 	})
 	return out
@@ -324,11 +332,15 @@ func scanProjectFiles(root string) []fileEntry {
 // fuzzyMatch reports whether query is a subsequence of target, plus a score
 // (lower is better).
 func fuzzyMatch(query, target string) (int, bool) {
+	return fuzzyMatchNormalized(strings.ToLower(query), strings.ToLower(target))
+}
+
+func fuzzyMatchNormalized(query, target string) (int, bool) {
 	if query == "" {
 		return len(target), true
 	}
-	q := strings.ToLower(query)
-	t := strings.ToLower(target)
+	q := query
+	t := target
 
 	// Exact substring is strongly preferred.
 	if i := strings.Index(t, q); i >= 0 {
@@ -354,18 +366,27 @@ func fuzzyMatch(query, target string) (int, bool) {
 }
 
 func filterFiles(all []fileEntry, query string) []fileEntry {
+	queryLower := strings.ToLower(query)
 	type scored struct {
 		e     fileEntry
 		score int
 	}
 	var out []scored
 	for _, e := range all {
-		s, ok := fuzzyMatch(query, e.path)
+		pathLower := e.lowerPath
+		if pathLower == "" && e.path != "" {
+			pathLower = strings.ToLower(e.path)
+		}
+		nameLower := e.lowerName
+		if nameLower == "" && e.name != "" {
+			nameLower = strings.ToLower(e.name)
+		}
+		s, ok := fuzzyMatchNormalized(queryLower, pathLower)
 		if !ok {
 			continue
 		}
 		// Prefer matches in the basename.
-		if bs, bok := fuzzyMatch(query, e.name); bok && bs < s {
+		if bs, bok := fuzzyMatchNormalized(queryLower, nameLower); bok && bs < s {
 			s = bs
 		}
 		out = append(out, scored{e, s + len(e.path)/8})

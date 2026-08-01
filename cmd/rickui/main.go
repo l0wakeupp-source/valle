@@ -144,7 +144,11 @@ func wheel(m *tui.Model, up bool, n int) *tui.Model {
 	return m
 }
 
-var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+var (
+	ansiRE        = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	borderColorRE = regexp.MustCompile(`\x1b\[38;2;([0-9;]+)m`)
+	artColorRE    = regexp.MustCompile(`[34]8;2;(\d+);(\d+);(\d+)`)
+)
 
 func plain(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
@@ -152,7 +156,7 @@ func plain(s string) string { return ansiRE.ReplaceAllString(s, "") }
 func borderColor(view string) string {
 	for _, line := range strings.Split(view, "\n") {
 		if strings.Contains(line, "╭") {
-			if m := regexp.MustCompile(`\x1b\[38;2;([0-9;]+)m`).FindStringSubmatch(line); m != nil {
+			if m := borderColorRE.FindStringSubmatch(line); m != nil {
 				return m[1]
 			}
 		}
@@ -1242,7 +1246,7 @@ func testSplashArt(tmp string) {
 	// Colours are averaged from the source, so assert on hue rather than an
 	// exact triple: the palette changes whenever the art is regenerated.
 	blue, skin := 0, 0
-	for _, m := range regexp.MustCompile(`[34]8;2;(\d+);(\d+);(\d+)`).FindAllStringSubmatch(art, -1) {
+	for _, m := range artColorRE.FindAllStringSubmatch(art, -1) {
 		r, _ := strconv.Atoi(m[1])
 		g, _ := strconv.Atoi(m[2])
 		b, _ := strconv.Atoi(m[3])

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"rick/internal/glob"
 )
@@ -141,15 +142,7 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
 	n := 0
 	for sc.Scan() {
-		line := sc.Text()
-		// Make paths relative for compactness.
-		if i := strings.Index(line, ":"); i > 0 {
-			if p := line[:i]; filepath.IsAbs(p) {
-				line = relTo(tc.Cwd, p) + line[i:]
-			}
-		} else if filepath.IsAbs(line) {
-			line = relTo(tc.Cwd, line)
-		}
+		line := capGrepLine(compactGrepLine(tc.Cwd, sc.Text()))
 		lines = append(lines, line)
 		n++
 		if n >= limit {
@@ -167,6 +160,45 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		Title:  fmt.Sprintf("grep %q (%d)", a.Pattern, n),
 		Meta:   map[string]any{"count": n},
 	}, nil
+}
+
+func compactGrepLine(cwd, line string) string {
+	if filepath.IsAbs(line) {
+		return relTo(cwd, line)
+	}
+	// On Windows rg emits `C:\\path\\file.go:12:text`. Splitting at the
+	// first colon mistakes the drive letter for the path, so locate the
+	// colon that starts the line-number suffix instead.
+	for i := 2; i+1 < len(line); i++ {
+		if line[i] != ':' || line[i+1] < '0' || line[i+1] > '9' {
+			continue
+		}
+		pathPart := line[:i]
+		if filepath.IsAbs(pathPart) || isWindowsAbsolute(pathPart) {
+			return relTo(cwd, pathPart) + line[i:]
+		}
+	}
+	return line
+}
+
+const maxGrepLineBytes = 4 << 10
+
+func capGrepLine(line string) string {
+	if len(line) <= maxGrepLineBytes {
+		return line
+	}
+	suffix := fmt.Sprintf("… <line truncated at %d bytes>", maxGrepLineBytes)
+	limit := maxGrepLineBytes - len(suffix)
+	for limit > 0 && !utf8.RuneStart(line[limit]) {
+		limit--
+	}
+	return line[:limit] + suffix
+}
+
+func isWindowsAbsolute(path string) bool {
+	return len(path) >= 3 &&
+		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+		path[1] == ':' && (path[2] == '\\' || path[2] == '/')
 }
 
 func isExitCode(err error, code int) bool {
@@ -378,12 +410,15 @@ func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 	}
 	skip := map[string]bool{".git": true, "node_modules": true, "vendor": true, ".venv": true}
 
+	const maxListEntries = 500
 	var b strings.Builder
 	b.WriteString(relTo(tc.Cwd, root) + "/\n")
 	count := 0
+	truncated := false
 	var walk func(dir, prefix string, level int)
 	walk = func(dir, prefix string, level int) {
-		if level > depth || count > 500 {
+		if level > depth || count >= maxListEntries {
+			truncated = count >= maxListEntries
 			return
 		}
 		entries, err := os.ReadDir(dir)
@@ -397,6 +432,10 @@ func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 			return entries[i].Name() < entries[j].Name()
 		})
 		for i, e := range entries {
+			if count >= maxListEntries {
+				truncated = true
+				return
+			}
 			if strings.HasPrefix(e.Name(), ".") && e.Name() != ".rick" || skip[e.Name()] {
 				continue
 			}
@@ -419,5 +458,8 @@ func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 		}
 	}
 	walk(root, "", 1)
+	if truncated {
+		fmt.Fprintf(&b, "… <truncated at %d entries>\n", maxListEntries)
+	}
 	return Result{Output: b.String(), Title: fmt.Sprintf("list %s (%d)", relTo(tc.Cwd, root), count)}, nil
 }

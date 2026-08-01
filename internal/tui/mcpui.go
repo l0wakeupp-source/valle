@@ -120,13 +120,14 @@ func (m *Model) cmdMcpAddType(name string) (tea.Model, tea.Cmd) {
 func (m *Model) cmdRefreshModelList() (tea.Model, tea.Cmd) {
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "refreshing model lists…", Time: time.Now()})
 	// Snapshot the credentials we need so the goroutine doesn't race the UI.
-	creds := m.creds
+	credentialStore := m.creds
+	creds := credentialStore.Snapshot()
 	return m, func() tea.Msg {
-		for id, cred := range creds.Providers {
+		for id, cred := range creds {
 			if cred.BaseURL == "" {
 				continue
 			}
-			res := catalog.Probe(context.Background(), cred.BaseURL, creds.CurrentKey(id))
+			res := catalog.Probe(context.Background(), cred.BaseURL, credentialStore.CurrentKey(id))
 			if res.Err != nil || len(res.Models) == 0 {
 				continue
 			}
@@ -150,9 +151,12 @@ func (m *Model) cmdRefreshModelList() (tea.Model, tea.Cmd) {
 					cred.VisionModels = append(cred.VisionModels, mm.ID)
 				}
 			}
-			creds.Set(id, cred)
+			creds[id] = cred
 		}
-		_ = creds.Save()
+		for id, cred := range creds {
+			credentialStore.Set(id, cred)
+		}
+		_ = credentialStore.Save()
 		return refreshDoneMsg{}
 	}
 }

@@ -72,6 +72,15 @@ func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.Raw
 	if a.MaxConcurrent <= 0 {
 		a.MaxConcurrent = 4
 	}
+	if t.MaxDepth > 0 && tc.Depth >= t.MaxDepth {
+		return tools.Errf("maximum subagent depth reached (%d)", t.MaxDepth), nil
+	}
+	if a.Background && t.SpawnBackground == nil {
+		return tools.Errf("background subagents are unavailable in this context"), nil
+	}
+	if !a.Background && t.Spawn == nil {
+		return tools.Errf("subagent spawning is unavailable in this context"), nil
+	}
 
 	type result struct {
 		desc string
@@ -94,6 +103,16 @@ func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.Raw
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			if strings.TrimSpace(tk.SubagentType) == "" {
+				results[idx] = result{desc: tk.Description, err: fmt.Errorf("subagent_type is required")}
+				return
+			}
+			if len(t.Specs) > 0 {
+				if _, ok := t.Specs[tk.SubagentType]; !ok {
+					results[idx] = result{desc: tk.Description, err: fmt.Errorf("unknown subagent_type %q", tk.SubagentType)}
+					return
+				}
+			}
 			var out string
 			var err error
 			if a.Background {

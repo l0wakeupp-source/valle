@@ -141,6 +141,14 @@ func analyzeOne(p Policy, raw string, argv []string) []Violation {
 
 	if p.WritesAllowed() && p.Mode != ModeTrusted {
 		for _, target := range writeTargets(prog, args) {
+			if strings.ContainsAny(target, "$`") {
+				out = append(out, Violation{
+					Rule: "write.dynamic_path", Command: raw,
+					Detail: "dynamic shell path expansion cannot be verified safely",
+				})
+				continue
+			}
+			target = expandWriteTarget(target)
 			if dev := matchDevice(target); dev != "" {
 				out = append(out, Violation{
 					Rule: "write.device", Command: raw,
@@ -265,6 +273,23 @@ func writeTargets(prog string, args []string) []string {
 		}
 	}
 	return out
+}
+
+func expandWriteTarget(target string) string {
+	if !strings.HasPrefix(target, "~") {
+		return target
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return target
+	}
+	if target == "~" {
+		return home
+	}
+	if strings.HasPrefix(target, "~/") || strings.HasPrefix(target, `~\\`) {
+		return filepath.Join(home, target[2:])
+	}
+	return target
 }
 
 // hostsIn pulls hostnames out of URL-looking arguments.

@@ -89,6 +89,11 @@ func NewID() string {
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
 
+func validID(id string) bool {
+	return id != "" && id != "." && id != ".." && filepath.Base(id) == id &&
+		!strings.ContainsAny(id, "/\\\x00")
+}
+
 func (s *Store) metaPath(id string) string { return filepath.Join(s.dir, id+".meta.json") }
 
 // Save atomically writes a session.
@@ -97,6 +102,9 @@ func (s *Store) Save(sess *Session) error {
 	defer s.mu.Unlock()
 	if sess.ID == "" {
 		sess.ID = NewID()
+	}
+	if !validID(sess.ID) {
+		return fmt.Errorf("invalid session id")
 	}
 	sess.Updated = time.Now()
 	if sess.Created.IsZero() {
@@ -129,6 +137,9 @@ func (s *Store) Save(sess *Session) error {
 
 // Load reads a session by id.
 func (s *Store) Load(id string) (*Session, error) {
+	if !validID(id) {
+		return nil, fmt.Errorf("invalid session id")
+	}
 	data, err := os.ReadFile(s.path(id))
 	if err != nil {
 		return nil, err
@@ -142,6 +153,9 @@ func (s *Store) Load(id string) (*Session, error) {
 
 // Delete removes a session file and its lightweight metadata companion.
 func (s *Store) Delete(id string) error {
+	if !validID(id) {
+		return fmt.Errorf("invalid session id")
+	}
 	sessionErr := os.Remove(s.path(id))
 	if sessionErr != nil && !os.IsNotExist(sessionErr) {
 		return sessionErr

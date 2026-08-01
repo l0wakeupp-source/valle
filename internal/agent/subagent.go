@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -17,6 +18,15 @@ const (
 	SubagentGeneral = "general"
 	SubagentExplore = "explore"
 )
+
+func sortedSubagentNames(specs map[string]SubagentSpec) []string {
+	names := make([]string, 0, len(specs))
+	for name := range specs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
 
 // SubagentSpec describes a spawnable subagent.
 type SubagentSpec struct {
@@ -78,18 +88,16 @@ func (t TaskTool) Description() string {
 	b.WriteString("Use 'task' for one-shot delegation, 'swarm' for ongoing multi-agent coordination.\n\n")
 	b.WriteString("The optional background=true returns immediately with an agent ID; use /agents or chat/steer to follow it.\n\n")
 	b.WriteString("Available subagent types:\n")
-	for n := range t.Specs {
-		fmt.Fprintf(&b, "- %s: %s\n", n, t.Specs[n].Description)
+	names := sortedSubagentNames(t.Specs)
+	for _, name := range names {
+		fmt.Fprintf(&b, "- %s: %s\n", name, t.Specs[name].Description)
 	}
 	return b.String()
 }
 
 // Schema implements tools.Tool.
 func (t TaskTool) Schema() map[string]any {
-	kinds := make([]string, 0, len(t.Specs))
-	for n := range t.Specs {
-		kinds = append(kinds, n)
-	}
+	kinds := sortedSubagentNames(t.Specs)
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -140,10 +148,7 @@ func (t TaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage)
 		a.SubagentType = SubagentGeneral
 	}
 	if _, ok := t.Specs[a.SubagentType]; !ok {
-		kinds := make([]string, 0, len(t.Specs))
-		for n := range t.Specs {
-			kinds = append(kinds, n)
-		}
+		kinds := sortedSubagentNames(t.Specs)
 		return tools.Errf("unknown subagent_type %q (have: %s)", a.SubagentType, strings.Join(kinds, ", ")), nil
 	}
 
@@ -247,7 +252,7 @@ func SubagentToolFilter(spec SubagentSpec, base func(string) bool) func(string) 
 		"write": true, "edit": true, "apply_patch": true, "bash": true,
 	}
 	return func(name string) bool {
-		if name == "task" {
+		if name == "task" || name == "parallel_tasks" || name == "swarm" {
 			return false // subagents never delegate further
 		}
 		if spec.ReadOnly && writeTools[name] {

@@ -90,6 +90,9 @@ type resumeModel struct {
 	metas    []session.Meta
 	filtered []session.Meta
 
+	messageSearchCache      map[string]string
+	messageSearchCacheOrder []string
+
 	cursor       int
 	width        int
 	height       int
@@ -699,16 +702,48 @@ func (m *resumeModel) matchesQuery(meta session.Meta, query string) bool {
 	// Metadata search is cheap for every keystroke. Only open a transcript
 	// when its metadata did not match, so message search remains complete
 	// without making the common case expensive.
-	sess, err := m.store.Load(meta.ID)
-	if err != nil {
-		return false
-	}
-	for _, message := range sess.Messages {
-		if strings.Contains(strings.ToLower(message.Text()), query) {
-			return true
+	return strings.Contains(m.cachedMessageSearchText(meta.ID), query)
+}
+
+const (
+	maxResumeMessageCacheEntries = 64
+	maxResumeCachedMessageBytes  = 256 << 10
+)
+
+func (m *resumeModel) cachedMessageSearchText(id string) string {
+	if m.messageSearchCache != nil {
+		if text, ok := m.messageSearchCache[id]; ok {
+			return text
 		}
 	}
-	return false
+
+	sess, err := m.store.Load(id)
+	if err != nil {
+		return ""
+	}
+	var builder strings.Builder
+	for _, message := range sess.Messages {
+		for _, block := range message.Content {
+			if block.Type == "text" {
+				builder.WriteString(block.Text)
+			}
+		}
+	}
+	text := strings.ToLower(builder.String())
+	if len(text) > maxResumeCachedMessageBytes {
+		return text
+	}
+	if m.messageSearchCache == nil {
+		m.messageSearchCache = make(map[string]string)
+	}
+	if len(m.messageSearchCacheOrder) >= maxResumeMessageCacheEntries {
+		oldest := m.messageSearchCacheOrder[0]
+		m.messageSearchCacheOrder = m.messageSearchCacheOrder[1:]
+		delete(m.messageSearchCache, oldest)
+	}
+	m.messageSearchCache[id] = text
+	m.messageSearchCacheOrder = append(m.messageSearchCacheOrder, id)
+	return text
 }
 
 func (m *resumeModel) recalculateViewport() {

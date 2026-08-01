@@ -85,6 +85,7 @@ func RunTaskTeam(ctx context.Context, jobs []TeamJob, board *TaskBoard, maxConcu
 		results[index].Err = err
 		results[index].Status = StatusFailed
 		results[index].Finished = time.Now()
+		_ = board.Cancel(jobs[index].TaskID, err.Error())
 		emit(RuntimeEvent{Name: jobs[index].Name, Kind: EventAgentFailed, Value: err})
 	}
 
@@ -102,7 +103,12 @@ func RunTaskTeam(ctx context.Context, jobs []TeamJob, board *TaskBoard, maxConcu
 					continue
 				}
 				if task.Status == TaskBlocked {
-					finishWithoutRun(i, fmt.Errorf("swarm: task %q is blocked by a failed dependency", job.TaskID))
+					started[i], finished[i] = true, true
+					completed++
+					results[i].Err = fmt.Errorf("swarm: task %q is blocked by a failed dependency", job.TaskID)
+					results[i].Status = StatusFailed
+					results[i].Finished = time.Now()
+					emit(RuntimeEvent{Name: job.Name, Kind: EventAgentFailed, Value: results[i].Err})
 					continue
 				}
 				if task.Status == TaskPending && board.DependenciesComplete(job.TaskID) {
@@ -149,9 +155,19 @@ func RunTaskTeam(ctx context.Context, jobs []TeamJob, board *TaskBoard, maxConcu
 		}
 		if running == 0 && !launched {
 			for i := range jobs {
-				if !finished[i] {
-					finishWithoutRun(i, fmt.Errorf("swarm: task %q cannot become ready", jobs[i].TaskID))
+				if finished[i] {
+					continue
 				}
+				if task, err := board.Get(jobs[i].TaskID); err == nil && task.Status == TaskBlocked {
+					finished[i] = true
+					completed++
+					results[i].Err = fmt.Errorf("swarm: task %q is blocked", jobs[i].TaskID)
+					results[i].Status = StatusFailed
+					results[i].Finished = time.Now()
+					emit(RuntimeEvent{Name: jobs[i].Name, Kind: EventAgentFailed, Value: results[i].Err})
+					continue
+				}
+				finishWithoutRun(i, fmt.Errorf("swarm: task %q cannot become ready", jobs[i].TaskID))
 			}
 			break
 		}

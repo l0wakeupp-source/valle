@@ -18,7 +18,7 @@ import (
 // osvRateLimiter paces OSV.dev queries to 10 requests per second.
 // It is a channel-based token bucket: callers block on receive before sending
 // a query, and a background goroutine refills one token every 100ms.
-var osvRateLimiter = func() chan struct{} {
+var osvRateLimiter = sync.OnceValue(func() chan struct{} {
 	ch := make(chan struct{}, 10)
 	// Prime the bucket.
 	for i := 0; i < 10; i++ {
@@ -35,7 +35,7 @@ var osvRateLimiter = func() chan struct{} {
 		}
 	}()
 	return ch
-}()
+})
 
 // Finding is one vulnerability discovered in a dependency.
 type Finding struct {
@@ -49,10 +49,11 @@ type Finding struct {
 
 // auditCacheEntry is one cached OSV response, keyed by package+version+ecosystem.
 type auditCacheEntry struct {
-	Fingerprint   string          `json:"fingerprint"`
-	ResponseBody  []byte          `json:"response_body"`
-	Timestamp     time.Time       `json:"timestamp"`
-	SourceMtime   time.Time       `json:"source_mtime"`
+	Fingerprint  string    `json:"fingerprint"`
+	ResponseBody []byte    `json:"response_body,omitempty"` // legacy cache entries
+	Findings     []Finding `json:"findings,omitempty"`
+	Timestamp    time.Time `json:"timestamp"`
+	SourceMtime  time.Time `json:"source_mtime"`
 }
 
 // auditCache is the on-disk cache of OSV query responses.
@@ -62,9 +63,9 @@ type auditCache struct {
 
 // dependency is one extracted package reference.
 type dependency struct {
-	Name       string
-	Version    string
-	Ecosystem  string
+	Name        string
+	Version     string
+	Ecosystem   string
 	SourceMtime time.Time
 }
 
@@ -83,15 +84,27 @@ func Audit(dir string) ([]Finding, error) {
 	}
 
 	var (
-		mu      sync.Mutex
+		mu       sync.Mutex
 		findings []Finding
 	)
 
 	for _, dep := range deps {
 		hit := cache.lookup(dep, dir)
 		if hit != nil {
-			fs, err := parseFindings(hit, dep)
-			if err == nil {
+			fs := hit.Findings
+			if hit.ResponseBody != nil {
+				var err error
+				fs, err = parseFindings(hit.ResponseBody, dep)
+				if err != nil {
+					fs = nil
+				} else {
+					// Migrate legacy raw-body entries to compact findings when the
+					// audit is next run.
+					hit.Findings = fs
+					hit.ResponseBody = nil
+				}
+			}
+			if hit.ResponseBody == nil {
 				mu.Lock()
 				findings = append(findings, fs...)
 				mu.Unlock()
@@ -99,11 +112,11 @@ func Audit(dir string) ([]Finding, error) {
 			}
 		}
 
-		fs, body, err := queryOSV(dep.Name, dep.Version, dep.Ecosystem)
+		fs, _, err := queryOSV(dep.Name, dep.Version, dep.Ecosystem)
 		if err != nil {
 			return nil, fmt.Errorf("query %s %s: %w", dep.Name, dep.Version, err)
 		}
-		cache.store(dep, body, dir)
+		cache.store(dep, fs, dir)
 		mu.Lock()
 		findings = append(findings, fs...)
 		mu.Unlock()
@@ -149,7 +162,7 @@ func collect(dir string) ([]dependency, error) {
 
 // osvQuery is the request body sent to OSV.dev.
 type osvQuery struct {
-	Version  string `json:"version"`
+	Version string `json:"version"`
 	Package struct {
 		Name      string `json:"name"`
 		Ecosystem string `json:"ecosystem"`
@@ -177,11 +190,12 @@ type osvSeverity struct {
 }
 
 const osvEndpoint = "https://api.osv.dev/v1/query"
+const maxOSVResponseBytes = 4 << 20
 
 // queryOSV sends a single lookup to OSV.dev and returns any findings.
 func queryOSV(pkg, version, ecosystem string) ([]Finding, []byte, error) {
 	// Rate limit: wait for a token before sending the query.
-	<-osvRateLimiter
+	<-osvRateLimiter()
 
 	body := osvQuery{Version: version}
 	body.Package.Name = pkg
@@ -198,9 +212,12 @@ func queryOSV(pkg, version, ecosystem string) ([]Finding, []byte, error) {
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxOSVResponseBytes+1))
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(data) > maxOSVResponseBytes {
+		return nil, nil, fmt.Errorf("osv response exceeds %d bytes", maxOSVResponseBytes)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -337,7 +354,7 @@ func saveCache(dir string, cache *auditCache) error {
 }
 
 // lookup returns the cached response for dep if present and not stale.
-func (c *auditCache) lookup(dep dependency, dir string) []byte {
+func (c *auditCache) lookup(dep dependency, dir string) *auditCacheEntry {
 	fp := cacheFingerprint(dep)
 	for i := range c.Entries {
 		e := &c.Entries[i]
@@ -349,13 +366,14 @@ func (c *auditCache) lookup(dep dependency, dir string) []byte {
 			c.remove(i)
 			return nil
 		}
-		return e.ResponseBody
+		return e
 	}
 	return nil
 }
 
-// store records dep's response body in the cache.
-func (c *auditCache) store(dep dependency, body []byte, dir string) {
+// store records compact findings in the cache instead of retaining the full
+// provider response body.
+func (c *auditCache) store(dep dependency, findings []Finding, dir string) {
 	if dep.SourceMtime.IsZero() {
 		fi, err := os.Stat(filepath.Join(dir, manifestFile(dep)))
 		if err == nil {
@@ -366,19 +384,19 @@ func (c *auditCache) store(dep dependency, body []byte, dir string) {
 	for i := range c.Entries {
 		if c.Entries[i].Fingerprint == fp {
 			c.Entries[i] = auditCacheEntry{
-				Fingerprint:  fp,
-				ResponseBody: body,
-				Timestamp:    time.Now(),
-				SourceMtime:  dep.SourceMtime,
+				Fingerprint: fp,
+				Findings:    findings,
+				Timestamp:   time.Now(),
+				SourceMtime: dep.SourceMtime,
 			}
 			return
 		}
 	}
 	c.Entries = append(c.Entries, auditCacheEntry{
-		Fingerprint:  fp,
-		ResponseBody: body,
-		Timestamp:    time.Now(),
-		SourceMtime:  dep.SourceMtime,
+		Fingerprint: fp,
+		Findings:    findings,
+		Timestamp:   time.Now(),
+		SourceMtime: dep.SourceMtime,
 	})
 }
 

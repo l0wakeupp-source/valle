@@ -220,7 +220,7 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 		if taskID == "" {
 			taskID = spec.Name
 		}
-		prompt := fmt.Sprintf("Team goal: %s\n\nYour identity: %s\nYour task ID: %s\nYour assignment: %s\n\nYour task has already been claimed for you. Confirm it with claim_task using this exact task ID, coordinate through team messages, and finish with complete_task or fail_task.", msg.goal, spec.Name, taskID, spec.Role)
+		prompt := fmt.Sprintf("Team goal: %s\n\nYour identity: %s\nYour task ID: %s\nYour assignment: %s\n\nYour task is already claimed for you. Do not claim it again; coordinate through team messages, and finish with complete_task or fail_task.", msg.goal, spec.Name, taskID, spec.Role)
 		jobs = append(jobs, swarm.TeamJob{Name: spec.Name, TaskID: taskID, Runner: agent.NewAgentRunner(cfg, prompt)})
 	}
 	committed = true
