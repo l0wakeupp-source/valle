@@ -72,7 +72,7 @@ func TestWebProviderEditorRedactsExistingAPIKey(t *testing.T) {
 	m.deps.Loaded = &config.Loaded{}
 	m.deps.Loaded.Config.WebSearch = &config.WebSearchConfig{
 		Providers: map[string]config.WebSearchProviderConfig{
-			"exa": {APIKey: "super-secret-test-key"},
+			"exa": {APIKey: "super...y"},
 		},
 	}
 	m.web = webSearchState{
@@ -90,4 +90,92 @@ func TestWebProviderEditorRedactsExistingAPIKey(t *testing.T) {
 	if !strings.Contains(view, "[REDACTED]") {
 		t.Fatal("web-provider editor did not show a redacted key status")
 	}
+}
+
+func TestWebProviderFieldsUseTypedProviderControls(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps.Loaded = &config.Loaded{Config: config.Config{WebSearch: &config.WebSearchConfig{}}}
+	m.web.selected = "exa"
+
+	fields := m.webFields()
+	weight := findWebField(t, fields, "weight")
+	if len(weight.options) == 0 {
+		t.Fatal("provider weight has no dropdown options")
+	}
+	if webOptionIndex(weight.options, "1") < 0 || webOptionIndex(weight.options, "__custom__") < 0 {
+		t.Fatal("provider weight dropdown is missing bounded or custom choices")
+	}
+	maxAge := findWebField(t, fields, "max_age_hours")
+	if len(maxAge.options) == 0 {
+		t.Fatal("Exa max age has no typed choices")
+	}
+
+	routing := m.webRoutingFields()
+	parallel := findWebField(t, routing, "parallel")
+	if !parallel.toggle || len(parallel.options) != 2 {
+		t.Fatalf("parallel control = toggle:%v options:%d, want a two-state switch", parallel.toggle, len(parallel.options))
+	}
+	if len(findWebField(t, routing, "max_parallel").options) == 0 {
+		t.Fatal("max parallel has no dropdown options")
+	}
+}
+
+func TestWebProviderDropdownAndBooleanControlsApplyValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("RICK_HOME", home)
+	m := newModelChoiceTestModel()
+	m.deps.Loaded = &config.Loaded{Config: config.Config{WebSearch: &config.WebSearchConfig{Providers: map[string]config.WebSearchProviderConfig{}}}}
+	m.web.active = true
+	m.web.stage = webProviderMenu
+	m.web.selected = "exa"
+	m.web.fields = m.webFields()
+
+	weight := findWebField(t, m.web.fields, "weight")
+	m.openWebField(weight)
+	if m.web.stage != webProviderEdit {
+		t.Fatalf("weight open stage = %d, want edit", m.web.stage)
+	}
+	m.handleWebKey(tea.KeyMsg{Type: tea.KeyDown}, "down")
+	if m.web.inputBuf != "0.25" {
+		t.Fatalf("weight dropdown selection = %q, want 0.25", m.web.inputBuf)
+	}
+	m.handleWebKey(tea.KeyMsg{Type: tea.KeyEnter}, "enter")
+	if got := m.webConfig().Providers["exa"].Weight; got != 0.25 {
+		t.Fatalf("saved provider weight = %v, want 0.25", got)
+	}
+
+	m.web.fields = m.webFields()
+	weight = findWebField(t, m.web.fields, "weight")
+	m.openWebField(weight)
+	for index := 0; index < 9; index++ {
+		m.handleWebKey(tea.KeyMsg{Type: tea.KeyDown}, "down")
+	}
+	m.handleWebKey(tea.KeyMsg{Type: tea.KeyEnter}, "enter")
+	if !m.web.customInput {
+		t.Fatal("custom weight choice did not open exact-value input")
+	}
+	m.handleWebKey(tea.KeyMsg{Runes: []rune("2.75")}, "")
+	m.handleWebKey(tea.KeyMsg{Type: tea.KeyEnter}, "enter")
+	if got := m.webConfig().Providers["exa"].Weight; got != 2.75 {
+		t.Fatalf("saved custom provider weight = %v, want 2.75", got)
+	}
+
+	m.web.stage = webProviderRouting
+	m.web.fields = m.webRoutingFields()
+	parallel := findWebField(t, m.web.fields, "parallel")
+	m.openWebField(parallel)
+	if m.webConfig().Parallel == nil || !*m.webConfig().Parallel {
+		t.Fatal("parallel switch did not enable parallel execution")
+	}
+}
+
+func findWebField(t *testing.T, fields []webField, id string) webField {
+	t.Helper()
+	for _, field := range fields {
+		if field.id == id {
+			return field
+		}
+	}
+	t.Fatalf("web field %q not found", id)
+	return webField{}
 }
