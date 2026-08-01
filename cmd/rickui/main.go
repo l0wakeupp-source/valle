@@ -994,13 +994,31 @@ func testReasoningLevels(tmp string) {
 	m.SetModelID("openai/gpt-5")
 	check("a reasoning model starts at medium", m.Reasoning() == "medium", m.Reasoning())
 
+	// Newer GLM ids use a provider-specific thinking object and must still
+	// start with the normal reasoning controls.
+	glm := build(tmp, "pickle-rick", 90, 30)
+	glm.SetModelID("zai/glm-4.7")
+	check("GLM-4.7 IS DETECTED AS BOOLEAN THINKING", glm.Reasoning() == "on", glm.Reasoning())
+
+	// An unknown/custom id is not treated as a confirmed non-reasoning model.
+	// It starts safely off, but /thinking remains available for new models.
+	unknown := build(tmp, "pickle-rick", 90, 30)
+	unknown.SetModelID("gateway/vendor-new-model")
+	check("UNKNOWN MODELS START WITH THINKING OFF", unknown.Reasoning() == "off", unknown.Reasoning())
+	unknown.InputSetValue("/thinking")
+	unknown = key(unknown, "enter")
+	check("UNKNOWN MODELS STILL OFFER EXPLICIT THINKING CONTROLS", unknown.PendingKind() != 0, fmt.Sprint(unknown.PendingKind()))
+	check("UNKNOWN MODELS DO NOT CLAIM THINKING IS IMPOSSIBLE",
+		!strings.Contains(unknown.ChatContent(), "not a reasoning model"), unknown.ChatContent())
+
 	m.InputSetValue("/thinking")
 	m = key(m, "enter")
-	check("/THINKING OFFERS LEVELS, NOT A TOGGLE", m.PendingKind() != 0, fmt.Sprint(m.PendingKind()))
+	check("/THINKING OFFERS ONLY MODEL-SUPPORTED LEVELS", m.PendingKind() != 0, fmt.Sprint(m.PendingKind()))
 	v := plain(m.View())
-	for _, lvl := range []string{"off", "low", "medium", "high"} {
+	for _, lvl := range []string{"minimal", "low", "medium", "high"} {
 		check("  offers "+lvl, strings.Contains(v, lvl), v)
 	}
+	check("  does not offer unsupported off", !strings.Contains(v, "off"), v)
 	check("  the current level is marked", strings.Contains(v, "current"), v)
 
 	m.InputSetValue("high")
