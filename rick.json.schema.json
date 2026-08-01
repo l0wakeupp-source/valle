@@ -468,33 +468,74 @@
     "web_search": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Web search restrictions and budget.",
+      "description": "Web search restrictions, logical budget, bounded fallback, and provider health controls.",
       "properties": {
         "allow_domains": {
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string" },
           "description": "If set, only return results from these domains."
         },
         "deny_domains": {
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string" },
           "description": "Domains to exclude from results."
         },
         "max_results": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10,
-          "default": 5,
-          "description": "Maximum results per query (default 5)."
+          "type": "integer", "minimum": 1, "maximum": 10, "default": 5,
+          "description": "Maximum results per query."
         },
         "max_searches_per_session": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Max web searches per session (default 10)."
+          "type": "integer", "minimum": 1,
+          "description": "Logical Rick searches per session; provider retries do not consume extra units."
+        },
+        "logical_budget": {
+          "type": "integer", "minimum": 1,
+          "description": "Preferred name for the logical per-session search budget."
+        },
+        "provider": {
+          "type": "string",
+          "description": "auto, parallel, or one explicit provider ID. Bing is intentionally not an automatic option."
+        },
+        "mode": { "type": "string" },
+        "parallel": { "type": "boolean" },
+        "max_parallel": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "max_concurrent": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "hedge_after_ms": { "type": "integer", "minimum": 0 },
+        "cache_ttl_seconds": { "type": "integer", "minimum": 0 },
+        "providers": {
+          "type": "object",
+          "description": "Only explicitly configured providers are eligible except DuckDuckGo, which is the keyless default.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "api_key": { "type": "string", "description": "Prefer api_key_env so secrets remain outside rick.json." },
+              "api_key_env": { "type": "string" },
+              "clear_api_key": { "type": "boolean" },
+              "clear_base_url": { "type": "boolean" },
+              "base_url": { "type": "string" },
+              "instances": { "type": "array", "items": { "type": "string" } },
+              "kind": { "type": "string", "enum": ["api", "local", "public_instance", "domain"] },
+              "backend": { "type": "string" },
+              "region": { "type": "string" },
+              "safe_search": { "type": "string" },
+              "time_range": { "type": "string" },
+              "type": { "type": "string" },
+              "livecrawl": { "type": "string" },
+              "max_age_hours": { "type": "integer", "minimum": 0 },
+              "include_domains": { "type": "array", "items": { "type": "string" } },
+              "exclude_domains": { "type": "array", "items": { "type": "string" } },
+              "priority": { "type": "integer", "minimum": 1 },
+              "weight": { "type": "number", "exclusiveMinimum": 0 },
+              "max_rpm": { "type": "integer", "minimum": 1 },
+              "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 4 },
+              "daily_budget": { "type": "integer", "minimum": 0 },
+              "monthly_budget": { "type": "integer", "minimum": 0 },
+              "timeout_seconds": { "type": "integer", "minimum": 1 },
+              "cache_ttl_seconds": { "type": "integer", "minimum": 0 }
+            }
+          }
         }
       }
     }
