@@ -167,9 +167,10 @@ type Model struct {
 	resumable   string
 	slashCursor int
 
-	// reasoning effort for the active model, and whether it supports any
-	reasoning      provider.ReasoningEffort
-	reasoningStyle provider.ReasoningStyle
+	// reasoning effort for the active model and its model-specific controls
+	reasoning             provider.ReasoningEffort
+	reasoningStyle        provider.ReasoningStyle
+	reasoningCapabilities provider.ReasoningCapabilities
 
 	// billed totals across the session (usage tracks context occupancy)
 	billed session.Usage
@@ -372,14 +373,28 @@ func (m *Model) updateContextWindow() {
 	provID, modelID := config.SplitModel(m.modelID)
 
 	// Reasoning support is a property of the model, so re-detect on every
-	// switch and keep the user's level when the new model also supports it.
-	style, deflt := provider.DetectReasoning(modelID)
-	m.reasoningStyle = style
+	// switch and keep the user's level only when the new model supports it.
+	previousStyle := m.reasoningStyle
+	var advertised *provider.ModelInfo
+	if p, ok := m.deps.Providers[provID]; ok {
+		for _, mi := range p.Models() {
+			if mi.ID == modelID {
+				modelInfo := mi
+				advertised = &modelInfo
+				break
+			}
+		}
+	}
+	caps := provider.ReasoningCapabilitiesForProvider(provID, modelID, advertised)
+	m.reasoningCapabilities = caps
+	m.reasoningStyle = caps.Style
 	switch {
-	case style == provider.ReasoningStyleNone:
+	case caps.Style == provider.ReasoningStyleNone:
 		m.reasoning = provider.ReasoningOff
-	case m.reasoning == "" || m.reasoning == provider.ReasoningOff:
-		m.reasoning = deflt
+	case caps.Style == provider.ReasoningStyleAlways:
+		m.reasoning = caps.Default
+	case m.reasoning == "" || previousStyle != caps.Style || !containsReasoningEffort(caps.Efforts, m.reasoning):
+		m.reasoning = caps.Default
 	}
 
 	// Prefer live API metadata over catalogs and id heuristics. The source is
@@ -396,15 +411,9 @@ func (m *Model) updateContextWindow() {
 		}
 	}
 	bestValue, bestSource = betterContextCandidate(bestValue, bestSource, stored, storedSource)
-	if p, ok := m.deps.Providers[provID]; ok {
-		for _, mi := range p.Models() {
-			if mi.ID != modelID {
-				continue
-			}
-			bestValue, bestSource = betterContextCandidate(
-				bestValue, bestSource, mi.ContextWindow, mi.ContextSource)
-			break
-		}
+	if advertised != nil {
+		bestValue, bestSource = betterContextCandidate(
+			bestValue, bestSource, advertised.ContextWindow, advertised.ContextSource)
 	}
 	if bestValue > 0 {
 		m.ctxWindow = bestValue
