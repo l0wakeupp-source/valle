@@ -170,6 +170,18 @@ type ModelInfo struct {
 	// as a conservative fallback for non-chat model families.
 	CapabilitiesKnown bool
 	ChatCapable       bool
+	// ReasoningEfforts is the provider's advertised effort vocabulary. A nil
+	// slice means no explicit vocabulary was supplied; use the model/provider
+	// fallback in that case.
+	ReasoningEfforts             []ReasoningEffort
+	ReasoningEffortsKnown        bool
+	ReasoningEffortsAll          bool
+	ReasoningDefault             ReasoningEffort
+	ReasoningDefaultEnabled      bool
+	ReasoningDefaultEnabledKnown bool
+	ReasoningMandatory           bool
+	ReasoningSupportsMaxTokens   bool
+	ReasoningKnown               bool
 }
 
 // Provider is the single abstraction every backend implements.
