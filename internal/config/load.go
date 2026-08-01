@@ -260,11 +260,26 @@ func mergeWebSearchConfig(base, over *WebSearchConfig) *WebSearchConfig {
 	if over.Provider != "" {
 		out.Provider = over.Provider
 	}
+	if over.Mode != "" {
+		out.Mode = over.Mode
+	}
 	if over.Parallel != nil {
 		out.Parallel = over.Parallel
 	}
 	if over.MaxParallel != 0 {
 		out.MaxParallel = over.MaxParallel
+	}
+	if over.HedgeAfterMS != 0 {
+		out.HedgeAfterMS = over.HedgeAfterMS
+	}
+	if over.LogicalBudget != 0 {
+		out.LogicalBudget = over.LogicalBudget
+	}
+	if over.CacheTTLSeconds != 0 {
+		out.CacheTTLSeconds = over.CacheTTLSeconds
+	}
+	if over.MaxConcurrent != 0 {
+		out.MaxConcurrent = over.MaxConcurrent
 	}
 	if over.Providers != nil {
 		if out.Providers == nil {
@@ -282,11 +297,28 @@ func mergeWebSearchProvider(base, over WebSearchProviderConfig) WebSearchProvide
 	if over.Enabled != nil {
 		out.Enabled = over.Enabled
 	}
+	if over.ClearAPIKey {
+		out.APIKey = ""
+	}
+	if over.ClearBaseURL {
+		out.BaseURL = ""
+	}
 	if over.APIKey != "" {
 		out.APIKey = over.APIKey
+		out.ClearAPIKey = false
+	}
+	if over.APIKeyEnv != "" {
+		out.APIKeyEnv = over.APIKeyEnv
 	}
 	if over.BaseURL != "" {
 		out.BaseURL = over.BaseURL
+		out.ClearBaseURL = false
+	}
+	if over.Instances != nil {
+		out.Instances = append([]string(nil), over.Instances...)
+	}
+	if over.Kind != "" {
+		out.Kind = over.Kind
 	}
 	if over.Backend != "" {
 		out.Backend = over.Backend
@@ -317,6 +349,27 @@ func mergeWebSearchProvider(base, over WebSearchProviderConfig) WebSearchProvide
 	}
 	if over.Weight != 0 {
 		out.Weight = over.Weight
+	}
+	if over.Priority != 0 {
+		out.Priority = over.Priority
+	}
+	if over.MaxRPM != 0 {
+		out.MaxRPM = over.MaxRPM
+	}
+	if over.MaxConcurrency != 0 {
+		out.MaxConcurrency = over.MaxConcurrency
+	}
+	if over.DailyBudget != 0 {
+		out.DailyBudget = over.DailyBudget
+	}
+	if over.MonthlyBudget != 0 {
+		out.MonthlyBudget = over.MonthlyBudget
+	}
+	if over.TimeoutSeconds != 0 {
+		out.TimeoutSeconds = over.TimeoutSeconds
+	}
+	if over.CacheTTLSeconds != 0 {
+		out.CacheTTLSeconds = over.CacheTTLSeconds
 	}
 	return out
 }
