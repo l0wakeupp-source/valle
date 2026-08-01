@@ -16,8 +16,17 @@ func FilterChatModels(models []Model) []Model {
 
 func IsChatModel(model Model) bool {
 	return provider.IsChatModel(provider.ModelInfo{
-		ID:                model.ID,
-		CapabilitiesKnown: model.CapabilitiesKnown,
-		ChatCapable:       model.ChatCapable,
+		ID:                           model.ID,
+		CapabilitiesKnown:            model.CapabilitiesKnown,
+		ChatCapable:                  model.ChatCapable,
+		ReasoningEfforts:             append([]provider.ReasoningEffort(nil), model.ReasoningEfforts...),
+		ReasoningEffortsKnown:        model.ReasoningEffortsKnown,
+		ReasoningEffortsAll:          model.ReasoningEffortsAll,
+		ReasoningDefault:             model.ReasoningDefault,
+		ReasoningDefaultEnabled:      model.ReasoningDefaultEnabled,
+		ReasoningDefaultEnabledKnown: model.ReasoningDefaultEnabledKnown,
+		ReasoningMandatory:           model.ReasoningMandatory,
+		ReasoningSupportsMaxTokens:   model.ReasoningSupportsMaxTokens,
+		ReasoningKnown:               model.ReasoningKnown,
 	})
 }
