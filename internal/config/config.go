@@ -130,19 +130,31 @@ type Command struct {
 // API keys may also be supplied through the provider's conventional environment
 // variable so they do not need to be written to rick.json.
 type WebSearchProviderConfig struct {
-	Enabled        *bool    `json:"enabled,omitempty"`
-	APIKey         string   `json:"api_key,omitempty"`
-	BaseURL        string   `json:"base_url,omitempty"`
-	Backend        string   `json:"backend,omitempty"`
-	Region         string   `json:"region,omitempty"`
-	SafeSearch     string   `json:"safe_search,omitempty"`
-	TimeRange      string   `json:"time_range,omitempty"`
-	Type           string   `json:"type,omitempty"`
-	Livecrawl      string   `json:"livecrawl,omitempty"`
-	MaxAgeHours    *int     `json:"max_age_hours,omitempty"`
-	IncludeDomains []string `json:"include_domains,omitempty"`
-	ExcludeDomains []string `json:"exclude_domains,omitempty"`
-	Weight         float64  `json:"weight,omitempty"`
+	Enabled         *bool    `json:"enabled,omitempty"`
+	APIKey          string   `json:"api_key,omitempty"`
+	APIKeyEnv       string   `json:"api_key_env,omitempty"`
+	BaseURL         string   `json:"base_url,omitempty"`
+	Instances       []string `json:"instances,omitempty"`
+	Kind            string   `json:"kind,omitempty"` // api | local | public_instance | domain
+	Backend         string   `json:"backend,omitempty"`
+	Region          string   `json:"region,omitempty"`
+	SafeSearch      string   `json:"safe_search,omitempty"`
+	TimeRange       string   `json:"time_range,omitempty"`
+	Type            string   `json:"type,omitempty"`
+	Livecrawl       string   `json:"livecrawl,omitempty"`
+	MaxAgeHours     *int     `json:"max_age_hours,omitempty"`
+	IncludeDomains  []string `json:"include_domains,omitempty"`
+	ExcludeDomains  []string `json:"exclude_domains,omitempty"`
+	Priority        int      `json:"priority,omitempty"`
+	Weight          float64  `json:"weight,omitempty"`
+	MaxRPM          int      `json:"max_rpm,omitempty"`
+	MaxConcurrency  int      `json:"max_concurrency,omitempty"`
+	DailyBudget     int      `json:"daily_budget,omitempty"`
+	MonthlyBudget   int      `json:"monthly_budget,omitempty"`
+	TimeoutSeconds  int      `json:"timeout_seconds,omitempty"`
+	CacheTTLSeconds int      `json:"cache_ttl_seconds,omitempty"`
+	ClearAPIKey     bool     `json:"clear_api_key,omitempty"`
+	ClearBaseURL    bool     `json:"clear_base_url,omitempty"`
 }
 
 // WebSearchConfig restricts web search results by domain and controls the
@@ -154,8 +166,13 @@ type WebSearchConfig struct {
 	MaxResults            int                                `json:"max_results,omitempty"`              // default 5
 	MaxSearchesPerSession int                                `json:"max_searches_per_session,omitempty"` // budget, default 10
 	Provider              string                             `json:"provider,omitempty"`
+	Mode                  string                             `json:"mode,omitempty"`
 	Parallel              *bool                              `json:"parallel,omitempty"`
 	MaxParallel           int                                `json:"max_parallel,omitempty"`
+	HedgeAfterMS          int                                `json:"hedge_after_ms,omitempty"`
+	LogicalBudget         int                                `json:"logical_budget,omitempty"`
+	CacheTTLSeconds       int                                `json:"cache_ttl_seconds,omitempty"`
+	MaxConcurrent         int                                `json:"max_concurrent,omitempty"`
 	Providers             map[string]WebSearchProviderConfig `json:"providers,omitempty"`
 }
 
