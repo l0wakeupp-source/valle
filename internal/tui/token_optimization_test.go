@@ -1,11 +1,15 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"rick/internal/config"
 	"rick/internal/provider"
@@ -127,5 +131,110 @@ func TestCompactHistoryKeepsOnlyLatestThinkingMessage(t *testing.T) {
 	}
 	if len(compacted[1].Content) != 2 || compacted[1].Content[0].Text != "latest" {
 		t.Fatalf("latest thinking was not retained: %#v", compacted[1].Content)
+	}
+}
+
+type compactionTestProvider struct {
+	events []provider.Event
+	close  bool
+}
+
+func (p *compactionTestProvider) Name() string { return "fake" }
+
+func (p *compactionTestProvider) Models() []provider.ModelInfo {
+	return []provider.ModelInfo{{ID: "model", Name: "model"}}
+}
+
+func (p *compactionTestProvider) Stream(ctx context.Context, req provider.Request, ch chan<- provider.Event) {
+	for _, event := range p.events {
+		select {
+		case ch <- event:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if p.close {
+		close(ch)
+	}
+}
+
+func newCompactionTestModel(prov provider.Provider) *Model {
+	return &Model{
+		deps: Deps{
+			Loaded:    &config.Loaded{},
+			Providers: map[string]provider.Provider{"fake": prov},
+		},
+		modelID: "fake/model",
+		history: make([]provider.Message, 5),
+		tx:      newTranscript(),
+	}
+}
+
+func runCompactionCommand(t *testing.T, cmd tea.Cmd) compactDoneMsg {
+	t.Helper()
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	select {
+	case msg := <-result:
+		compact, ok := msg.(compactDoneMsg)
+		if !ok {
+			t.Fatalf("compaction returned %T, want compactDoneMsg", msg)
+		}
+		return compact
+	case <-time.After(2 * time.Second):
+		t.Fatal("compaction waited for channel close after receiving a terminal event")
+		return compactDoneMsg{}
+	}
+}
+
+func TestCompactionStopsAtDoneWithoutWaitingForChannelClose(t *testing.T) {
+	prov := &compactionTestProvider{events: []provider.Event{
+		{Kind: provider.EventText, Text: "summary"},
+		{Kind: provider.EventDone},
+	}}
+	model := newCompactionTestModel(prov)
+	_, cmd := model.cmdCompact()
+	if cmd == nil {
+		t.Fatal("compaction command was not created")
+	}
+	result := runCompactionCommand(t, cmd)
+	if result.err != nil || result.summary != "summary" {
+		t.Fatalf("compaction result = %#v, want a successful summary", result)
+	}
+	model.compactionCancel = nil
+}
+
+func TestCompactionReportsProviderStreamEndingWithoutDone(t *testing.T) {
+	prov := &compactionTestProvider{events: nil, close: true}
+	model := newCompactionTestModel(prov)
+	_, cmd := model.cmdCompact()
+	if cmd == nil {
+		t.Fatal("compaction command was not created")
+	}
+	result := runCompactionCommand(t, cmd)
+	if result.err == nil || !strings.Contains(result.err.Error(), "without a completion event") {
+		t.Fatalf("compaction error = %v, want missing completion error", result.err)
+	}
+}
+
+func TestCompactionErrorReleasesChatGate(t *testing.T) {
+	model := &Model{
+		compactionActive: true,
+		compactionRunID:  7,
+		tx:               newTranscript(),
+	}
+	model.Update(compactDoneMsg{runID: 7, err: errors.New("provider failed")})
+	if model.compactionActive {
+		t.Fatal("provider failure left compaction active")
+	}
+}
+
+func TestCancelCompactionInvalidatesLateResult(t *testing.T) {
+	model := &Model{compactionActive: true, compactionRunID: 3}
+	cancelled := false
+	model.compactionCancel = func() { cancelled = true }
+	model.cancelCompaction()
+	if !cancelled || model.compactionActive || model.compactionRunID != 4 {
+		t.Fatalf("cancelCompaction state = active:%v run:%d cancelled:%v", model.compactionActive, model.compactionRunID, cancelled)
 	}
 }

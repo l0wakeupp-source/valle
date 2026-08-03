@@ -187,7 +187,9 @@ type ModelInfo struct {
 // Provider is the single abstraction every backend implements.
 //
 // Stream owns ch: it must close ch exactly once before returning. Callers must
-// never close it (see the double-close pitfall).
+// never close it (see the double-close pitfall). EventDone and EventError are
+// terminal events; callers may cancel ctx immediately after receiving either.
+// Providers should stop work promptly when ctx is cancelled.
 type Provider interface {
 	Name() string
 	Models() []ModelInfo

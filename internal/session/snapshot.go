@@ -166,6 +166,13 @@ func (s *Snapshotter) History() []Snapshot {
 	return append([]Snapshot(nil), s.history...)
 }
 
+// WorkTree returns the project directory this snapshotter shadows.
+func (s *Snapshotter) WorkTree() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.workTree
+}
+
 // Restore resets the work tree to a snapshot.
 func (s *Snapshotter) Restore(hash string) error {
 	if !s.Enabled() {

@@ -130,6 +130,27 @@ func (m *Manager) ServerNames() []string {
 	return out
 }
 
+// ServerTools lists the tools advertised by one connected server.
+func (m *Manager) ServerTools(name string) []ToolDef {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c, ok := m.clients[name]
+	if !ok {
+		return nil
+	}
+	return c.Tools()
+}
+
+// ServerStatus reports whether a name is a connected server or a failed one.
+func (m *Manager) ServerStatus(name string) (connected bool, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.clients[name]; ok {
+		return true, nil
+	}
+	return false, m.errs[name]
+}
+
 // Register adds every MCP tool to a rick tool registry using the
 // <server>_<tool> naming convention, honouring enable/disable globs.
 func (m *Manager) Register(reg *tools.Registry, enabled map[string]bool) int {

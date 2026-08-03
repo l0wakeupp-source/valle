@@ -465,6 +465,7 @@ func messageByteSize(message provider.Message) int {
 }
 
 func (m *Model) interrupt() {
+	m.cancelCompaction()
 	if m.permReply != nil {
 		m.answerPermission(agent.DecideReject)
 	}

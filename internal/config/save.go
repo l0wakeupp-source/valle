@@ -35,6 +35,18 @@ func SaveWebSearchConfig(cfg WebSearchConfig) error {
 	return patchGlobal("rick.json", "web_search", cfg)
 }
 
+// SaveConfigPatch persists several keys at once in the global rick.json. Keys
+// with nil values are removed so a cleared field falls back to defaults.
+func SaveConfigPatch(patch map[string]any) error {
+	return patchGlobalMap("rick.json", patch, true)
+}
+
+// SaveTUIPatch persists several presentation keys at once in the global
+// tui.json. Keys with nil values are removed.
+func SaveTUIPatch(patch map[string]any) error {
+	return patchGlobalMap("tui.json", patch, true)
+}
+
 // patchGlobal sets one key in a global config file, leaving everything else
 // untouched.
 //
@@ -43,6 +55,12 @@ func SaveWebSearchConfig(cfg WebSearchConfig) error {
 // never silently drop configuration it does not understand. The write goes
 // through a temp file so an interrupted save cannot truncate the original.
 func patchGlobal(name, key string, value any) error {
+	return patchGlobalMap(name, map[string]any{key: value}, false)
+}
+
+// patchGlobalMap applies a set of keys to one global config file. When
+// deleteNil is true, nil values remove the key instead of storing null.
+func patchGlobalMap(name string, patch map[string]any, deleteNil bool) error {
 	patchMu.Lock()
 	defer patchMu.Unlock()
 	dir := GlobalDir()
@@ -56,8 +74,8 @@ func patchGlobal(name, key string, value any) error {
 	// every comment the user wrote. Refuse instead of destroying their file.
 	path := filepath.Join(dir, name)
 	if jsonc := path + "c"; firstExisting(jsonc) != "" {
-		return fmt.Errorf("%s exists and takes precedence; edit %q by hand to change %q",
-			filepath.Base(jsonc), jsonc, key)
+		return fmt.Errorf("%s exists and takes precedence; edit %q by hand to change config",
+			filepath.Base(jsonc), jsonc)
 	}
 
 	doc := map[string]any{}
@@ -68,7 +86,13 @@ func patchGlobal(name, key string, value any) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	doc[key] = value
+	for key, value := range patch {
+		if deleteNil && value == nil {
+			delete(doc, key)
+		} else {
+			doc[key] = value
+		}
+	}
 
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

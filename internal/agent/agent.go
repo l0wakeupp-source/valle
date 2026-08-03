@@ -213,7 +213,8 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		}
 
 		ch := make(chan provider.Event, 256)
-		go r.cfg.Provider.Stream(ctx, req, ch)
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		go r.cfg.Provider.Stream(streamCtx, req, ch)
 
 		var (
 			textBuf    strings.Builder
@@ -224,17 +225,20 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			streamDone bool
 		)
 
+	streamEvents:
 		for ev := range ch {
 			switch ev.Kind {
 			case provider.EventText:
 				textBuf.WriteString(ev.Text)
 				if !emit(Event{Kind: EvText, Text: ev.Text}) {
+					cancelStream()
 					go drain(ch)
 					return appended, ctx.Err()
 				}
 			case provider.EventThinking:
 				thinkBuf.WriteString(ev.Text)
 				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
+					cancelStream()
 					go drain(ch)
 					return appended, ctx.Err()
 				}
@@ -255,6 +259,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 								if ok, _ := goal.CheckBudget(g2); !ok {
 									budgetErr := fmt.Errorf("goal token budget exhausted")
 									emit(Event{Kind: EvError, Err: budgetErr})
+									cancelStream()
 									drain(ch)
 									return appended, budgetErr
 								}
@@ -265,10 +270,16 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			case provider.EventDone:
 				streamDone = true
 				stopReason = ev.StopReason
+				break streamEvents
 			case provider.EventError:
+				if ev.Err == nil {
+					ev.Err = fmt.Errorf("provider returned an unspecified error")
+				}
 				streamErr = ev.Err
+				break streamEvents
 			}
 		}
+		cancelStream()
 
 		if streamErr != nil {
 			// Check for rate-limit / quota errors and rotate keys if configured.

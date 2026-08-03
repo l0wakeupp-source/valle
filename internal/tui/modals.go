@@ -402,6 +402,7 @@ func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
 	if m.running || m.agentCh != nil {
 		m.interrupt()
 	}
+	m.cancelCompaction()
 	m.compactionRunID++
 	m.compactionActive = false
 	m.autoCompactPending = false
@@ -434,6 +435,7 @@ func (m *Model) doResume(id string) {
 	if m.running || m.agentCh != nil {
 		m.interrupt()
 	}
+	m.cancelCompaction()
 	m.compactionRunID++
 	m.compactionActive = false
 	m.autoCompactPending = false
@@ -605,6 +607,7 @@ func (m *Model) cmdRedo() (tea.Model, tea.Cmd) {
 
 const autoCompactCooldown = 2 * time.Minute
 const compactionMaxTokens = 2048
+const compactionTimeout = 120 * time.Second
 
 func addProviderUsage(total *provider.Usage, delta provider.Usage) {
 	total.InputTokens += delta.InputTokens
@@ -650,6 +653,21 @@ func compactionTokenLimit(configured int) int {
 	return compactionMaxTokens
 }
 
+// cancelCompaction invalidates the current compaction and stops its provider
+// request. The run ID prevents a late command result from changing a new
+// session's history or re-enabling the wrong state.
+func (m *Model) cancelCompaction() {
+	if m.compactionCancel != nil {
+		m.compactionCancel()
+		m.compactionCancel = nil
+	}
+	if m.compactionActive {
+		m.compactionRunID++
+		m.compactionActive = false
+	}
+	m.autoCompactPending = false
+}
+
 func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	if m.running {
 		m.setStatus("cannot compact while working")
@@ -689,9 +707,10 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	m.compactionActive = true
 	m.compactionRunID++
 	runID := m.compactionRunID
+	ctx, cancel := context.WithTimeout(context.Background(), compactionTimeout)
+	m.compactionCancel = cancel
 
 	return m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		req := provider.Request{
@@ -707,7 +726,20 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 			sb    strings.Builder
 			usage provider.Usage
 		)
-		for ev := range ch {
+		for {
+			var ev provider.Event
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return compactDoneMsg{runID: runID, err: ctx.Err(), modelID: modelID, usage: usage}
+			case ev, ok = <-ch:
+				if !ok {
+					return compactDoneMsg{
+						runID: runID, err: fmt.Errorf("compaction provider stream ended without a completion event"),
+						modelID: modelID, usage: usage,
+					}
+				}
+			}
 			switch ev.Kind {
 			case provider.EventText:
 				sb.WriteString(ev.Text)
@@ -716,10 +748,14 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 					addProviderUsage(&usage, *ev.Usage)
 				}
 			case provider.EventError:
+				if ev.Err == nil {
+					ev.Err = fmt.Errorf("compaction provider returned an unspecified error")
+				}
 				return compactDoneMsg{runID: runID, err: ev.Err, modelID: modelID, usage: usage}
+			case provider.EventDone:
+				return compactDoneMsg{runID: runID, summary: sb.String(), tail: tail, modelID: modelID, usage: usage}
 			}
 		}
-		return compactDoneMsg{runID: runID, summary: sb.String(), tail: tail, modelID: modelID, usage: usage}
 	}
 }
 

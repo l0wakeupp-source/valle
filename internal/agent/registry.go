@@ -63,17 +63,17 @@ type AgentEntry struct {
 
 // AgentSnapshot is a race-free, presentation-friendly copy of an entry.
 type AgentSnapshot struct {
-	ID          string
-	Name        string
-	ParentID    string
-	Depth       int
-	Status      AgentStatus
-	Started     time.Time
-	Finished    time.Time
-	Description string
-	Output      string
-	Err         error
-	Children    []string
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	ParentID    string      `json:"parent_id,omitempty"`
+	Depth       int         `json:"depth"`
+	Status      AgentStatus `json:"status"`
+	Started     time.Time   `json:"started,omitempty"`
+	Finished    time.Time   `json:"finished,omitempty"`
+	Description string      `json:"description,omitempty"`
+	Output      string      `json:"output,omitempty"`
+	Err         error       `json:"error,omitempty"`
+	Children    []string    `json:"children,omitempty"`
 }
 
 func (e *AgentEntry) snapshot() AgentSnapshot {

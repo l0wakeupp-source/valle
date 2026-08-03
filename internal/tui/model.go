@@ -150,6 +150,7 @@ type Model struct {
 	autoCompactPending bool
 	compactionActive   bool
 	compactionRunID    uint64
+	compactionCancel   context.CancelFunc
 	quitting           bool
 
 	// provider auth flow
@@ -785,6 +786,10 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.compactionActive = false
+		if m.compactionCancel != nil {
+			m.compactionCancel()
+			m.compactionCancel = nil
+		}
 		m.billed.Input += msg.usage.InputTokens
 		m.billed.Output += msg.usage.OutputTokens
 		m.billed.CacheRead += msg.usage.CacheReadTokens
