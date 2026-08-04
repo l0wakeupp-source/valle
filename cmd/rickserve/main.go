@@ -12,6 +12,7 @@
 //	{"type":"interrupt","session_id":"abc"}
 //	{"type":"sessions","cwd":"/proj"}
 //	{"type":"models"}
+//	{"type":"tools"}
 //	{"type":"config","cwd":"/proj"}
 //	{"type":"snapshot","action":"list","cwd":"/proj"}              // list | can | undo | redo
 //	{"type":"goal","action":"list"}                                  // list | create | update | step | abort | delete | set_active | active
@@ -69,6 +70,7 @@ import (
 	"rick/internal/provider/openai"
 	"rick/internal/sandbox"
 	"rick/internal/session"
+	"rick/internal/swarm"
 	"rick/internal/tools"
 	"rick/internal/usage"
 )
@@ -279,7 +281,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.7"
+var rickVersion = "0.1.8"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -570,6 +572,8 @@ func (s *server) dispatch(ctx context.Context, req Request, out *writer) {
 		s.handleSessions(req, out)
 	case "models":
 		s.handleModels(out)
+	case "tools":
+		s.handleTools(out)
 	case "config":
 		s.handleConfig(req, out)
 	case "snapshot":
@@ -692,10 +696,16 @@ func (s *server) modelsForProvider(name string, p provider.Provider) []provider.
 		if strings.TrimSpace(id) == "" {
 			continue
 		}
+		// Provider-specific deployments override the API-reported window so
+		// the daemon advertises exactly what the TUI model list shows.
+		contextWindow := cred.ContextWindows[id]
+		if override, ok := provider.ProviderContextWindow(name, id); ok {
+			contextWindow = override
+		}
 		advertised = append(advertised, provider.ModelInfo{
 			ID:             id,
 			Name:           id,
-			ContextWindow:  cred.ContextWindows[id],
+			ContextWindow:  contextWindow,
 			SupportsImages: vision[id],
 		})
 	}
@@ -1646,9 +1656,10 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		}
 	}
 
-	// Build system prompt.
-	stableSystem := agent.BuildPrompt + agent.ProjectContext(s.loaded.ProjectRoot, nil)
-	system := stableSystem + agent.Environment(cwd, model, agentName, "")
+	// Build system prompt. The instruction globs and the model id must match
+	// the TUI so the injected markdown is byte-identical in both frontends.
+	stableSystem := agent.BuildPrompt + agent.ProjectContext(s.loaded.ProjectRoot, s.loaded.Config.Instructions)
+	system := stableSystem + agent.Environment(cwd, modelID, agentName, "")
 
 	// Snapshotter for undo support, shared per project so undo/redo survives
 	// across runs. Created lazily; disabled when git is missing.
@@ -1734,7 +1745,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		System:       system,
 		SystemStable: stableSystem,
 		MaxTokens:    s.loaded.Config.MaxTokens,
-		Tools:        s.tools,
+		Tools:        s.sessionTools(sid, cwd, model, ask, perms, reg, out),
 		Perms:        perms,
 		Ask:          ask,
 		Cwd:          cwd,
@@ -1765,38 +1776,6 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 
 	for ev := range ch {
 		switch ev.Kind {
-		case agent.EvText:
-			out.emit(Response{Type: "event", SessionID: sid, Event: "Content",
-				Data: mustJSON(map[string]string{"text": ev.Text})})
-
-		case agent.EvThinking:
-			out.emit(Response{Type: "event", SessionID: sid, Event: "Thinking",
-				Data: mustJSON(map[string]string{"text": ev.Text})})
-
-		case agent.EvToolStart:
-			if ev.Tool == nil {
-				break
-			}
-			out.emit(Response{Type: "event", SessionID: sid, Event: "ToolUse",
-				Data: mustJSON(map[string]any{
-					"name":  ev.Tool.Name,
-					"title": ev.Tool.Title,
-					"input": json.RawMessage(orNull(ev.Tool.Input)),
-				})})
-
-		case agent.EvToolEnd:
-			if ev.Tool == nil {
-				break
-			}
-			out.emit(Response{Type: "event", SessionID: sid, Event: "ToolResult",
-				Data: mustJSON(map[string]any{
-					"name":     ev.Tool.Name,
-					"title":    ev.Tool.Title,
-					"output":   truncate(ev.Tool.Output, 4000),
-					"is_error": ev.Tool.IsError,
-					"elapsed":  ev.Tool.Elapsed.Round(time.Millisecond).String(),
-				})})
-
 		case agent.EvUsage:
 			if ev.Usage == nil {
 				break
@@ -1821,14 +1800,11 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		case agent.EvPermissionAsk:
 			// Handled by the ask callback — no separate event needed.
 
-		case agent.EvError:
-			if ev.Err != nil {
-				out.emit(Response{Type: "event", SessionID: sid, Event: "Error",
-					Data: mustJSON(map[string]string{"error": ev.Err.Error()})})
-			}
-
 		case agent.EvDone:
 			// Loop will end when ch closes.
+
+		default:
+			emitAgentEvent(out, sid, ev)
 		}
 	}
 
@@ -1873,6 +1849,308 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		}
 	}
 	out.emit(Response{Type: "done", SessionID: sid})
+}
+
+// ---------- delegation tools ----------
+
+// sessionTools returns a per-session registry that layers the delegation
+// tools (subagent spawn plus swarm/chat/steer/report) on top of the daemon-wide
+// tool set, so rickserve exposes the same tools the TUI gives its primary
+// agent. The registry is per-session because the spawn closure and the agent
+// registry are session-bound.
+func (s *server) sessionTools(sid, cwd, model string, ask agent.PermissionAsker, perms *permission.Engine, reg *agent.Registry, out *writer) *tools.Registry {
+	rt := tools.NewRegistry()
+	for _, name := range s.tools.Names() {
+		if t, ok := s.tools.Get(name); ok {
+			rt.Register(t)
+		}
+	}
+
+	specs := s.subagentSpecs()
+	maxDepth := 1
+	if d := s.loaded.Config.SubagentDepth; d != nil && *d > 0 {
+		maxDepth = *d
+	}
+	spawn := s.spawnSubagent(sid, cwd, ask, perms, reg, out, rt, specs, maxDepth)
+	rt.Register(agent.TaskTool{Specs: specs, MaxDepth: maxDepth, Spawn: spawn})
+	rt.Register(agent.ParallelTaskTool{Specs: specs, MaxDepth: maxDepth, Spawn: spawn})
+	// Headless swarm support: the TUI registers the swarm tool only when a
+	// UI swarm manager exists; rickserve runs the same team machinery through
+	// RunTaskTeam so desktop sessions can spawn collaborative agent teams.
+	rt.Register(agent.SwarmTool{Manager: s.spawnSwarm(sid, cwd, model, ask, perms, out, rt)})
+	if reg != nil {
+		rt.Register(agent.ChatTool{Registry: reg})
+		rt.Register(agent.SteerTool{Registry: reg})
+		rt.Register(agent.ReportTool{Registry: reg})
+	}
+	return rt
+}
+
+// subagentSpecs merges the built-in subagent types with config-defined
+// subagents, exactly like the TUI's registerTaskTool.
+func (s *server) subagentSpecs() map[string]agent.SubagentSpec {
+	specs := agent.BuiltinSubagents()
+	for name, a := range s.loaded.Config.Agents {
+		if a.Mode != "subagent" && a.Mode != "all" {
+			continue
+		}
+		spec := agent.SubagentSpec{
+			Name:        name,
+			Description: a.Description,
+			Prompt:      a.Prompt,
+			Model:       a.Model,
+		}
+		if spec.Description == "" {
+			spec.Description = "Custom subagent defined in config."
+		}
+		if spec.Prompt == "" {
+			spec.Prompt = agent.GeneralSubagentPrompt
+		}
+		specs[name] = spec
+	}
+	return specs
+}
+
+// spawnSubagent runs one subagent with the same provider, permission engine,
+// plugin set and event stream as the parent run, mirroring the TUI's
+// foreground delegation path.
+func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms *permission.Engine, reg *agent.Registry, out *writer, sessionTools *tools.Registry, specs map[string]agent.SubagentSpec, maxDepth int) func(context.Context, string, string, string, int) (string, error) {
+	return func(ctx context.Context, kind, description, prompt string, depth int) (string, error) {
+		if depth > maxDepth || depth > agent.MaxAllowedDepth {
+			return "", fmt.Errorf("subagent depth %d exceeds configured limit %d", depth, maxDepth)
+		}
+		spec, ok := specs[kind]
+		if !ok {
+			return "", fmt.Errorf("unknown subagent type %q", kind)
+		}
+		modelRef := spec.Model
+		if modelRef == "" {
+			modelRef = s.loaded.Config.Model
+		}
+		provID, modelID := config.SplitModel(modelRef)
+		prov, ok := s.provs[provID]
+		if !ok {
+			return "", fmt.Errorf("subagent: unknown provider %q", provID)
+		}
+
+		subPerms := agent.SubagentPermissions(spec, perms, s.loaded.ProjectRoot)
+		stableSys := spec.Prompt + agent.ProjectContext(s.loaded.ProjectRoot, s.loaded.Config.Instructions)
+		sys := stableSys + agent.Environment(cwd, modelID, kind, "")
+		toolSpec := spec
+		if perms != nil && perms.Yolo() {
+			toolSpec.ReadOnly = false
+		}
+
+		out.emit(Response{Type: "event", SessionID: sid, Event: "SubagentStart",
+			Data: mustJSON(map[string]string{"kind": kind, "description": description})})
+		toolCount := 0
+		result, runErr := agent.RunSubagent(ctx, agent.Config{
+			Provider:     prov,
+			Model:        modelID,
+			System:       sys,
+			SystemStable: stableSys,
+			MaxTokens:    s.loaded.Config.MaxTokens,
+			Tools:        sessionTools,
+			ToolFilter:   agent.SubagentToolFilter(toolSpec, nil),
+			Perms:        subPerms,
+			Ask:          ask,
+			Cwd:          cwd,
+			SessionID:    sid,
+			AgentName:    kind,
+			Depth:        depth,
+			MaxTurns:     30,
+			Plugins:      s.plugins,
+			Parallel:     true,
+			Registry:     reg,
+		}, prompt, func(ev agent.Event) {
+			if ev.Kind == agent.EvUsage && ev.Usage != nil && s.usage != nil {
+				_ = s.usage.Record(modelRef, ev.Usage.InputTokens, ev.Usage.OutputTokens,
+					ev.Usage.CacheReadTokens, ev.Usage.CacheWriteTokens)
+			}
+			if ev.Kind == agent.EvToolEnd {
+				toolCount++
+			}
+			emitAgentEvent(out, sid, ev)
+		})
+		out.emit(Response{Type: "event", SessionID: sid, Event: "SubagentDone",
+			Data: mustJSON(map[string]any{"kind": kind, "description": description, "tools": toolCount})})
+		return result, runErr
+	}
+}
+
+// spawnSwarm runs a swarm headlessly through the same worker machinery as the
+// TUI: one agent.Runner per teammate, a shared task board, and RunTaskTeam for
+// dependency-aware scheduling. Worker activity streams to the client like
+// subagent output so the desktop transcript shows the team's work.
+func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, perms *permission.Engine, out *writer, sessionTools *tools.Registry) func(context.Context, string, string, []agent.SwarmAgentSpec, swarm.Topology) (string, error) {
+	return func(ctx context.Context, name, goal string, specs []agent.SwarmAgentSpec, topo swarm.Topology) (string, error) {
+		if len(specs) < 2 {
+			return "", fmt.Errorf("at least 2 agents are required for a swarm (got %d)", len(specs))
+		}
+		prov, modelID, err := s.resolveProvider(model)
+		if err != nil {
+			return "", err
+		}
+		team := swarm.NewSwarmContext(ctx, "swarm-"+session.NewID(), name, goal, topo)
+		for _, spec := range specs {
+			team.AddAgent(spec.Name, spec.Role)
+		}
+		if topo == swarm.TopologyStar && len(specs) > 0 {
+			team.Primary = specs[0].Name
+		}
+		taskSpecs := make([]swarm.TaskSpec, 0, len(specs))
+		for _, spec := range specs {
+			taskID := spec.TaskID
+			if taskID == "" {
+				taskID = spec.Name
+			}
+			subject := spec.Subject
+			if subject == "" {
+				subject = spec.Role
+			}
+			if subject == "" {
+				subject = "Complete assigned team work"
+			}
+			taskSpecs = append(taskSpecs, swarm.TaskSpec{ID: taskID, Subject: subject, Description: spec.Role, Owner: spec.Name, DependsOn: spec.DependsOn})
+		}
+		if err := team.Tasks.AddBatch(taskSpecs); err != nil {
+			return "", err
+		}
+
+		jobs := make([]swarm.TeamJob, 0, len(specs))
+		for _, spec := range specs {
+			var allowedTools []string
+			if strings.TrimSpace(spec.Tools) != "" {
+				allowedTools = strings.FieldsFunc(spec.Tools, func(r rune) bool {
+					return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+				})
+			}
+			workerTools := tools.NewFilteredSwarmRegistry(sessionTools, nil, allowedTools...)
+			workerTools.Register(agent.TeamTool{Swarm: team})
+			system := "You are an independent teammate reporting to the lead agent. Use the team tool to confirm your assigned task, inspect messages, share only useful findings, and complete or fail the task explicitly. Do not delegate or spawn agents. Return ONLY factual findings—no narration, no 'I'll research', and no 'Let me dig deeper'. Output clean, complete results with sources when applicable."
+			cfg := agent.Config{
+				Provider:  prov,
+				Model:     modelID,
+				System:    system,
+				MaxTokens: s.loaded.Config.MaxTokens,
+				Tools:     workerTools,
+				Perms:     perms,
+				Ask:       ask,
+				Cwd:       cwd,
+				SessionID: sid,
+				AgentName: spec.Name,
+				Depth:     1,
+				MaxTurns:  30,
+				Plugins:   s.plugins,
+				Parallel:  true,
+			}
+			taskID := spec.TaskID
+			if taskID == "" {
+				taskID = spec.Name
+			}
+			prompt := fmt.Sprintf("Team goal: %s\n\nYour identity: %s\nYour task ID: %s\nYour assignment: %s\n\nYour task is already claimed for you. Do not claim it again; coordinate through team messages, and finish with complete_task or fail_task.", goal, spec.Name, taskID, spec.Role)
+			jobs = append(jobs, swarm.TeamJob{Name: spec.Name, TaskID: taskID, Runner: agent.NewAgentRunner(cfg, prompt)})
+		}
+
+		out.emit(Response{Type: "event", SessionID: sid, Event: "SwarmStart",
+			Data: mustJSON(map[string]any{"name": name, "goal": goal, "agents": len(specs)})})
+		results := swarm.RunTaskTeam(ctx, jobs, team.Tasks, 4, func(ev swarm.RuntimeEvent) {
+			if aev, ok := ev.Value.(agent.Event); ok {
+				if aev.Kind == agent.EvUsage && aev.Usage != nil && s.usage != nil {
+					_ = s.usage.Record(model, aev.Usage.InputTokens, aev.Usage.OutputTokens,
+						aev.Usage.CacheReadTokens, aev.Usage.CacheWriteTokens)
+					return
+				}
+				emitAgentEvent(out, sid, aev)
+			}
+		})
+		var b strings.Builder
+		fmt.Fprintf(&b, "Swarm %q completed. Goal: %s\n", name, goal)
+		for _, result := range results {
+			if result.Err != nil {
+				fmt.Fprintf(&b, "[%s] failed: %v\n", result.Name, result.Err)
+			} else {
+				fmt.Fprintf(&b, "[%s] %s\n", result.Name, result.Output)
+			}
+		}
+		return strings.TrimRight(b.String(), "\n"), nil
+	}
+}
+
+// emitAgentEvent streams a non-usage agent event to the client in the exact
+// shape the main run loop uses, so subagent activity renders identically.
+func emitAgentEvent(out *writer, sid string, ev agent.Event) {
+	switch ev.Kind {
+	case agent.EvText:
+		out.emit(Response{Type: "event", SessionID: sid, Event: "Content",
+			Data: mustJSON(map[string]string{"text": ev.Text})})
+
+	case agent.EvThinking:
+		out.emit(Response{Type: "event", SessionID: sid, Event: "Thinking",
+			Data: mustJSON(map[string]string{"text": ev.Text})})
+
+	case agent.EvToolStart:
+		if ev.Tool == nil {
+			return
+		}
+		out.emit(Response{Type: "event", SessionID: sid, Event: "ToolUse",
+			Data: mustJSON(map[string]any{
+				"name":  ev.Tool.Name,
+				"title": ev.Tool.Title,
+				"input": json.RawMessage(orNull(ev.Tool.Input)),
+			})})
+
+	case agent.EvToolEnd:
+		if ev.Tool == nil {
+			return
+		}
+		out.emit(Response{Type: "event", SessionID: sid, Event: "ToolResult",
+			Data: mustJSON(map[string]any{
+				"name":     ev.Tool.Name,
+				"title":    ev.Tool.Title,
+				"output":   truncate(ev.Tool.Output, 4000),
+				"is_error": ev.Tool.IsError,
+				"elapsed":  ev.Tool.Elapsed.Round(time.Millisecond).String(),
+			})})
+
+	case agent.EvError:
+		if ev.Err != nil {
+			out.emit(Response{Type: "event", SessionID: sid, Event: "Error",
+				Data: mustJSON(map[string]string{"error": ev.Err.Error()})})
+		}
+	}
+}
+
+// ---------- tools ----------
+
+// handleTools reports the exact tool set exposed to the agent loop, so
+// clients can mirror the TUI's tool inventory 1:1. The session-bound
+// delegation tools are listed alongside the daemon-wide registry.
+func (s *server) handleTools(out *writer) {
+	entries := make([]map[string]any, 0, 24)
+	for _, schema := range s.tools.Schemas(nil) {
+		entries = append(entries, map[string]any{
+			"name":        schema.Name,
+			"description": schema.Description,
+		})
+	}
+	reg := agent.NewRegistry(agent.MaxAllowedDepth, 1)
+	maxDepth := 1
+	if d := s.loaded.Config.SubagentDepth; d != nil && *d > 0 {
+		maxDepth = *d
+	}
+	specs := s.subagentSpecs()
+	for _, tool := range []tools.Tool{
+		agent.TaskTool{Specs: specs, MaxDepth: maxDepth},
+		agent.ParallelTaskTool{Specs: specs, MaxDepth: maxDepth},
+		agent.SwarmTool{},
+		agent.ChatTool{Registry: reg},
+		agent.SteerTool{Registry: reg},
+		agent.ReportTool{Registry: reg},
+	} {
+		entries = append(entries, map[string]any{"name": tool.Name(), "description": tool.Description()})
+	}
+	out.emit(Response{Type: "tools", Data: mustJSON(entries)})
 }
 
 // ---------- helpers ----------
