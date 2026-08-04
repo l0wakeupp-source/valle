@@ -258,6 +258,15 @@
       "description": "Warn and offer compaction as the context window fills.",
       "default": true
     },
+    "distill_enabled": {
+      "type": "boolean",
+      "description": "Replace the oldest stable chat prefix with a distilled summary as the context window fills.",
+      "default": false
+    },
+    "distill_model": {
+      "type": "string",
+      "description": "Cheap model used for the background distillation summary. Falls back to small_model, then model."
+    },
     "subagent_depth": {
       "type": "integer",
       "description": "How many levels of subagent spawning are permitted.",

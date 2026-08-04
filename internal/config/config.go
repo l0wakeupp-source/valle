@@ -190,19 +190,39 @@ type Config struct {
 	Profiles map[string]Permission `json:"permission_profile,omitempty"`
 	// Sandbox is the global command-confinement policy. A permission block
 	// or agent may override it.
-	Sandbox          *SandboxConfig       `json:"sandbox,omitempty"`
-	Tools            map[string]bool      `json:"tools,omitempty"`
-	Agents           map[string]Agent     `json:"agent,omitempty"`
-	MCP              map[string]MCPServer `json:"mcp,omitempty"`
-	Commands         map[string]Command   `json:"command,omitempty"`
-	Instructions     []string             `json:"instructions,omitempty"`
-	AutoCompact      *bool                `json:"autocompact,omitempty"`
-	ContextReserve   int                  `json:"context_reserve,omitempty"`
-	SubagentDepth    *int                 `json:"subagent_depth,omitempty"`
-	BackgroundNotify bool                 `json:"background_notify,omitempty"`
-	MaxBackground    int                  `json:"max_background,omitempty"`
-	Plugins          []string             `json:"plugin,omitempty"`
-	WebSearch        *WebSearchConfig     `json:"web_search,omitempty"`
+	Sandbox        *SandboxConfig       `json:"sandbox,omitempty"`
+	Tools          map[string]bool      `json:"tools,omitempty"`
+	Agents         map[string]Agent     `json:"agent,omitempty"`
+	MCP            map[string]MCPServer `json:"mcp,omitempty"`
+	Commands       map[string]Command   `json:"command,omitempty"`
+	Instructions   []string             `json:"instructions,omitempty"`
+	AutoCompact    *bool                `json:"autocompact,omitempty"`
+	ContextReserve int                  `json:"context_reserve,omitempty"`
+	// DistillEnabled turns on state distillation: when the transcript
+	// approaches the context budget, the oldest stable prefix is replaced by
+	// a structured summary placed after the cache breakpoint. Requires an
+	// extra provider round-trip, so it defaults to off.
+	DistillEnabled *bool `json:"distill_enabled,omitempty"`
+	// DistillModel is the fast model used for the background summary call.
+	// Empty falls back to the primary model.
+	DistillModel     string           `json:"distill_model,omitempty"`
+	SubagentDepth    *int             `json:"subagent_depth,omitempty"`
+	BackgroundNotify bool             `json:"background_notify,omitempty"`
+	MaxBackground    int              `json:"max_background,omitempty"`
+	Plugins          []string         `json:"plugin,omitempty"`
+	WebSearch        *WebSearchConfig `json:"web_search,omitempty"`
+}
+
+// DistillModelFor returns the model used for the background distillation
+// summary: the explicit distill_model, else small_model, else the main model.
+func (c *Config) DistillModelFor() string {
+	if c.DistillModel != "" {
+		return c.DistillModel
+	}
+	if c.SmallModel != "" {
+		return c.SmallModel
+	}
+	return c.Model
 }
 
 // Keybinds is the tui.json keybind block.
