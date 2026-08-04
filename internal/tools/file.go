@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"rick/internal/delta"
+	"rick/pkg/skeleton"
 )
 
 // ---------- shared file-state tracking ----------
@@ -28,9 +31,17 @@ var fileState struct {
 
 var fileWriteMu sync.Mutex
 
+// deltaStore is the shared per-session delta baseline store for ReadTool. It
+// is reset whenever read tracking is reset so a new session never emits a
+// delta against a stale baseline.
+var deltaStore = delta.NewStore()
+
 const maxEditDiffBytes = 24 << 10
 
 func init() { fileState.readAt = map[string]int64{} }
+
+// DeltaStore returns the shared delta baseline store used by ReadTool.
+func DeltaStore() *delta.Store { return deltaStore }
 
 func markRead(path string) {
 	if st, err := os.Stat(path); err == nil {
@@ -51,11 +62,12 @@ func wasRead(path string) bool {
 	return ok && readAt == st.ModTime().UnixNano()
 }
 
-// ResetFileState clears read tracking (new session).
+// ResetFileState clears read tracking and delta baselines (new session).
 func ResetFileState() {
 	fileState.Lock()
 	fileState.readAt = map[string]int64{}
 	fileState.Unlock()
+	deltaStore.Reset()
 }
 
 func resolvePath(cwd, p string) string {
@@ -102,10 +114,15 @@ func bytesIndexZero(b []byte) bool {
 
 // ---------- read ----------
 
-// ReadTool reads a file with line numbers and pagination.
+// ReadTool reads a file with line numbers and pagination. When Delta is set,
+// repeat reads of a changed file return a token-level delta view instead of
+// the whole file. When EnableSkeleton is set and a target symbol is named on
+// a whole-file read, the AST skeleton with that one body expanded is returned.
 type ReadTool struct {
-	MaxBytes      int
-	MaxInputBytes int
+	MaxBytes       int
+	MaxInputBytes  int
+	Delta          *delta.Store
+	EnableSkeleton bool
 }
 
 // Name implements Tool.
@@ -118,7 +135,9 @@ func (ReadTool) ReadOnly() bool { return true }
 func (ReadTool) Description() string {
 	return "Read a file from the filesystem. Returns contents with 1-indexed line numbers " +
 		"in the form 'N|line'. Use offset/limit for large files. Always read a file " +
-		"before editing it. Prefer this over 'cat' via bash."
+		"before editing it. Prefer this over 'cat' via bash. Pass target to get an " +
+		"AST skeleton with only that symbol expanded, or full:true to force the " +
+		"complete file (repeat reads of changed files return a delta view)."
 }
 
 // Schema implements Tool.
@@ -127,6 +146,9 @@ func (ReadTool) Schema() map[string]any {
 		"path":   strProp("File path (absolute, or relative to the project root)."),
 		"offset": numProp("1-indexed line to start from. Default 1."),
 		"limit":  numProp("Maximum number of lines to read. Default 2000."),
+		"target": strProp("Optional symbol name: return an AST skeleton with signatures of " +
+			"every top-level declaration but only the named symbol's body expanded."),
+		"full": boolProp("Force the complete file, bypassing skeleton and delta views."),
 	}, "path")
 }
 
@@ -134,6 +156,8 @@ type readArgs struct {
 	Path   string `json:"path"`
 	Offset int    `json:"offset"`
 	Limit  int    `json:"limit"`
+	Target string `json:"target"`
+	Full   bool   `json:"full"`
 }
 
 // Run implements Tool.
@@ -185,6 +209,36 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 	prefix = prefix[:prefixBytes]
 	if isBinary(prefix) {
 		return Errf("%s appears to be a binary file (%d bytes)", relTo(tc.Cwd, p), st.Size()), nil
+	}
+
+	// Whole-file reads (no explicit pagination) can be served more cheaply: an
+	// AST skeleton by default (all bodies collapsed; a named target keeps only
+	// that body expanded), or a delta view when the file changed since the
+	// model last saw it. full:true always bypasses both.
+	if !a.Full && a.Offset < 1 && a.Limit <= 0 {
+		if t.EnableSkeleton {
+			if skel, err := skeleton.Skeleton(p, a.Target); err == nil {
+				markRead(p)
+				return Result{
+					Output: skel,
+					Title:  fmt.Sprintf("%s (skeleton)", relTo(tc.Cwd, p)),
+					Meta:   map[string]any{"path": p, "skeleton": true},
+				}, nil
+			}
+			// Parse failures fall through to the plain read.
+		}
+		if t.Delta != nil {
+			if content, err := os.ReadFile(p); err == nil {
+				if view, isDelta := t.Delta.Deliver(p, string(content), maxBytes); isDelta {
+					markRead(p)
+					return Result{
+						Output: view,
+						Title:  fmt.Sprintf("%s (delta)", relTo(tc.Cwd, p)),
+						Meta:   map[string]any{"path": p, "delta": true},
+					}, nil
+				}
+			}
+		}
 	}
 
 	offset := a.Offset
