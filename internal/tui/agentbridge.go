@@ -203,6 +203,10 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 					return nil, false
 				}
 			}
+			if ev.Tool.Optimization != nil {
+				stats := ev.Tool.Optimization
+				m.optimization.Add(stats.OriginalTokens, stats.CompressedTokens, stats.SavedTokens)
+			}
 			if m.toolOutputs == nil {
 				m.toolOutputs = make(map[string]string)
 			}
