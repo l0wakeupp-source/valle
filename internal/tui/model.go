@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -31,23 +32,27 @@ import (
 	"rick/internal/theme"
 	"rick/internal/tools"
 	"rick/internal/usage"
+	"rick/pkg/contextbudget"
 )
 
 // Deps is everything the TUI needs from the outside world.
 type Deps struct {
-	Loaded       *config.Loaded
-	Themes       *theme.Registry
-	ThemeDirs    *theme.Watcher
-	Registry     *tools.Registry
-	Todos        *tools.TodoStore
-	Perms        *permission.Engine
-	Sandbox      *sandbox.Holder
-	Store        *session.Store
-	Snapshots    *session.Snapshotter
-	Providers    map[string]provider.Provider
-	MCP          *mcp.Manager
-	Plugins      *plugin.Registry
-	Skills       []plugin.Skill
+	Loaded    *config.Loaded
+	Themes    *theme.Registry
+	ThemeDirs *theme.Watcher
+	Registry  *tools.Registry
+	Todos     *tools.TodoStore
+	Perms     *permission.Engine
+	Sandbox   *sandbox.Holder
+	Store     *session.Store
+	Snapshots *session.Snapshotter
+	Providers map[string]provider.Provider
+	MCP       *mcp.Manager
+	Plugins   *plugin.Registry
+	Skills    []plugin.Skill
+	// Budget is the shared session context manager: content-addressed dedup,
+	// cache boundaries, and reversible live-zone compression.
+	Budget       *contextbudget.Budget
 	SwarmManager *swarm.SwarmManager
 	Goals        *goal.Store
 	Agent        string
@@ -93,6 +98,11 @@ type Model struct {
 	agentName string
 	agentID   string
 	modelID   string
+
+	// repoMapOnce/repoMapBlock build the RepoMap once per session so every
+	// turn sends a byte-identical system suffix (provider cache stays warm).
+	repoMapOnce  sync.Once
+	repoMapBlock string
 
 	// streaming
 	running      bool

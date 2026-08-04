@@ -124,20 +124,23 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 	system := stableSystem + agent.Environment(opts.Cwd, opts.Model, opts.AgentName, "")
 
 	runner := agent.New(agent.Config{
-		Provider:     deps.Provider,
-		Model:        deps.ModelID,
-		System:       system,
-		SystemStable: stableSystem,
-		MaxTokens:    deps.Config.MaxTokens,
-		Tools:        deps.Tools,
-		Perms:        deps.Perms,
-		Ask:          ask,
-		Cwd:          opts.Cwd,
-		SessionID:    sessionID,
-		AgentName:    opts.AgentName,
-		MaxTurns:     opts.MaxTurns,
-		Plugins:      deps.Plugins,
-		Parallel:     true,
+		Provider:           deps.Provider,
+		Model:              deps.ModelID,
+		System:             system,
+		SystemStable:       stableSystem,
+		MaxTokens:          deps.Config.MaxTokens,
+		Tools:              deps.Tools,
+		Perms:              deps.Perms,
+		Ask:                ask,
+		Cwd:                opts.Cwd,
+		SessionID:          sessionID,
+		AgentName:          opts.AgentName,
+		MaxTurns:           opts.MaxTurns,
+		Plugins:            deps.Plugins,
+		Parallel:           true,
+		RepoMapRoot:        opts.ProjectRoot,
+		EnableDistillation: deps.Config.DistillEnabled != nil && *deps.Config.DistillEnabled,
+		DistillModel:       deps.Config.DistillModelFor(),
 	})
 
 	history := []provider.Message{provider.UserText(opts.Prompt)}

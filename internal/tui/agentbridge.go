@@ -15,6 +15,8 @@ import (
 	"rick/internal/plugin"
 	"rick/internal/provider"
 	"rick/internal/session"
+	"rick/internal/tokens"
+	"rick/pkg/repomap"
 )
 
 // startAgent kicks off a run and returns the drain command.
@@ -93,25 +95,30 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	stableSystem, systemPrompt := buildSystemPromptParts(agentName, modelID, cwd, projectRoot, cfg, skills, userText)
 	go func() {
 		runner := agent.New(agent.Config{
-			Provider:     prov,
-			Model:        modelID,
-			System:       systemPrompt,
-			SystemStable: stableSystem,
-			MaxTokens:    cfg.MaxTokens,
-			Reasoning:    reasoning,
-			Tools:        registry,
-			ToolFilter:   toolFilter,
-			Perms:        perms,
-			Ask:          ask,
-			Cwd:          cwd,
-			SessionID:    sessionID,
-			AgentName:    agentName,
-			AgentID:      agentID,
-			Registry:     m.deps.AgentRegistry,
-			Snapshotter:  snapshotter,
-			Plugins:      plugins,
-			Parallel:     true,
-			Goals:        m.deps.Goals,
+			Provider:           prov,
+			Model:              modelID,
+			System:             systemPrompt,
+			SystemStable:       stableSystem,
+			MaxTokens:          cfg.MaxTokens,
+			Reasoning:          reasoning,
+			Tools:              registry,
+			ToolFilter:         toolFilter,
+			Perms:              perms,
+			Ask:                ask,
+			Cwd:                cwd,
+			SessionID:          sessionID,
+			AgentName:          agentName,
+			AgentID:            agentID,
+			Registry:           m.deps.AgentRegistry,
+			Snapshotter:        snapshotter,
+			Plugins:            plugins,
+			Parallel:           true,
+			Goals:              m.deps.Goals,
+			Budget:             m.deps.Budget,
+			RepoMapRoot:        projectRoot,
+			RepoMapBlock:       m.sessionRepoMap(projectRoot, modelID),
+			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
+			DistillModel:       cfg.DistillModelFor(),
 		})
 		appended, _ := runner.Run(ctx, history, ch)
 		// Results are delivered through the channel; the appended slice is
@@ -573,6 +580,44 @@ func buildSystemPromptParts(agentName, modelID, cwd, projectRoot string, cfg con
 	}
 	volatile += agent.Environment(cwd, modelID, agentName, session.GitInfo(cwd))
 	return stable, stable + volatile
+}
+
+// sessionRepoMap returns the session-wide RepoMap block, computed once so
+// every turn of the session sends a byte-identical system suffix and the
+// provider prompt cache stays warm. The prompt weighting uses the first user
+// request.
+func (m *Model) sessionRepoMap(projectRoot, modelID string) string {
+	if projectRoot == "" {
+		return ""
+	}
+	m.repoMapOnce.Do(func() {
+		block, err := repomap.Build(repomap.Options{
+			Root:      projectRoot,
+			Prompt:    m.initialPrompt(),
+			MaxTokens: 0,
+			Encoding:  tokens.EncodingForModel(modelID),
+		})
+		if err == nil {
+			m.repoMapBlock = block
+		}
+	})
+	return m.repoMapBlock
+}
+
+// initialPrompt returns the first plain user text of the session, used to
+// weight the session-wide RepoMap.
+func (m *Model) initialPrompt() string {
+	for _, message := range m.history {
+		if message.Role != provider.RoleUser {
+			continue
+		}
+		for _, block := range message.Content {
+			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+				return block.Text
+			}
+		}
+	}
+	return ""
 }
 
 // toolFilter honours config tool enable/disable globs, plan-mode limits,
