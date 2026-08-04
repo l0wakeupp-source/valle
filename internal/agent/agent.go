@@ -15,13 +15,16 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
+	"rick/internal/budget"
+	"rick/internal/compress"
 	"rick/internal/config"
 	"rick/internal/goal"
+	"rick/internal/history"
 	"rick/internal/permission"
 	"rick/internal/plugin"
 	"rick/internal/provider"
+	"rick/internal/tokens"
 	"rick/internal/tools"
 )
 
@@ -46,14 +49,28 @@ const (
 
 // ToolEvent describes a tool execution.
 type ToolEvent struct {
-	CallID  string
-	Name    string
-	Title   string
-	Input   json.RawMessage
-	Output  string
-	Meta    map[string]any
-	IsError bool
-	Elapsed time.Duration
+	CallID       string
+	Name         string
+	Title        string
+	Input        json.RawMessage
+	Output       string
+	Meta         map[string]any
+	IsError      bool
+	Elapsed      time.Duration
+	Optimization *OptimizationStats
+}
+
+// OptimizationStats describes the provider-facing reduction for one tool
+// result. Original tool output remains in ToolEvent.Output unchanged.
+type OptimizationStats struct {
+	Stage            string
+	Fallback         bool
+	OriginalBytes    int
+	CompressedBytes  int
+	OriginalTokens   int
+	CompressedTokens int
+	SavedTokens      int
+	Truncated        bool
 }
 
 // Event is one item on the agent's output stream.
@@ -91,25 +108,30 @@ type Config struct {
 	System       string
 	SystemStable string
 	MaxTokens    int
-	Temperature  *float64
-	Reasoning    provider.ReasoningEffort
-	Tools        tools.ToolSet
-	ToolFilter   func(string) bool
-	Perms        *permission.Engine
-	Ask          PermissionAsker
-	Cwd          string
-	SandboxRoot  string
-	SessionID    string
-	AgentName    string
-	Depth        int
-	MaxTurns     int
-	Snapshotter  Snapshotter
-	Parallel     bool // allow concurrent read-only tools
-	Plugins      *plugin.Registry
-	Goals        *goal.Store
-	Creds        *config.Credentials // for key rotation on rate-limit
-	Registry     *Registry           // optional live hierarchy registry
-	AgentID      string              // registry ID for this run
+	// ContextWindow overrides provider/model discovery when positive. A zero
+	// value uses provider metadata and then the conservative budget fallback.
+	ContextWindow      int
+	SafetyMarginTokens int
+	TokenEncoding      tokens.Encoding
+	Temperature        *float64
+	Reasoning          provider.ReasoningEffort
+	Tools              tools.ToolSet
+	ToolFilter         func(string) bool
+	Perms              *permission.Engine
+	Ask                PermissionAsker
+	Cwd                string
+	SandboxRoot        string
+	SessionID          string
+	AgentName          string
+	Depth              int
+	MaxTurns           int
+	Snapshotter        Snapshotter
+	Parallel           bool // allow concurrent read-only tools
+	Plugins            *plugin.Registry
+	Goals              *goal.Store
+	Creds              *config.Credentials // for key rotation on rate-limit
+	Registry           *Registry           // optional live hierarchy registry
+	AgentID            string              // registry ID for this run
 }
 
 // Runner executes the loop.
@@ -201,16 +223,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			}
 		}
 
-		req := provider.Request{
-			Model:        r.cfg.Model,
-			System:       r.cfg.System,
-			SystemStable: r.cfg.SystemStable,
-			Messages:     msgs,
-			Tools:        schemas,
-			MaxTokens:    r.cfg.MaxTokens,
-			Temperature:  r.cfg.Temperature,
-			Reasoning:    r.cfg.Reasoning,
-		}
+		req := r.buildRequest(msgs, schemas)
 
 		ch := make(chan provider.Event, 256)
 		streamCtx, cancelStream := context.WithCancel(ctx)
@@ -530,6 +543,82 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 	return results
 }
 
+func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.ToolSchema) provider.Request {
+	encoding := r.cfg.TokenEncoding
+	if encoding == "" {
+		encoding = tokens.EncodingCl100kBase
+	}
+
+	contextWindow := r.cfg.ContextWindow
+	if contextWindow <= 0 && r.cfg.Provider != nil {
+		contextWindow = provider.KnownProviderContextWindow(r.cfg.Provider.Name(), r.cfg.Model)
+	}
+	reservedOutput := r.cfg.MaxTokens
+	if reservedOutput <= 0 {
+		reservedOutput = 4096
+	}
+
+	stableSystem := r.cfg.SystemStable
+	volatileSystem := r.cfg.System
+	if stableSystem != "" && strings.HasPrefix(volatileSystem, stableSystem) {
+		volatileSystem = strings.TrimPrefix(volatileSystem, stableSystem)
+	}
+	plan := budget.Plan(budget.Input{
+		ContextWindow:        contextWindow,
+		StableSystemTokens:   countTokens(stableSystem, encoding),
+		VolatileSystemTokens: countTokens(volatileSystem, encoding),
+		ToolSchemaTokens:     countJSONValues(schemas, encoding),
+		MessageTokens:        countMessages(messages, encoding),
+		ReservedOutputTokens: reservedOutput,
+		SafetyMarginTokens:   r.cfg.SafetyMarginTokens,
+	})
+
+	return provider.Request{
+		Model:        r.cfg.Model,
+		System:       r.cfg.System,
+		SystemStable: r.cfg.SystemStable,
+		Messages:     retainMessages(messages, plan.RetainedMessageTokens, encoding),
+		Tools:        schemas,
+		MaxTokens:    r.cfg.MaxTokens,
+		Temperature:  r.cfg.Temperature,
+		Reasoning:    r.cfg.Reasoning,
+	}
+}
+
+func countTokens(text string, encoding tokens.Encoding) int {
+	return tokens.Count(text, encoding).Count
+}
+
+func countJSONValues(value any, encoding tokens.Encoding) int {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return countTokens(fmt.Sprint(value), encoding)
+	}
+	return countTokens(string(encoded), encoding) + 4
+}
+
+func countMessages(messages []provider.Message, encoding tokens.Encoding) int {
+	total := 0
+	for _, message := range messages {
+		total += countJSONValues(message, encoding)
+	}
+	return total
+}
+
+func retainMessages(messages []provider.Message, maxTokens int, encoding tokens.Encoding) []provider.Message {
+	retained, _ := history.Retain(messages, maxTokens, encoding)
+	return retained
+}
+
+func containsBlock(message provider.Message, blockType string) bool {
+	for _, block := range message.Content {
+		if block.Type == blockType {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.ContentBlock, *ToolEvent) {
 	start := time.Now()
 	ev := &ToolEvent{CallID: call.ID, Name: call.Name, Input: call.Input, Title: call.Name}
@@ -649,24 +738,58 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		}
 	}
 
-	return provider.ToolResultBlock(call.ID, capModelToolOutput(ev.Output), ev.IsError), ev
+	modelOutput, stats := capModelToolOutputForCall(call, ev.Output, ev.IsError)
+	ev.Optimization = stats
+	return provider.ToolResultBlock(call.ID, modelOutput, ev.IsError), ev
 }
 
 const maxModelToolResultBytes = 32 << 10
 
 func capModelToolOutput(output string) string {
-	if len(output) <= maxModelToolResultBytes {
-		return output
+	compressed, _ := capModelToolOutputForCall(provider.ToolCall{Name: "unknown"}, output, false)
+	return compressed
+}
+
+func capModelToolOutputForCall(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
+	compressed := compress.ForTool(compress.Input{
+		Text:     output,
+		Command:  compressionCommand(call),
+		MaxBytes: maxModelToolResultBytes,
+		IsError:  isError,
+	})
+	modelOutput := strings.Replace(compressed.Text, "output truncated", "tool output truncated", 1)
+	encoding := tokens.EncodingCl100kBase
+	originalTokens := countTokens(output, encoding)
+	compressedTokens := countTokens(modelOutput, encoding)
+	return modelOutput, &OptimizationStats{
+		Stage:            compressed.Stage,
+		Fallback:         compressed.Fallback,
+		OriginalBytes:    compressed.OriginalBytes,
+		CompressedBytes:  len(modelOutput),
+		OriginalTokens:   originalTokens,
+		CompressedTokens: compressedTokens,
+		SavedTokens:      maxInt(0, originalTokens-compressedTokens),
+		Truncated:        compressed.Truncated,
 	}
-	suffix := fmt.Sprintf("\n… <tool output truncated; %d bytes omitted; narrow the next request to continue>", len(output)-maxModelToolResultBytes)
-	limit := maxModelToolResultBytes - len(suffix)
-	if limit < 1 {
-		return suffix[1:]
+}
+
+func compressionCommand(call provider.ToolCall) string {
+	if call.Name == "bash" {
+		var input struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(call.Input, &input) == nil && input.Command != "" {
+			return input.Command
+		}
 	}
-	for limit > 0 && !utf8.RuneStart(output[limit]) {
-		limit--
+	return call.Name
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
 	}
-	return output[:limit] + fmt.Sprintf("\n… <tool output truncated; %d bytes omitted; narrow the next request to continue>", len(output)-limit)
+	return right
 }
 
 func canonicalToolInput(input json.RawMessage) string {
