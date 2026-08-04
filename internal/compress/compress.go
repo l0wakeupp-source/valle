@@ -49,6 +49,11 @@ func ForTool(input Input) Result {
 	case isSearchCommand(command):
 		return finish(input, compactSearch(input.Text), "search")
 	default:
+		// Structured documents (JSON/YAML) are minified before the byte cap.
+		normalized := normalize(input.Text)
+		if compact, ok := Minify(normalized); ok && len(compact) < len(normalized) {
+			return finish(input, compact, "minify")
+		}
 		result := Generic(input)
 		result.Stage = "generic"
 		result.Fallback = true
