@@ -34,6 +34,7 @@ import (
 	"rick/internal/tools"
 	"rick/internal/tui"
 	"rick/internal/usage"
+	"rick/pkg/contextbudget"
 )
 
 var Version = "0.1.8"
@@ -51,6 +52,7 @@ func main() {
 		flagProfile     string
 		flagNoNetwork   bool
 		flagEnforcement string
+		flagTerse       bool
 	)
 
 	root := &cobra.Command{
@@ -70,7 +72,7 @@ func main() {
 				model: flagModel, agent: flagAgent, resume: flagResume, cont: flagContinue,
 				fresh: flagNew, prompt: flagPrompt, yolo: flagYolo,
 				sandbox: flagSandbox, profile: flagProfile,
-				noNetwork: flagNoNetwork, enforcement: flagEnforcement,
+				noNetwork: flagNoNetwork, enforcement: flagEnforcement, terse: flagTerse,
 			})
 		},
 	}
@@ -84,6 +86,8 @@ func main() {
 		"start a fresh session (now the default; kept for compatibility)")
 	root.Flags().StringVarP(&flagPrompt, "prompt", "p", "", "send an initial prompt on startup")
 	root.Flags().BoolVar(&flagYolo, "yolo", false, "skip all permission prompts (dangerous)")
+	root.Flags().BoolVar(&flagTerse, "terse", false,
+		"caveman mode: instruct the model to return zero conversational filler")
 	root.Flags().StringVar(&flagSandbox, "sandbox", "",
 		"command sandbox: read-only | workspace-write | trusted | off")
 	root.Flags().StringVar(&flagProfile, "permission-profile", "",
@@ -128,7 +132,13 @@ type opts struct {
 	profile     string
 	noNetwork   bool
 	enforcement string
+	terse       bool
 }
+
+// cavemanInstruction is appended to the project instructions in caveman mode
+// (--terse). The model must return only data, code, or commands.
+const cavemanInstruction = "Caveman mode: return zero conversational filler. " +
+	"Output only data, code, or terminal commands. Use telegraphic syntax."
 
 // resolveSecurity builds the permission engine and sandbox holder from config
 // plus command-line overrides.
@@ -217,6 +227,9 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	if err != nil {
 		return tui.Deps{}, err
 	}
+	if o.terse {
+		loaded.Config.Instructions = append(loaded.Config.Instructions, cavemanInstruction)
+	}
 	// Saved /auth credentials fill in any provider rick.json did not pin.
 	creds, cerr := config.LoadCredentials()
 	if cerr != nil {
@@ -273,6 +286,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 
 	todos := tools.NewTodoStore()
 	reg := tools.NewRegistry()
+	ctxBudget := contextbudget.New(contextbudget.Options{})
 	depth := 1
 	if loaded.Config.SubagentDepth != nil {
 		depth = *loaded.Config.SubagentDepth
@@ -282,7 +296,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	// Token usage tracker: persists cumulative usage per model per day
 	// at ~/.config/rick/usage.json.
 	usageTracker := usage.New(config.GlobalDir())
-	reg.Register(tools.ReadTool{})
+	reg.Register(tools.ReadTool{Delta: tools.DeltaStore(), EnableSkeleton: true})
 	reg.Register(tools.WriteTool{})
 	reg.Register(tools.EditTool{})
 	reg.Register(tools.BashTool{Sandbox: sandboxHolder})
@@ -300,6 +314,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	reg.Register(tools.FetchTool{})
 	reg.Register(tools.MemoryTool{})
 	reg.Register(tools.WebSearchTool{Restrictions: loaded.Config.WebSearch})
+	reg.Register(tools.RetrieveUncompressedTool{Store: ctxBudget})
 
 	goals, _ := goal.NewStore(filepath.Join(config.DataDir(), "goals"))
 	if goals != nil {
@@ -360,6 +375,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 		Cwd: abs, Version: "v" + Version, ResumeID: resume, InitialMsg: o.prompt,
 		SwarmManager: swarm.NewSwarmManager(),
 		Goals:        goals, Usage: usageTracker, AgentRegistry: agentRegistry,
+		Budget: ctxBudget,
 	}, nil
 }
 
@@ -672,6 +688,7 @@ func execCmd() *cobra.Command {
 	var (
 		flagExecModel   string
 		flagExecYolo    bool
+		flagExecTerse   bool
 		flagExecSandbox string
 		flagExecFormat  string
 		flagExecTurns   int
@@ -716,6 +733,9 @@ func execCmd() *cobra.Command {
 			loaded, err := config.Load(abs)
 			if err != nil {
 				return err
+			}
+			if flagExecTerse {
+				loaded.Config.Instructions = append(loaded.Config.Instructions, cavemanInstruction)
 			}
 			// Merge saved credentials.
 			creds, cerr := config.LoadCredentials()
@@ -773,7 +793,7 @@ func execCmd() *cobra.Command {
 			// Build tools.
 			todos := tools.NewTodoStore()
 			reg := tools.NewRegistry()
-			reg.Register(tools.ReadTool{})
+			reg.Register(tools.ReadTool{Delta: tools.DeltaStore(), EnableSkeleton: true})
 			reg.Register(tools.WriteTool{})
 			reg.Register(tools.EditTool{})
 			reg.Register(tools.BashTool{Sandbox: sandboxHolder})
@@ -824,6 +844,8 @@ func execCmd() *cobra.Command {
 	}
 	c.Flags().StringVarP(&flagExecModel, "model", "m", "", "model to use (provider/model-id)")
 	c.Flags().BoolVar(&flagExecYolo, "yolo", false, "auto-approve all permissions (dangerous)")
+	c.Flags().BoolVar(&flagExecTerse, "terse", false,
+		"caveman mode: instruct the model to return zero conversational filler")
 	c.Flags().StringVar(&flagExecSandbox, "sandbox", "",
 		"command sandbox: read-only | workspace-write | trusted | off")
 	c.Flags().StringVarP(&flagExecFormat, "output-format", "o", "text",
