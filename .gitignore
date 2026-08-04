@@ -12,3 +12,6 @@ dist/
 .env
 .env.*
 *.local
+
+# Research scratch (temporary clones for reference study)
+_research/
