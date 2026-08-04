@@ -17,19 +17,46 @@ import (
 
 // Session is one conversation.
 type Session struct {
-	ID        string             `json:"id"`
-	Title     string             `json:"title"`
-	Cwd       string             `json:"cwd"`
-	Model     string             `json:"model"`
-	Agent     string             `json:"agent"`
-	Parent    string             `json:"parent,omitempty"`
-	Category  string             `json:"category,omitempty"`
-	Favorite  bool               `json:"favorite,omitempty"`
-	Created   time.Time          `json:"created"`
-	Updated   time.Time          `json:"updated"`
-	Messages  []provider.Message `json:"messages"`
-	Snapshots []Snapshot         `json:"snapshots,omitempty"`
-	Usage     Usage              `json:"usage"`
+	ID           string             `json:"id"`
+	Title        string             `json:"title"`
+	Cwd          string             `json:"cwd"`
+	Model        string             `json:"model"`
+	Agent        string             `json:"agent"`
+	Parent       string             `json:"parent,omitempty"`
+	Category     string             `json:"category,omitempty"`
+	Favorite     bool               `json:"favorite,omitempty"`
+	Created      time.Time          `json:"created"`
+	Updated      time.Time          `json:"updated"`
+	Messages     []provider.Message `json:"messages"`
+	Snapshots    []Snapshot         `json:"snapshots,omitempty"`
+	Usage        Usage              `json:"usage"`
+	Optimization OptimizationUsage  `json:"optimization,omitempty"`
+}
+
+// OptimizationUsage accumulates exact local measurements for provider-facing
+// tool-output reduction. It is separate from cumulative billing usage.
+type OptimizationUsage struct {
+	ToolResults    int `json:"tool_results"`
+	OriginalTokens int `json:"original_tokens"`
+	ProviderTokens int `json:"provider_tokens"`
+	SavedTokens    int `json:"saved_tokens"`
+}
+
+// SavingsPercent returns the measured provider-facing reduction as a percentage
+// of the original tokens. Zero original tokens returns zero.
+func (u OptimizationUsage) SavingsPercent() float64 {
+	if u.OriginalTokens <= 0 {
+		return 0
+	}
+	return float64(u.SavedTokens) * 100 / float64(u.OriginalTokens)
+}
+
+// Add merges one optimization measurement.
+func (u *OptimizationUsage) Add(original, provider, saved int) {
+	u.ToolResults++
+	u.OriginalTokens += original
+	u.ProviderTokens += provider
+	u.SavedTokens += saved
 }
 
 // Usage is the cumulative token count for a session.
