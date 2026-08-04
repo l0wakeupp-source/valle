@@ -2,6 +2,7 @@
 package tokens
 
 import (
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -40,6 +41,19 @@ func Count(text string, encoding Encoding) Result {
 	}
 
 	return Result{Count: conservativeFallback(text), Encoding: encoding}
+}
+
+// EncodingForModel selects the exact BPE vocabulary that matches the tokenizer
+// family of a model id. OpenAI's modern models (gpt-4o, gpt-5, o-series,
+// codex) tokenize with o200k_base; everything else falls back to cl100k_base.
+func EncodingForModel(modelID string) Encoding {
+	id := strings.ToLower(modelID)
+	for _, marker := range []string{"gpt-4o", "gpt-5", "o1", "o3", "o4", "codex", "o200k"} {
+		if strings.Contains(id, marker) {
+			return EncodingO200kBase
+		}
+	}
+	return EncodingCl100kBase
 }
 
 func conservativeFallback(text string) int {

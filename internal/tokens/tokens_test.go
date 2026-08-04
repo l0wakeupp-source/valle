@@ -31,3 +31,20 @@ func TestCountFallbackIsConservativeAndUnicodeSafe(t *testing.T) {
 		t.Fatal("unknown encoding used exact mode")
 	}
 }
+
+func TestEncodingForModel(t *testing.T) {
+	cases := map[string]Encoding{
+		"gpt-4o":        EncodingO200kBase,
+		"gpt-5":         EncodingO200kBase,
+		"o4-mini":       EncodingO200kBase,
+		"codex-mini":    EncodingO200kBase,
+		"claude-sonnet": EncodingCl100kBase,
+		"deepseek-v4":   EncodingCl100kBase,
+		"":              EncodingCl100kBase,
+	}
+	for model, want := range cases {
+		if got := EncodingForModel(model); got != want {
+			t.Errorf("EncodingForModel(%q) = %s, want %s", model, got, want)
+		}
+	}
+}

@@ -71,3 +71,24 @@ func TestWireRequestAddsPromptCacheBreakpoints(t *testing.T) {
 		t.Fatalf("final tool cache control = %#v, want ephemeral", decoded.Tools[1].CacheControl)
 	}
 }
+
+func TestToWirePlacesBoundaryOnMarkedMessage(t *testing.T) {
+	messages := []provider.Message{
+		provider.UserText("first"),
+		provider.UserText("second"),
+		provider.UserText("third"),
+	}
+	wire := toWire(messages, map[int]bool{1: true})
+	if len(wire) != 3 {
+		t.Fatalf("got %d wire messages, want 3", len(wire))
+	}
+	if wire[0].Content[0].CacheControl != nil {
+		t.Fatal("unmarked message unexpectedly has a cache breakpoint")
+	}
+	if wire[1].Content[0].CacheControl == nil || wire[1].Content[0].CacheControl.Type != "ephemeral" {
+		t.Fatalf("marked message missing cache breakpoint: %#v", wire[1].Content[0].CacheControl)
+	}
+	if wire[2].Content[0].CacheControl != nil {
+		t.Fatal("message after boundary unexpectedly cached")
+	}
+}

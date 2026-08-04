@@ -150,9 +150,9 @@ type wireImageSource struct {
 	Data      string `json:"data"`
 }
 
-func toWire(msgs []provider.Message) []wireMessage {
+func toWire(msgs []provider.Message, boundaries map[int]bool) []wireMessage {
 	out := make([]wireMessage, 0, len(msgs))
-	for _, m := range msgs {
+	for index, m := range msgs {
 		wm := wireMessage{Role: m.Role}
 		for _, b := range m.Content {
 			switch b.Type {
@@ -192,6 +192,11 @@ func toWire(msgs []provider.Message) []wireMessage {
 		if len(wm.Content) == 0 {
 			continue // Anthropic rejects empty content arrays
 		}
+		// A stable cache boundary marks the message that ends a reusable
+		// prefix; everything before it is cached by the provider.
+		if boundaries != nil && boundaries[index] {
+			wm.Content[0].CacheControl = &cacheControl{Type: "ephemeral"}
+		}
 		out = append(out, wm)
 	}
 	return out
@@ -224,7 +229,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		MaxTokens:    maxTok,
 		CacheControl: &cacheControl{Type: "ephemeral"},
 		System:       wireSystem(req.System, req.SystemStable),
-		Messages:     toWire(req.Messages),
+		Messages:     toWire(req.Messages, req.CacheBoundaries),
 		Tools:        wireTools(req.Tools),
 		Stream:       true,
 		Temperature:  req.Temperature,

@@ -106,6 +106,11 @@ type Request struct {
 	// Reasoning is the requested thinking level. Providers translate it into
 	// their own dialect and ignore it when the model does not reason.
 	Reasoning ReasoningEffort
+	// CacheBoundaries marks message indices that delimit a stable history
+	// prefix. Providers that support explicit cache breakpoints (Anthropic)
+	// place a cache_control marker on the message at each index; other
+	// providers ignore the field.
+	CacheBoundaries map[int]bool
 }
 
 // Usage reports token accounting for a turn.
