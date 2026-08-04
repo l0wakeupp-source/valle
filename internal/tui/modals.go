@@ -451,6 +451,7 @@ func (m *Model) doResume(id string) {
 	m.toolOutputs = toolOutputsFromHistory(sess.Messages)
 	m.resetStats()
 	m.usage = sess.Usage
+	m.optimization = sess.Optimization
 	if sess.Model != "" {
 		m.modelID = sess.Model
 		m.updateContextWindow()
@@ -558,12 +559,13 @@ func (m *Model) saveSession() {
 		}
 		_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
 	}
-	// Keep the complete transcript on disk for local expansion and export. The
-	// provider-facing m.history remains bounded by rebuildHistory.
-	m.sess.Messages = capHistory(m.buildHistory(0))
+	// Keep the complete canonical transcript on disk for local expansion and
+	// export. Only the provider-facing m.history is bounded by rebuildHistory.
+	m.sess.Messages = m.buildHistory(0)
 	m.sess.Model = m.modelID
 	m.sess.Agent = m.agentName
 	m.sess.Usage = m.usage
+	m.sess.Optimization = m.optimization
 	if m.deps.Snapshots.Enabled() {
 		m.sess.Snapshots = m.deps.Snapshots.History()
 	}
