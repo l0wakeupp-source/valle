@@ -19,6 +19,7 @@ import (
 	"rick/internal/budget"
 	"rick/internal/compress"
 	"rick/internal/config"
+	"rick/internal/distill"
 	"rick/internal/goal"
 	"rick/internal/history"
 	"rick/internal/permission"
@@ -26,6 +27,8 @@ import (
 	"rick/internal/provider"
 	"rick/internal/tokens"
 	"rick/internal/tools"
+	"rick/pkg/contextbudget"
+	"rick/pkg/repomap"
 )
 
 // EventKind enumerates agent-level events surfaced to the UI.
@@ -115,28 +118,67 @@ type Config struct {
 	TokenEncoding      tokens.Encoding
 	Temperature        *float64
 	Reasoning          provider.ReasoningEffort
-	Tools              tools.ToolSet
-	ToolFilter         func(string) bool
-	Perms              *permission.Engine
-	Ask                PermissionAsker
-	Cwd                string
-	SandboxRoot        string
-	SessionID          string
-	AgentName          string
-	Depth              int
-	MaxTurns           int
-	Snapshotter        Snapshotter
-	Parallel           bool // allow concurrent read-only tools
-	Plugins            *plugin.Registry
-	Goals              *goal.Store
-	Creds              *config.Credentials // for key rotation on rate-limit
-	Registry           *Registry           // optional live hierarchy registry
-	AgentID            string              // registry ID for this run
+	// Budget is the shared session context manager (content-addressed dedup,
+	// cache boundaries, reversible live-zone compression). When nil the runner
+	// creates a private one that still deduplicates and picks boundaries but
+	// never replaces tool output without a reversible store.
+	Budget *contextbudget.Budget
+	// RepoMapRoot enables the RepoMap structural skeleton in the system
+	// prompt when non-empty.
+	RepoMapRoot string
+	// RepoMapBlock is a precomputed RepoMap block. When non-empty it is used
+	// verbatim on every turn, so a long-lived session keeps a byte-identical
+	// system prompt and the provider prompt cache is never disturbed. When
+	// empty, the runner builds its own map once per run.
+	RepoMapBlock string
+	// RepoMapMaxTokens bounds the RepoMap block; zero means the package
+	// default (1024).
+	RepoMapMaxTokens int
+	// EnableDistillation turns on state distillation when the transcript
+	// approaches the context budget. Requires a provider (for the default
+	// summarizer) or an injected DistillSummarizer.
+	EnableDistillation bool
+	// DistillModel is the fast model used for the background summary call.
+	// Empty falls back to the primary model.
+	DistillModel string
+	// DistillSummarizer overrides the background summarizer; tests inject a
+	// stub here.
+	DistillSummarizer distill.Summarizer
+	// DistillOptions tunes the distillation policy. A zero value applies the
+	// package defaults; the Summarizer field is filled from
+	// DistillSummarizer or the primary provider when left nil.
+	DistillOptions distill.Options
+	Tools          tools.ToolSet
+	ToolFilter     func(string) bool
+	Perms          *permission.Engine
+	Ask            PermissionAsker
+	Cwd            string
+	SandboxRoot    string
+	SessionID      string
+	AgentName      string
+	Depth          int
+	MaxTurns       int
+	Snapshotter    Snapshotter
+	Parallel       bool // allow concurrent read-only tools
+	Plugins        *plugin.Registry
+	Goals          *goal.Store
+	Creds          *config.Credentials // for key rotation on rate-limit
+	Registry       *Registry           // optional live hierarchy registry
+	AgentID        string              // registry ID for this run
 }
 
 // Runner executes the loop.
 type Runner struct {
 	cfg Config
+
+	// budget is the shared session context manager, or a private fallback.
+	budget *contextbudget.Budget
+
+	// repoMapOnce/repoMapBlock compute the RepoMap once per run using the
+	// active chat prompt; the block is byte-identical across turns so it does
+	// not disturb the provider prompt cache.
+	repoMapOnce  sync.Once
+	repoMapBlock string
 }
 
 // New builds a Runner.
@@ -147,7 +189,11 @@ func New(cfg Config) *Runner {
 	if cfg.SandboxRoot == "" && cfg.Perms != nil {
 		cfg.SandboxRoot = cfg.Perms.SandboxRoot()
 	}
-	return &Runner{cfg: cfg}
+	budget := cfg.Budget
+	if budget == nil {
+		budget = contextbudget.New(contextbudget.Options{})
+	}
+	return &Runner{cfg: cfg, budget: budget}
 }
 
 // Cfg exposes the runner configuration (read-only use).
@@ -546,7 +592,7 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.ToolSchema) provider.Request {
 	encoding := r.cfg.TokenEncoding
 	if encoding == "" {
-		encoding = tokens.EncodingCl100kBase
+		encoding = tokens.EncodingForModel(r.cfg.Model)
 	}
 
 	contextWindow := r.cfg.ContextWindow
@@ -558,8 +604,15 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		reservedOutput = 4096
 	}
 
+	system := r.cfg.System
+	if block := r.repoMap(lastUserText(messages)); block != "" {
+		system += "\n\n" + block
+	}
+	if manifest := toolManifest(schemas); manifest != "" {
+		system += "\n\n" + manifest
+	}
 	stableSystem := r.cfg.SystemStable
-	volatileSystem := r.cfg.System
+	volatileSystem := system
 	if stableSystem != "" && strings.HasPrefix(volatileSystem, stableSystem) {
 		volatileSystem = strings.TrimPrefix(volatileSystem, stableSystem)
 	}
@@ -573,16 +626,78 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		SafetyMarginTokens:   r.cfg.SafetyMarginTokens,
 	})
 
-	return provider.Request{
-		Model:        r.cfg.Model,
-		System:       r.cfg.System,
-		SystemStable: r.cfg.SystemStable,
-		Messages:     retainMessages(messages, plan.RetainedMessageTokens, encoding),
-		Tools:        schemas,
-		MaxTokens:    r.cfg.MaxTokens,
-		Temperature:  r.cfg.Temperature,
-		Reasoning:    r.cfg.Reasoning,
+	retained := retainMessages(messages, plan.RetainedMessageTokens, encoding)
+	// Deduplicate after trimming so a replaced payload's original is always
+	// present in the same sent transcript.
+	if r.budget.Enabled() {
+		retained = r.budget.ApplyDedup(retained).View
 	}
+	boundaries := r.budget.ChooseBoundaries(retained)
+
+	// State distillation: when the transcript approaches the context budget,
+	// collapse the oldest stable prefix into a structured summary placed just
+	// after the cache breakpoint. Best-effort: every failure keeps the view.
+	if r.shouldDistill(plan, contextWindow) {
+		if result := distill.Distill(retained, boundaries, r.distillOptions()); result.Replaced {
+			retained = result.Messages
+			boundaries = r.budget.ChooseBoundaries(retained)
+		}
+	}
+
+	return provider.Request{
+		Model:           r.cfg.Model,
+		System:          system,
+		SystemStable:    r.cfg.SystemStable,
+		Messages:        retained,
+		Tools:           schemas,
+		MaxTokens:       r.cfg.MaxTokens,
+		Temperature:     r.cfg.Temperature,
+		Reasoning:       r.cfg.Reasoning,
+		CacheBoundaries: boundaries,
+	}
+}
+
+// repoMap renders the repository skeleton once per run, keyed to the active
+// chat prompt. The result is stable for the whole run so the provider cache
+// sees an identical system suffix on every turn.
+func (r *Runner) repoMap(prompt string) string {
+	if r.cfg.RepoMapRoot == "" && r.cfg.RepoMapBlock == "" {
+		return ""
+	}
+	// A precomputed block (built once per session by the caller) is used
+	// verbatim so every turn sends a byte-identical system suffix and the
+	// provider prompt cache stays warm.
+	if r.cfg.RepoMapBlock != "" {
+		return r.cfg.RepoMapBlock
+	}
+	r.repoMapOnce.Do(func() {
+		block, err := repomap.Build(repomap.Options{
+			Root:      r.cfg.RepoMapRoot,
+			Prompt:    prompt,
+			MaxTokens: r.cfg.RepoMapMaxTokens,
+			Encoding:  tokens.EncodingForModel(r.cfg.Model),
+		})
+		if err == nil {
+			r.repoMapBlock = block
+		}
+	})
+	return r.repoMapBlock
+}
+
+// lastUserText returns the most recent plain-text user request, which is the
+// "active chat prompt" used to weight the RepoMap.
+func lastUserText(messages []provider.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != provider.RoleUser {
+			continue
+		}
+		for _, block := range messages[i].Content {
+			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+				return block.Text
+			}
+		}
+	}
+	return ""
 }
 
 func countTokens(text string, encoding tokens.Encoding) int {
@@ -738,26 +853,49 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		}
 	}
 
-	modelOutput, stats := capModelToolOutputForCall(call, ev.Output, ev.IsError)
+	modelOutput, stats := r.capToolOutput(call, ev.Output, ev.IsError)
 	ev.Optimization = stats
 	return provider.ToolResultBlock(call.ID, modelOutput, ev.IsError), ev
 }
 
 const maxModelToolResultBytes = 32 << 10
 
-func capModelToolOutput(output string) string {
-	compressed, _ := capModelToolOutputForCall(provider.ToolCall{Name: "unknown"}, output, false)
-	return compressed
+// capToolOutput applies the deterministic command-aware reducer and then the
+// reversible live-zone pass. The pre-live-zone payload is stored under the
+// call id so the model can retrieve it via retrieve_uncompressed_context.
+func (r *Runner) capToolOutput(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
+	modelOutput, stats := capToolOutputStatic(call, output, isError)
+	if r.budget != nil && r.budget.Enabled() && !isError && len(modelOutput) > 0 {
+		key := call.ID
+		if key == "" {
+			key = "tool:" + call.Name
+		}
+		live, changed := r.budget.CompressLive(key, modelOutput)
+		if changed {
+			stats = &OptimizationStats{
+				Stage:            stats.Stage + "+live-zone",
+				Fallback:         stats.Fallback,
+				OriginalBytes:    stats.OriginalBytes,
+				CompressedBytes:  len(live),
+				OriginalTokens:   stats.OriginalTokens,
+				CompressedTokens: countTokens(live, tokens.EncodingCl100kBase),
+				SavedTokens:      maxInt(0, stats.OriginalTokens-stats.CompressedTokens),
+				Truncated:        stats.Truncated,
+			}
+			modelOutput = live
+		}
+	}
+	return modelOutput, stats
 }
 
-func capModelToolOutputForCall(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
+func capToolOutputStatic(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
 	compressed := compress.ForTool(compress.Input{
 		Text:     output,
 		Command:  compressionCommand(call),
 		MaxBytes: maxModelToolResultBytes,
 		IsError:  isError,
 	})
-	modelOutput := strings.Replace(compressed.Text, "output truncated", "tool output truncated", 1)
+	modelOutput := compressed.Text
 	encoding := tokens.EncodingCl100kBase
 	originalTokens := countTokens(output, encoding)
 	compressedTokens := countTokens(modelOutput, encoding)
@@ -772,7 +910,6 @@ func capModelToolOutputForCall(call provider.ToolCall, output string, isError bo
 		Truncated:        compressed.Truncated,
 	}
 }
-
 func compressionCommand(call provider.ToolCall) string {
 	if call.Name == "bash" {
 		var input struct {

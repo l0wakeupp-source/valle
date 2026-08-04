@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"rick/internal/distill"
 	"rick/internal/provider"
 	"rick/internal/tools"
 )
@@ -26,7 +27,7 @@ func TestCapModelToolOutputPreservesCanonicalEventOutput(t *testing.T) {
 	if strings.Contains(block.Content, "progress 10%") {
 		t.Fatal("provider-facing result retained progress noise")
 	}
-	if !strings.Contains(block.Content, "tool output truncated") {
+	if !strings.Contains(block.Content, "tool output truncated") && !strings.Contains(block.Content, "live-zone compressed") {
 		t.Fatal("provider-facing result lacks truncation marker")
 	}
 	if event.Optimization == nil || event.Optimization.SavedTokens <= 0 || !event.Optimization.Truncated {
@@ -70,4 +71,97 @@ func (canonicalOutputTool) Schema() map[string]any { return map[string]any{"type
 func (canonicalOutputTool) ReadOnly() bool         { return true }
 func (tool canonicalOutputTool) Run(context.Context, tools.Context, json.RawMessage) (tools.Result, error) {
 	return tools.Result{Output: tool.output}, nil
+}
+
+func TestLiveZoneCompressionIsReversibleThroughBudget(t *testing.T) {
+	payload := `{"items":[` + strings.Repeat(`"a",`, 120) + `"z"],"ok":true}`
+	registry := tools.NewRegistry()
+	registry.Register(canonicalOutputTool{output: payload})
+	runner := New(Config{Tools: registry})
+
+	block, _ := runner.execOne(context.Background(), provider.ToolCall{ID: "call-live-1", Name: "canonical_output", Input: json.RawMessage(`{}`)})
+	if len(block.Content) >= len(payload) {
+		t.Fatalf("live zone did not compress: %d >= %d", len(block.Content), len(payload))
+	}
+	original, ok := runner.budget.LiveOriginal("call-live-1")
+	if !ok || original != payload {
+		t.Fatal("live-zone original not retrievable from the runner budget")
+	}
+}
+
+type stubDistillSummarizer struct {
+	summary string
+	calls   int
+}
+
+func (s *stubDistillSummarizer) Summarize(context.Context, []provider.Message) (string, error) {
+	s.calls++
+	return s.summary, nil
+}
+
+func TestBuildRequestDistillsStableOverBudgetHistory(t *testing.T) {
+	// Window sized so the ~21K-token history crosses the 85% distillation
+	// threshold (24K*0.85 = 20.4K) but stays under the retained budget, so
+	// trimming never interferes with the distillable prefix.
+	runner := New(Config{
+		ContextWindow:      24_000,
+		MaxTokens:          10,
+		SafetyMarginTokens: 10,
+		EnableDistillation: true,
+		DistillOptions: distill.Options{
+			MinHistoryTokens:   1,
+			MinCacheBreakBytes: 1,
+			MinRatio:           0.001,
+			MinLiveRatio:       0.5,
+			LiveZoneTurns:      2,
+			MaxMessages:        48,
+		},
+		DistillSummarizer: &stubDistillSummarizer{summary: "**Goal:** fix build\n**Facts:** broken\n**Failed Paths:** none"},
+	})
+
+	// A history that crosses 85% of the window (without overflowing the
+	// retained budget, so trimming does not interfere): five big old tool
+	// turns plus a two-turn live zone. Payloads are distinct so
+	// content-addressed deduplication does not shrink the transcript before
+	// distillation.
+	var messages []provider.Message
+	for i := 0; i < 5; i++ {
+		messages = append(messages, provider.UserText("old request"))
+		messages = append(messages, pairMessage("t"+string(rune('a'+i)), strings.Repeat("payload", 4000+i*10))...)
+	}
+	messages = append(messages, provider.UserText("live request"))
+	messages = append(messages, pairMessage("tlive", strings.Repeat("live", 400))...)
+	messages = append(messages, provider.UserText("latest request"))
+
+	// First request: the cache prefix is not stable yet, so the summarizer
+	// must not run. Second identical request: stability reaches the threshold
+	// and the oldest stable prefix is distilled away.
+	summarizer := runner.cfg.DistillSummarizer.(*stubDistillSummarizer)
+	runner.buildRequest(messages, nil)
+	if summarizer.calls != 0 {
+		t.Fatalf("summarizer ran before the cache prefix was stable (%d calls)", summarizer.calls)
+	}
+	request := runner.buildRequest(messages, nil)
+	if summarizer.calls == 0 {
+		t.Fatal("over-budget stable history was not distilled")
+	}
+	if !containsDistillSummary(request.Messages) {
+		t.Fatalf("distilled summary missing from request messages")
+	}
+}
+
+func pairMessage(id, payload string) []provider.Message {
+	return []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "tool_use", ID: id, Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)}}},
+		{Role: provider.RoleUser, Content: []provider.ContentBlock{provider.ToolResultBlock(id, payload, false)}},
+	}
+}
+
+func containsDistillSummary(messages []provider.Message) bool {
+	for _, message := range messages {
+		if strings.Contains(message.Text(), "**Goal:**") {
+			return true
+		}
+	}
+	return false
 }
