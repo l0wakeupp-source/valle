@@ -145,6 +145,7 @@ type Model struct {
 	status             string
 	statusTime         time.Time
 	usage              session.Usage
+	optimization       session.OptimizationUsage
 	ctxWindow          int
 	lastAutoCompact    time.Time
 	autoCompactPending bool
@@ -1598,6 +1599,7 @@ func (m *Model) StatusBar() string { return m.StatusLine() }
 // brand-new conversation report the previous one's tokens and turn time.
 func (m *Model) resetStats() {
 	m.usage = session.Usage{}
+	m.optimization = session.OptimizationUsage{}
 	m.billed = session.Usage{}
 	m.turnStart = time.Time{}
 	m.turnElapsed = 0
