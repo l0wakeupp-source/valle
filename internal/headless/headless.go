@@ -34,7 +34,7 @@ type Options struct {
 	Prompt      string
 	Model       string
 	Yolo        bool
-	MaxTurns    int
+	MaxTurns    int // cap on agent turns; <= 0 means unlimited
 	Format      OutputFormat
 	Cwd         string
 	ProjectRoot string
@@ -95,9 +95,6 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 	if opts.Format == "" {
 		opts.Format = FormatText
 	}
-	if opts.MaxTurns <= 0 {
-		opts.MaxTurns = 50
-	}
 	if opts.AgentName == "" {
 		opts.AgentName = "build"
 	}
@@ -141,6 +138,7 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 		RepoMapRoot:        opts.ProjectRoot,
 		EnableDistillation: deps.Config.DistillEnabled != nil && *deps.Config.DistillEnabled,
 		DistillModel:       deps.Config.DistillModelFor(),
+		CacheRetention:     provider.CacheRetention(deps.Config.CacheRetention),
 	})
 
 	history := []provider.Message{provider.UserText(opts.Prompt)}
