@@ -447,7 +447,17 @@ func (m *Model) doResume(id string) {
 		return
 	}
 	m.sess = sess
-	m.history = capHistory(compactHistory(sess.Messages))
+	if len(sess.SentTranscript) > 0 {
+		// Replay the exact bytes last sent so the provider cache prefix
+		// survives the restart; seed the budget so the first turn emits
+		// boundaries instead of starting cold.
+		m.history = append([]provider.Message(nil), sess.SentTranscript...)
+	} else {
+		m.history = m.capHistoryCacheAware(compactHistory(sess.Messages))
+	}
+	if m.deps.Budget != nil {
+		m.deps.Budget.SeedStability(m.history)
+	}
 	m.toolOutputs = toolOutputsFromHistory(sess.Messages)
 	m.resetStats()
 	m.usage = sess.Usage
@@ -562,6 +572,9 @@ func (m *Model) saveSession() {
 	// Keep the complete canonical transcript on disk for local expansion and
 	// export. Only the provider-facing m.history is bounded by rebuildHistory.
 	m.sess.Messages = m.buildHistory(0)
+	// Persist the exact bounded view last sent so resume can replay it
+	// byte-identically and warm the provider prompt cache.
+	m.sess.SentTranscript = append([]provider.Message(nil), m.history...)
 	m.sess.Model = m.modelID
 	m.sess.Agent = m.agentName
 	m.sess.Usage = m.usage
