@@ -267,6 +267,12 @@
       "type": "string",
       "description": "Cheap model used for the background distillation summary. Falls back to small_model, then model."
     },
+    "cache_retention": {
+      "type": "string",
+      "enum": ["", "long", "none"],
+      "description": "Prompt-cache retention for every request: empty (provider default, ~5 min), \"long\" (extended TTL: Anthropic 1h / OpenAI 24h), or \"none\" (caching off).",
+      "default": ""
+    },
     "subagent_depth": {
       "type": "integer",
       "description": "How many levels of subagent spawning are permitted.",
