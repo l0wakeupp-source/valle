@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -330,8 +331,12 @@ type providerBatch struct {
 }
 
 func (t WebSearchTool) runProvider(ctx context.Context, provider configuredSearchProvider, query string, maxResults int, variant string) providerBatch {
-	if cached, ok := cacheGetVariant(provider.name, query, maxResults, variant); ok {
-		return providerBatch{name: provider.name, weight: provider.weight, results: normalizeResults(cached, maxResults)}
+	if cached, cachedErr, ok := cacheGetVariant(provider.name, query, maxResults, variant); ok {
+		if cachedErr != nil {
+			// Negative cache hit: the provider failed moments ago.
+			return providerBatch{name: provider.name, weight: provider.weight, err: cachedErr}
+		}
+		return providerBatch{name: provider.name, weight: provider.weight, results: cached}
 	}
 	endpoint := provider.config.BaseURL
 	if endpoint == "" {
@@ -346,6 +351,7 @@ func (t WebSearchTool) runProvider(ctx context.Context, provider configuredSearc
 	if err != nil {
 		typed := providerErrorFrom(err, provider.name)
 		finishProviderHealth(healthKeyValue, typed, 0, time.Since(started))
+		cachePutErrorVariant(provider.name, query, typed, negativeCacheTTL, variant)
 		return providerBatch{name: provider.name, weight: provider.weight, err: typed}
 	}
 	defer release()
@@ -353,6 +359,7 @@ func (t WebSearchTool) runProvider(ctx context.Context, provider configuredSearc
 	if err != nil {
 		typed := providerErrorFrom(err, provider.name)
 		finishProviderHealth(healthKeyValue, typed, 0, time.Since(started))
+		cachePutErrorVariant(provider.name, query, typed, negativeCacheTTL, variant)
 		return providerBatch{name: provider.name, weight: provider.weight, err: typed}
 	}
 	results = normalizeResults(results, maxResults)
@@ -365,7 +372,11 @@ func (t WebSearchTool) runProvider(ctx context.Context, provider configuredSearc
 		if ttl == 0 {
 			ttl = 300 * time.Second
 		}
-		cachePutVariant(provider.name, query, maxResults, results, ttl, variant)
+		cachePutVariant(provider.name, query, results, ttl, variant)
+	} else {
+		// Empty responses are cached negatively so a flapping provider is
+		// not immediately retried for the same query.
+		cachePutErrorVariant(provider.name, query, errors.New("empty results"), negativeCacheTTL, variant)
 	}
 	return providerBatch{name: provider.name, weight: provider.weight, results: results}
 }
