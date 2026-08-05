@@ -186,11 +186,13 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 
 	// Build the table body in plain text (no ANSI codes inside columns).
 	type row struct {
-		provider, model             string
-		input, output, cache, total int
+		provider, model            string
+		input, output, read, write int
+		hitRate                    float64
+		total                      int
 	}
 	var rows []row
-	var grandIn, grandOut, grandCache int
+	var grandIn, grandOut, grandRead, grandWrite int
 	for _, id := range models {
 		u := m.deps.Usage.ModelTotal(id)
 		total := u.Input + u.Output + u.CacheRead + u.CacheWrite
@@ -199,7 +201,8 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 		}
 		grandIn += u.Input
 		grandOut += u.Output
-		grandCache += u.CacheRead + u.CacheWrite
+		grandRead += u.CacheRead
+		grandWrite += u.CacheWrite
 		// Split provider/model.
 		prov := ""
 		modelID := id
@@ -207,54 +210,64 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 			prov = id[:i]
 			modelID = id[i+1:]
 		}
-		rows = append(rows, row{prov, modelID, u.Input, u.Output, u.CacheRead + u.CacheWrite, total})
+		rows = append(rows, row{prov, modelID, u.Input, u.Output, u.CacheRead, u.CacheWrite, u.CacheHitRate(), total})
 	}
 
 	// Compute grand total from accumulated components.
-	grandTotal := grandIn + grandOut + grandCache
+	grandTotal := grandIn + grandOut + grandRead + grandWrite
+	grandHit := 0.0
+	if denom := grandIn + grandRead; denom > 0 {
+		grandHit = float64(grandRead) * 100 / float64(denom)
+	}
 
 	// Sort by total descending.
 	sort.Slice(rows, func(i, j int) bool { return rows[i].total > rows[j].total })
 
 	// Plain-text table.
 	const (
-		wProv   = 12
-		wModel  = 32
-		wInput  = 10
-		wOutput = 10
-		wCache  = 10
-		wTotal  = 10
+		wProv  = 12
+		wModel = 30
+		wInput = 9
+		wOut   = 9
+		wRead  = 9
+		wWrite = 9
+		wHit   = 7
+		wTotal = 9
 	)
 
 	// Build the separator from the actual data format so it always matches.
-	dataLine := fmt.Sprintf("  %s %s %s %s %s %s",
+	dataLine := fmt.Sprintf("  %s %s %s %s %s %s %s %s",
 		padRight("", wProv), padRight("", wModel),
-		padLeft("", wInput), padLeft("", wOutput),
-		padLeft("", wCache), padLeft("", wTotal))
+		padLeft("", wInput), padLeft("", wOut),
+		padLeft("", wRead), padLeft("", wWrite),
+		padLeft("", wHit), padLeft("", wTotal))
 	line := strings.Repeat("-", len(dataLine))
 
 	b.WriteString(s.Primary.Render("token usage") + "\n\n")
 
 	// Build the whole table body in plain text, then style it once.
 	var table strings.Builder
-	table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s\n",
+	table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s %s %s\n",
 		padRight("provider", wProv), padRight("model", wModel),
-		padLeft("input", wInput), padLeft("output", wOutput),
-		padLeft("cache", wCache), padLeft("total", wTotal)))
+		padLeft("input", wInput), padLeft("output", wOut),
+		padLeft("read", wRead), padLeft("write", wWrite),
+		padLeft("hit%", wHit), padLeft("total", wTotal)))
 	table.WriteString(line + "\n")
 
 	for _, r := range rows {
-		table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s\n",
+		table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s %s %s\n",
 			padRight(r.provider, wProv), padRight(truncate(r.model, wModel-1), wModel),
-			padLeft(humanTokens(r.input), wInput), padLeft(humanTokens(r.output), wOutput),
-			padLeft(humanTokens(r.cache), wCache), padLeft(humanTokens(r.total), wTotal)))
+			padLeft(humanTokens(r.input), wInput), padLeft(humanTokens(r.output), wOut),
+			padLeft(humanTokens(r.read), wRead), padLeft(humanTokens(r.write), wWrite),
+			padLeft(fmt.Sprintf("%.2f%%", r.hitRate), wHit), padLeft(humanTokens(r.total), wTotal)))
 	}
 
 	table.WriteString(line + "\n")
-	table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s\n",
+	table.WriteString(fmt.Sprintf("  %s %s %s %s %s %s %s %s\n",
 		padRight("TOTAL", wProv), padRight("", wModel),
-		padLeft(humanTokens(grandIn), wInput), padLeft(humanTokens(grandOut), wOutput),
-		padLeft(humanTokens(grandCache), wCache), padLeft(humanTokens(grandTotal), wTotal)))
+		padLeft(humanTokens(grandIn), wInput), padLeft(humanTokens(grandOut), wOut),
+		padLeft(humanTokens(grandRead), wRead), padLeft(humanTokens(grandWrite), wWrite),
+		padLeft(fmt.Sprintf("%.2f%%", grandHit), wHit), padLeft(humanTokens(grandTotal), wTotal)))
 
 	b.WriteString(s.Faint.Render(table.String()))
 
@@ -269,11 +282,13 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 				continue
 			}
 			b.WriteString(s.Faint.Render(
-				fmt.Sprintf("  %s  %s tokens  (in %s · out %s · cache %s)\n",
+				fmt.Sprintf("  %s  %s tokens  (in %s · out %s · read %s · write %s · %s%% hit)\n",
 					d, humanTokens(grand),
 					humanTokens(dayTotal.Input),
 					humanTokens(dayTotal.Output),
-					humanTokens(dayTotal.CacheRead+dayTotal.CacheWrite))))
+					humanTokens(dayTotal.CacheRead),
+					humanTokens(dayTotal.CacheWrite),
+					fmt.Sprintf("%.2f", dayTotal.CacheHitRate()))))
 		}
 	}
 
