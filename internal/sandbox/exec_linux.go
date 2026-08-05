@@ -5,6 +5,7 @@ package sandbox
 import (
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -35,12 +36,21 @@ func (linuxBackend) Name() string {
 func (linuxBackend) Available() bool { return true }
 
 func bwrapPath() string {
-	p, err := exec.LookPath("bwrap")
-	if err != nil {
-		return ""
-	}
-	return p
+	bwrapPathOnce.Do(func() {
+		p, err := exec.LookPath("bwrap")
+		if err != nil {
+			cachedBwrapPath = ""
+		} else {
+			cachedBwrapPath = p
+		}
+	})
+	return cachedBwrapPath
 }
+
+var (
+	bwrapPathOnce   sync.Once
+	cachedBwrapPath string
+)
 
 func (linuxBackend) Prepare(cmd *exec.Cmd, p Policy) (Session, error) {
 	s := &unixSession{limits: p.Limits, applied: "rlimit + process group"}
