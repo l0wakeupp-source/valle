@@ -92,6 +92,23 @@ type ToolSchema struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
+// CacheRetention controls provider prompt-cache behaviour for a request.
+type CacheRetention string
+
+const (
+	// CacheRetentionAuto uses the provider default TTL (Anthropic ~5 min,
+	// OpenAI implicit caching) — "short".
+	CacheRetentionAuto CacheRetention = ""
+	// CacheRetentionLong requests extended retention (Anthropic
+	// cache_control ttl:"1h", OpenAI prompt_cache_retention:"24h") so the
+	// cache survives long turns, idle gaps, and resumed sessions.
+	CacheRetentionLong CacheRetention = "long"
+	// CacheRetentionNone disables prompt caching for this request: no
+	// breakpoints, no cache keys, no cache writes. Used for one-off calls
+	// (distillation, compaction) that would pollute the session cache.
+	CacheRetentionNone CacheRetention = "none"
+)
+
 // Request is a single completion request.
 type Request struct {
 	Model  string
@@ -111,6 +128,14 @@ type Request struct {
 	// place a cache_control marker on the message at each index; other
 	// providers ignore the field.
 	CacheBoundaries map[int]bool
+	// CacheRetention is the prompt-cache retention policy for this request.
+	// Empty uses the provider default; "long" extends the TTL; "none"
+	// disables caching entirely.
+	CacheRetention CacheRetention
+	// SessionID names the session for session-keyed prompt caches and
+	// session-affinity routing hints. Stable across resume so a restarted
+	// session keeps hitting the same cache.
+	SessionID string
 }
 
 // Usage reports token accounting for a turn.
