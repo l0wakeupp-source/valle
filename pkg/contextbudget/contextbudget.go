@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"rick/internal/provider"
+	"rick/internal/tokens"
 )
 
 // Options configures a Budget.
@@ -33,15 +34,26 @@ type Options struct {
 	// content-addressed deduplication.
 	MinDedupBytes int
 	// MinStableTurns is how many consecutive identical observations a history
-	// prefix needs before it becomes a cache boundary.
+	// prefix needs before it becomes a cache boundary. Defaults to 1: the
+	// system prompt, tool list, and volatile tail are frozen per session, so
+	// a single observation is enough to trust the prefix.
 	MinStableTurns int
 	// LiveZoneTurns is how many newest logical turns are excluded from cache
-	// boundaries (the volatile tail of the conversation).
+	// boundaries (the volatile tail of the conversation). Defaults to 1.
 	LiveZoneTurns int
 	// MaxStableBytes is the minimum serialized prefix size worth caching.
 	MaxStableBytes int
-	// MaxBoundaries caps the cache breakpoints emitted per request.
+	// MaxBoundaries caps the cache breakpoints emitted per request. Anthropic
+	// allows 4 breakpoints total per request (system + tools + message
+	// boundaries), so the message-boundary budget is capped at 2.
 	MaxBoundaries int
+	// MinCacheTokens is the minimum prefix size (in tokens) a breakpoint must
+	// guard; providers silently ignore breakpoints on smaller prefixes. When
+	// Encoding is empty the prefix bytes/4 estimate is used.
+	MinCacheTokens int
+	// Encoding is the tokenizer used for the MinCacheTokens guard. Empty uses
+	// the byte/4 estimate.
+	Encoding tokens.Encoding
 	// LiveZoneCapBytes bounds live-zone compressed tool output.
 	LiveZoneCapBytes int
 }
@@ -58,16 +70,19 @@ func (o Options) withDefaults() Options {
 		o.MinDedupBytes = 2048
 	}
 	if o.MinStableTurns <= 0 {
-		o.MinStableTurns = 2
+		o.MinStableTurns = 1
 	}
 	if o.LiveZoneTurns <= 0 {
-		o.LiveZoneTurns = 2
+		o.LiveZoneTurns = 1
 	}
 	if o.MaxStableBytes <= 0 {
 		o.MaxStableBytes = 4096
 	}
 	if o.MaxBoundaries <= 0 {
-		o.MaxBoundaries = 4
+		o.MaxBoundaries = 2
+	}
+	if o.MinCacheTokens <= 0 {
+		o.MinCacheTokens = 1024
 	}
 	if o.LiveZoneCapBytes <= 0 {
 		o.LiveZoneCapBytes = 8 << 10
@@ -85,6 +100,16 @@ type Budget struct {
 	cab       map[string]string
 	cabOrd    []string
 	stability map[int]*prefixState
+	// dedup tracks the first-occurrence position of each collapsed payload
+	// and whether it has been superseded (its original was trimmed away).
+	// Persistent across calls so a payload's replaced status never
+	// flip-flops when trimming moves its first occurrence out of the view.
+	dedup map[string]*dedupState
+}
+
+type dedupState struct {
+	firstIdx   int
+	superseded bool
 }
 
 type prefixState struct {
@@ -99,6 +124,7 @@ func New(opts Options) *Budget {
 		live:      map[string]string{},
 		cab:       map[string]string{},
 		stability: map[int]*prefixState{},
+		dedup:     map[string]*dedupState{},
 	}
 }
 
@@ -189,15 +215,21 @@ type DedupResult struct {
 }
 
 // ApplyDedup replaces repeated large tool_result payloads within one
-// transcript with a self-contained reference. Only the second and later
-// occurrences are replaced, and only when the original is still present in the
-// same view, so no information is ever lost relative to the sent transcript.
+// transcript with a self-contained reference. The replacement decision is
+// persistent and content-addressed: the first occurrence of a payload is
+// replaced only once trimming has removed its original (superseded state), so
+// the provider-facing bytes never flip-flop between turns. The original
+// payload stays retrievable from the content-addressed store.
 func (b *Budget) ApplyDedup(messages []provider.Message) DedupResult {
 	result := DedupResult{View: append([]provider.Message(nil), messages...)}
 	if !b.Enabled() {
 		return result
 	}
-	seen := map[string]bool{}
+
+	// First pass: locate the first occurrence position of every large
+	// payload and mark payloads whose original was trimmed since last call.
+	first := map[string]int{}
+	position := 0
 	for index := range result.View {
 		for blockIndex := range result.View[index].Content {
 			block := &result.View[index].Content[blockIndex]
@@ -205,15 +237,55 @@ func (b *Budget) ApplyDedup(messages []provider.Message) DedupResult {
 				continue
 			}
 			hash := Hash(block.Content)
-			if seen[hash] {
+			if _, ok := first[hash]; !ok {
+				first[hash] = position
+			}
+			position++
+		}
+	}
+
+	b.mu.Lock()
+	for hash, firstPos := range first {
+		state := b.dedup[hash]
+		switch {
+		case state == nil:
+			b.dedup[hash] = &dedupState{firstIdx: firstPos}
+		case firstPos > state.firstIdx:
+			// The original occurrence was trimmed; collapse this payload
+			// everywhere from now on.
+			state.firstIdx = firstPos
+			state.superseded = true
+		}
+	}
+	b.mu.Unlock()
+
+	// Second pass: replace occurrences per the persistent state.
+	seen := map[string]bool{}
+	position = 0
+	for index := range result.View {
+		for blockIndex := range result.View[index].Content {
+			block := &result.View[index].Content[blockIndex]
+			if block.Type != "tool_result" || len(block.Content) < b.opts.MinDedupBytes {
+				continue
+			}
+			hash := Hash(block.Content)
+			state := b.dedup[hash]
+			replace := state != nil && state.superseded
+			if !replace {
+				if seen[hash] {
+					replace = true
+				} else {
+					seen[hash] = true
+					b.storeCAB(block.Content)
+				}
+			}
+			if replace {
 				originalLen := len(block.Content)
 				block.Content = fmt.Sprintf("[duplicate payload sha256:%s; identical to an earlier tool result — retrieve via retrieve_uncompressed_context key %s]", hash, hash)
 				result.SavedBytes += originalLen - len(block.Content)
 				result.Replaced++
-				continue
 			}
-			seen[hash] = true
-			b.storeCAB(block.Content)
+			position++
 		}
 	}
 	return result
@@ -246,10 +318,16 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 
 	hashes := make([]string, len(messages))
 	byteLen := make([]int, len(messages))
+	tokenLen := make([]int, len(messages))
 	for i, message := range messages {
 		hashes[i] = messageHash(message)
 		raw, _ := json.Marshal(message)
 		byteLen[i] = len(raw)
+		if b.opts.Encoding != "" {
+			tokenLen[i] = tokens.Count(string(raw), b.opts.Encoding).Count + 4
+		} else {
+			tokenLen[i] = len(raw) / 4
+		}
 	}
 
 	candidates := boundaryCandidates(messages, b.opts.LiveZoneTurns)
@@ -261,10 +339,12 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 	lastChosenBytes := 0
 	for _, index := range candidates {
 		prefixBytes := 0
+		prefixTokens := 0
 		for i := 0; i < index; i++ {
 			prefixBytes += byteLen[i]
+			prefixTokens += tokenLen[i]
 		}
-		if prefixBytes < b.opts.MaxStableBytes {
+		if prefixBytes < b.opts.MaxStableBytes || prefixTokens < b.opts.MinCacheTokens {
 			continue
 		}
 		state := b.observePrefix(index, hashes[:index])
@@ -302,6 +382,24 @@ func boundaryCandidates(messages []provider.Message, liveTurns int) []int {
 		indices = append(indices, groups[index].start)
 	}
 	return indices
+}
+
+// SeedStability primes the stability tracker with the transcript that was
+// last sent to the provider, so a resumed session emits cache boundaries on
+// its first turn instead of starting cold at a 100% miss.
+func (b *Budget) SeedStability(messages []provider.Message) {
+	if b == nil || !b.opts.Enabled || len(messages) < 2 {
+		return
+	}
+	hashes := make([]string, len(messages))
+	for i, message := range messages {
+		hashes[i] = messageHash(message)
+	}
+	for _, index := range boundaryCandidates(messages, b.opts.LiveZoneTurns) {
+		b.mu.Lock()
+		b.stability[index] = &prefixState{hash: combineHashes(hashes[:index]), count: b.opts.MinStableTurns}
+		b.mu.Unlock()
+	}
 }
 
 // observePrefix records one observation of the prefix ending at index and
