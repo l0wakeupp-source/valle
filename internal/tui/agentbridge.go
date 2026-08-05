@@ -3,12 +3,17 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"rick/internal/agent"
+	"rick/internal/cache"
 	"rick/internal/config"
 	"rick/internal/glob"
 	"rick/internal/permission"
@@ -79,20 +84,8 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 
 	history := append([]provider.Message(nil), m.history...)
 	skills := m.deps.Skills
-	// Extract the last user message text for skill matching.
-	var userText string
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == provider.RoleUser {
-			for _, b := range history[i].Content {
-				if b.Type == "text" {
-					userText = b.Text
-					break
-				}
-			}
-			break
-		}
-	}
-	stableSystem, systemPrompt := buildSystemPromptParts(agentName, modelID, cwd, projectRoot, cfg, skills, userText)
+	stableSystem, systemPrompt := m.sessionSystemParts(agentName, modelID, cwd, projectRoot, cfg, skills)
+	schemas := m.pinnedToolSchemas()
 	go func() {
 		runner := agent.New(agent.Config{
 			Provider:           prov,
@@ -119,6 +112,8 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			RepoMapBlock:       m.sessionRepoMap(projectRoot, modelID),
 			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
 			DistillModel:       cfg.DistillModelFor(),
+			CacheRetention:     provider.CacheRetention(cfg.CacheRetention),
+			PinnedToolSchemas:  schemas,
 		})
 		appended, _ := runner.Run(ctx, history, ch)
 		// Results are delivered through the channel; the appended slice is
@@ -136,11 +131,21 @@ func (m *Model) drainCmd(runID uint64) tea.Cmd {
 	return tea.Tick(40*time.Millisecond, func(time.Time) tea.Msg { return readAgentMsg{runID: runID} })
 }
 
+// sessionID returns the active session id, creating the session eagerly so
+// session-scoped freeze keys (system prompt parts, pinned tools) are unique
+// even before the first save.
 func (m *Model) sessionID() string {
-	if m.sess != nil {
-		return m.sess.ID
+	if m.sess == nil {
+		m.sess = &session.Session{
+			ID:      session.NewID(),
+			Cwd:     m.deps.Cwd,
+			Created: time.Now(),
+		}
+		if m.deps.Store != nil {
+			_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
+		}
 	}
-	return ""
+	return m.sess.ID
 }
 
 // drainAgent pulls whatever is available from the agent channel.
@@ -252,6 +257,7 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			m.billed.Output += ev.Usage.OutputTokens
 			m.billed.CacheRead += ev.Usage.CacheReadTokens
 			m.billed.CacheWrite += ev.Usage.CacheWriteTokens
+			m.observeCacheUsage(ev.Usage)
 			if m.deps.Usage != nil {
 				_ = m.deps.Usage.Record(m.modelID,
 					ev.Usage.InputTokens, ev.Usage.OutputTokens,
@@ -281,6 +287,35 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 		return m.finishRun(nil), true
 	}
 	return nil, false
+}
+
+// observeCacheUsage detects per-turn cache misses (pi's cache-stats.ts
+// contract): prompt tokens that were in the previous request's prompt but
+// were not read from cache, above a 1024-token noise floor. Consecutive
+// misses get a one-line system notice so cache regressions are visible.
+func (m *Model) observeCacheUsage(u *provider.Usage) {
+	promptTokens := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	if promptTokens <= 0 {
+		return
+	}
+	reported := u.CacheReadTokens+u.CacheWriteTokens > 0
+	if m.cachePrevPrompt > 0 && (reported || m.cachePrevReported) {
+		missed := min(m.cachePrevPrompt, promptTokens) - u.CacheReadTokens
+		if missed > cacheMissNoiseFloor {
+			m.cacheMissTokens += missed
+			m.cacheMissCount++
+			m.cacheMissStreak++
+			if m.cacheMissStreak == 2 {
+				m.appendMsg(ChatMsg{Kind: MsgSystem,
+					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (idle gap or prefix change)",
+						humanTokens(missed)), Time: time.Now()})
+			}
+		} else {
+			m.cacheMissStreak = 0
+		}
+	}
+	m.cachePrevPrompt = promptTokens
+	m.cachePrevReported = m.cachePrevReported || reported
 }
 
 // recordChildUsage updates persistent accounting from a child runner. Child
@@ -357,7 +392,7 @@ func (m *Model) finishRun(err error) tea.Cmd {
 // transcript. Large tool results remain available to local session export and
 // in-memory replay, but are not replayed in full on every provider turn.
 func (m *Model) rebuildHistory() {
-	m.history = capHistory(m.buildHistory(historyToolOutputChars))
+	m.history = m.capHistoryCacheAware(m.buildHistory(historyToolOutputChars))
 }
 
 func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
@@ -454,6 +489,58 @@ func capHistory(history []provider.Message) []provider.Message {
 	summaryText := fmt.Sprintf("Earlier conversation compacted: %d messages omitted.", removed)
 	summary := provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "text", Text: summaryText}}}
 	return append([]provider.Message{summary}, history[removed:]...)
+}
+
+// capHistoryCacheAware bounds the provider-facing transcript without
+// rewriting the stable cached prefix: the compaction summary is inserted
+// right after the last cache boundary that survives the trim, so the bytes
+// the provider still has cached stay byte-identical. Falls back to the plain
+// front-summary form when no budget/boundary is known or the cap would blow.
+func (m *Model) capHistoryCacheAware(history []provider.Message) []provider.Message {
+	if len(history) <= maxHistoryMessages && historyByteSize(history) <= maxHistoryBytes {
+		return history
+	}
+
+	removed := 0
+	remainingBytes := historyByteSize(history)
+	for removed < len(history)-1 && (len(history)-removed+1 > maxHistoryMessages || remainingBytes > maxHistoryBytes) {
+		remainingBytes -= messageByteSize(history[removed])
+		removed++
+	}
+	if removed == 0 {
+		return history
+	}
+
+	summaryText := fmt.Sprintf("Earlier conversation compacted: %d messages omitted.", removed)
+	summary := provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "text", Text: summaryText}}}
+	plain := append([]provider.Message{summary}, history[removed:]...)
+
+	insert := 0
+	if m.deps.Budget != nil {
+		insert = lastBoundaryBefore(history, removed, m.deps.Budget.ChooseBoundaries(history))
+	}
+	if insert == 0 {
+		return plain
+	}
+	kept := append([]provider.Message{}, history[:insert]...)
+	kept = append(kept, summary)
+	kept = append(kept, history[removed:]...)
+	if len(kept) > maxHistoryMessages || historyByteSize(kept) > maxHistoryBytes {
+		return plain
+	}
+	return kept
+}
+
+// lastBoundaryBefore returns the newest cache boundary index strictly before
+// the trim point, so the summary lands immediately after the cached prefix.
+func lastBoundaryBefore(history []provider.Message, removed int, boundaries map[int]bool) int {
+	insert := 0
+	for index := range boundaries {
+		if index > insert && index < removed {
+			insert = index
+		}
+	}
+	return insert
 }
 
 func historyByteSize(history []provider.Message) int {
@@ -564,6 +651,15 @@ func buildSystemPrompt(agentName, modelID, cwd, projectRoot string, cfg config.C
 	return prompt
 }
 
+// sessionSkillBlock renders the skills block against the session-stable user
+// prompt, so its bytes never change between turns.
+func sessionSkillBlock(skills []plugin.Skill, userText string) string {
+	if len(skills) == 0 || userText == "" {
+		return ""
+	}
+	return plugin.SkillBlock(plugin.MatchSkills(skills, userText))
+}
+
 func buildSystemPromptParts(agentName, modelID, cwd, projectRoot string, cfg config.Config, skills []plugin.Skill, userText string) (string, string) {
 	base := agent.BuildPrompt
 	if agentName == "plan" {
@@ -574,34 +670,147 @@ func buildSystemPromptParts(agentName, modelID, cwd, projectRoot string, cfg con
 	}
 
 	stable := base + agent.ProjectContext(projectRoot, cfg.Instructions)
-	volatile := ""
-	if len(skills) > 0 && userText != "" {
-		volatile += plugin.SkillBlock(plugin.MatchSkills(skills, userText))
-	}
-	volatile += agent.Environment(cwd, modelID, agentName, session.GitInfo(cwd))
+	volatile := sessionSkillBlock(skills, userText) + agent.Environment(cwd, modelID, agentName, session.GitInfo(cwd))
 	return stable, stable + volatile
+}
+
+// sessionSystemParts returns the system prompt split for the active session.
+// The volatile bytes (skills match, environment git state) are frozen once
+// per (session, model, agent) so every turn sends a byte-identical cached
+// prefix. The session id in the key prevents a brand-new session from
+// reusing the previous one's frozen volatile bytes.
+func (m *Model) sessionSystemParts(agentName, modelID, cwd, projectRoot string, cfg config.Config, skills []plugin.Skill) (string, string) {
+	key := m.sessionID() + "\x00" + agentName + "\x00" + modelID
+	if m.sysPartsStable != "" && m.sysPartsKey == key {
+		return m.sysPartsStable, m.sysPartsStable + m.sysPartsVolatile
+	}
+	base := agent.BuildPrompt
+	if agentName == "plan" {
+		base = agent.PlanPrompt
+	}
+	if a, ok := cfg.Agents[agentName]; ok && a.Prompt != "" {
+		base = a.Prompt
+	}
+	stable := base + agent.ProjectContext(projectRoot, cfg.Instructions)
+	volatile := sessionSkillBlock(skills, m.initialPrompt()) +
+		agent.Environment(cwd, modelID, agentName, m.sessionGitInfo())
+	m.sysPartsKey = key
+	m.sysPartsStable = stable
+	m.sysPartsVolatile = volatile
+	return stable, stable + volatile
+}
+
+// sessionGitInfo returns the git-state line frozen at session start. The
+// first turn captures it and the session file persists it, so a resumed
+// session reproduces byte-identical environment bytes and the provider cache
+// stays warm across the restart.
+func (m *Model) sessionGitInfo() string {
+	if m.sess != nil && m.sess.EnvGit != "" {
+		return m.sess.EnvGit
+	}
+	info := session.GitInfo(m.deps.Cwd)
+	if m.sess != nil {
+		m.sess.EnvGit = info
+	}
+	return info
+}
+
+// pinnedToolSchemas returns the provider-facing tool list frozen for the
+// session. The list is recomputed only when the session, model, agent, or
+// the user's /tools toggles change, so mid-session plugin churn never
+// alters the cached prefix bytes.
+func (m *Model) pinnedToolSchemas() []provider.ToolSchema {
+	key := m.sessionID() + "\x00" + m.agentName + "\x00" + m.modelID + "\x00" + toolToggleSignature(m.disabledTools)
+	if m.toolSchemasPinned != nil && m.toolSchemasKey == key {
+		return m.toolSchemasPinned
+	}
+	m.toolSchemasPinned = m.deps.Registry.Schemas(m.toolFilter())
+	m.toolSchemasKey = key
+	return m.toolSchemasPinned
+}
+
+// toolToggleSignature folds the user's /tools toggles into the pin key so a
+// deliberate tool change invalidates the pinned list (and the cache) exactly
+// once, instead of every turn.
+func toolToggleSignature(disabled map[string]bool) string {
+	if len(disabled) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(disabled))
+	for name, value := range disabled {
+		if value {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // sessionRepoMap returns the session-wide RepoMap block, computed once so
 // every turn of the session sends a byte-identical system suffix and the
 // provider prompt cache stays warm. The prompt weighting uses the first user
-// request.
+// request. Blocks are also cached on disk keyed by the git tree hash, so a
+// restarted session with an unchanged tree skips the expensive rebuild.
 func (m *Model) sessionRepoMap(projectRoot, modelID string) string {
 	if projectRoot == "" {
 		return ""
 	}
 	m.repoMapOnce.Do(func() {
-		block, err := repomap.Build(repomap.Options{
-			Root:      projectRoot,
-			Prompt:    m.initialPrompt(),
-			MaxTokens: 0,
-			Encoding:  tokens.EncodingForModel(modelID),
-		})
-		if err == nil {
-			m.repoMapBlock = block
+		encoding := tokens.EncodingForModel(modelID)
+		prompt := m.initialPrompt()
+		build := func() string {
+			block, err := repomap.Build(repomap.Options{
+				Root:      projectRoot,
+				Prompt:    prompt,
+				MaxTokens: 0,
+				Encoding:  encoding,
+			})
+			if err != nil {
+				return ""
+			}
+			return block
 		}
+		if disk := m.repoDisk(); disk != nil {
+			if tree := gitTreeHash(projectRoot); tree != "" {
+				key := strings.Join([]string{projectRoot, tree, string(encoding), prompt}, "\x00")
+				if data, ok := disk.Get(key); ok && len(data) > 0 {
+					m.repoMapBlock = string(data)
+					return
+				}
+				if block := build(); block != "" {
+					m.repoMapBlock = block
+					disk.Put(key, []byte(block))
+				}
+				return
+			}
+		}
+		m.repoMapBlock = build()
 	})
 	return m.repoMapBlock
+}
+
+// repoDisk lazily opens the content-addressed disk cache shared by sessions.
+func (m *Model) repoDisk() *cache.Dir {
+	m.repoDiskOnce.Do(func() {
+		dir, err := cache.New(filepath.Join(config.GlobalDir(), "cache"), 128)
+		if err == nil {
+			m.repoDiskDir = dir
+		}
+	})
+	return m.repoDiskDir
+}
+
+// gitTreeHash returns the content hash of the working tree (HEAD^{tree}),
+// used to key the disk-cached RepoMap so a stale map is never reused.
+func gitTreeHash(dir string) string {
+	cmd := exec.Command("git", "rev-parse", "HEAD^{tree}")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // initialPrompt returns the first plain user text of the session, used to
