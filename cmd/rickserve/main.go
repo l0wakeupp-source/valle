@@ -281,7 +281,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.8"
+var rickVersion = "0.1.10"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -1609,10 +1609,8 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 	if agentName == "" {
 		agentName = "build"
 	}
+	// maxTurns <= 0 means unlimited; the repeated-call guard still stops loops.
 	maxTurns := req.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 50
-	}
 
 	// Build permission engine.
 	permPolicy := config.ResolvePermission(s.loaded.Config, s.loaded.Config.Permission)
@@ -1757,6 +1755,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		Plugins:      s.plugins,
 		Parallel:     true,
 		Snapshotter:  snapshotter,
+		CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
 	})
 
 	ch := make(chan agent.Event, 256)
@@ -1958,8 +1957,9 @@ func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms
 			SessionID:    sid,
 			AgentName:    kind,
 			Depth:        depth,
-			MaxTurns:     30,
+			MaxTurns:     0, // unlimited; the repeated-call guard still stops loops
 			Plugins:      s.plugins,
+			CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
 			Parallel:     true,
 			Registry:     reg,
 		}, prompt, func(ev agent.Event) {
@@ -2040,9 +2040,10 @@ func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, p
 				SessionID: sid,
 				AgentName: spec.Name,
 				Depth:     1,
-				MaxTurns:  30,
+				MaxTurns:  0, // unlimited; the repeated-call guard still stops loops
 				Plugins:   s.plugins,
 				Parallel:  true,
+				CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
 			}
 			taskID := spec.TaskID
 			if taskID == "" {
