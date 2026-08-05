@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"rick/internal/config"
 )
 
 const defaultToolOutputLimit = 15 << 10
@@ -66,12 +68,70 @@ func storeFetchResult(key string, result Result) {
 	}
 	result.Meta = nil
 	fetchCache.entries[key] = fetchCacheEntry{created: time.Now(), result: result}
+	persistFetchCache()
 }
 
 func resetFetchCache() {
 	fetchCache.Lock()
 	fetchCache.entries = make(map[string]fetchCacheEntry)
 	fetchCache.Unlock()
+}
+
+// --- disk persistence ---
+
+var fetchCacheFile = filepath.Join(config.GlobalDir(), "fetch_cache.json")
+
+type diskFetchEntry struct {
+	Key     string    `json:"key"`
+	Created time.Time `json:"created"`
+	Output  string    `json:"output"`
+	Title   string    `json:"title"`
+}
+
+// persistFetchCache mirrors the in-memory fetch cache to disk so repeated
+// fetches survive process restarts within the TTL. fetchCache must be held.
+func persistFetchCache() {
+	entries := make([]diskFetchEntry, 0, len(fetchCache.entries))
+	for key, entry := range fetchCache.entries {
+		entries = append(entries, diskFetchEntry{
+			Key: key, Created: entry.created, Output: entry.result.Output, Title: entry.result.Title,
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	tmp := fetchCacheFile + ".tmp"
+	if os.WriteFile(tmp, data, 0o644) == nil {
+		_ = os.Rename(tmp, fetchCacheFile)
+	}
+}
+
+func loadFetchCache() {
+	data, err := os.ReadFile(fetchCacheFile)
+	if err != nil {
+		return
+	}
+	var entries []diskFetchEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return
+	}
+	for _, e := range entries {
+		if time.Since(e.Created) >= fetchCacheTTL {
+			continue
+		}
+		if _, exists := fetchCache.entries[e.Key]; exists || len(fetchCache.entries) >= maxFetchCacheEntries {
+			continue
+		}
+		fetchCache.entries[e.Key] = fetchCacheEntry{
+			created: e.Created,
+			result:  Result{Output: e.Output, Title: e.Title},
+		}
+	}
+}
+
+func init() {
+	loadFetchCache()
 }
 
 func runBoundedCommand(ctx context.Context, cwd, name string, args ...string) (string, error) {
