@@ -17,20 +17,28 @@ import (
 
 // Session is one conversation.
 type Session struct {
-	ID           string             `json:"id"`
-	Title        string             `json:"title"`
-	Cwd          string             `json:"cwd"`
-	Model        string             `json:"model"`
-	Agent        string             `json:"agent"`
-	Parent       string             `json:"parent,omitempty"`
-	Category     string             `json:"category,omitempty"`
-	Favorite     bool               `json:"favorite,omitempty"`
-	Created      time.Time          `json:"created"`
-	Updated      time.Time          `json:"updated"`
-	Messages     []provider.Message `json:"messages"`
-	Snapshots    []Snapshot         `json:"snapshots,omitempty"`
-	Usage        Usage              `json:"usage"`
-	Optimization OptimizationUsage  `json:"optimization,omitempty"`
+	ID       string             `json:"id"`
+	Title    string             `json:"title"`
+	Cwd      string             `json:"cwd"`
+	Model    string             `json:"model"`
+	Agent    string             `json:"agent"`
+	Parent   string             `json:"parent,omitempty"`
+	Category string             `json:"category,omitempty"`
+	Favorite bool               `json:"favorite,omitempty"`
+	Created  time.Time          `json:"created"`
+	Updated  time.Time          `json:"updated"`
+	Messages []provider.Message `json:"messages"`
+	// SentTranscript is the exact bounded provider-facing view last sent, so
+	// a resumed session can replay byte-identical bytes and warm the provider
+	// prompt cache on its first turn.
+	SentTranscript []provider.Message `json:"sent_transcript,omitempty"`
+	// EnvGit is the git-state line (branch + dirty count) frozen when the
+	// session started. Resuming reuses it so the system prompt's environment
+	// block is byte-identical and the provider cache survives the restart.
+	EnvGit       string            `json:"env_git,omitempty"`
+	Snapshots    []Snapshot        `json:"snapshots,omitempty"`
+	Usage        Usage             `json:"usage"`
+	Optimization OptimizationUsage `json:"optimization,omitempty"`
 }
 
 // OptimizationUsage accumulates exact local measurements for provider-facing
