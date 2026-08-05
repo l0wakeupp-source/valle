@@ -204,6 +204,19 @@ func toWireWithReasoning(system string, msgs []provider.Message, includeReasonin
 	return toWireWithStable(system, "", msgs, includeReasoning)
 }
 
+// hasThinkingBlocks reports whether any prior turn produced reasoning that a
+// DeepSeek-style endpoint will demand be echoed back with reasoning_content.
+func hasThinkingBlocks(msgs []provider.Message) bool {
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == "thinking" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // toWireWithStable keeps the stable prompt in an earlier message than the
 // per-turn tail. Direct OpenAI caching can then retain the stable prefix while
 // the volatile environment and skill instructions continue to be sent.
@@ -342,6 +355,15 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	// force preservation so the endpoint never rejects the exchange with a
 	// "reasoning_content must be passed back" 400.
 	if c.ID == "opencode-zen" || c.ID == "opencode-go" {
+		preserveReasoning = true
+	}
+	// Deciding to strip reasoning from the wire must never depend on guessing
+	// the provider or model dialect. If any prior turn produced thinking, the
+	// DeepSeek-style endpoint requires that reasoning_content be echoed back
+	// verbatim on the next request — otherwise it rejects the exchange with a
+	// "reasoning_content must be passed back" 400. Check the actual history so
+	// we only ever preserve what genuinely exists.
+	if hasThinkingBlocks(req.Messages) {
 		preserveReasoning = true
 	}
 	body := wireRequest{

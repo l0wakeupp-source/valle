@@ -123,6 +123,64 @@ func TestOpenCodeZenPreservesReasoningContent(t *testing.T) {
 	}
 }
 
+// reasoningEchoClient runs Stream against a probe server and returns the
+// decoded JSON request it received.
+func reasoningEchoClient(t *testing.T, providerID, model string, messages []provider.Message, level provider.ReasoningEffort) map[string]any {
+	t.Helper()
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &request)
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(providerID, "test-key", server.URL)
+	client.HTTP = server.Client()
+	events := make(chan provider.Event)
+	go client.Stream(context.Background(), provider.Request{
+		Model:     model,
+		Messages:  messages,
+		Reasoning: level,
+	}, events)
+	for range events {
+	}
+	return request
+}
+
+// When history contains thinking but the model name classifies as non-reasoning
+// (OpenAI-effort or none), rick must still echo reasoning_content back. The
+// DeepSeek-style endpoint rejects the exchange otherwise, regardless of the
+// provider id — so the old hardcoded opencode-zen/open-code-go whitelist was
+// not enough.
+func TestReasoningEchoedForAnyProviderWhenHistoryHasThinking(t *testing.T) {
+	prior := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "prior reasoning"}}}
+	for _, test := range []struct {
+		id    string
+		model string
+	}{
+		// gemini/gpt names classify as OpenAI-effort style; on a plain OpenAI
+		// provider that would normally strip reasoning_content.
+		{"custom-gateway", "gemini-3-pro"},
+		{"openwebui", "gpt-5"},
+		{"ollama", "deepseek-r1"},
+	} {
+		request := reasoningEchoClient(t, test.id, test.model, []provider.Message{prior, provider.UserText("continue")}, provider.ReasoningHigh)
+		messages, ok := request["messages"].([]any)
+		if !ok || len(messages) == 0 {
+			t.Fatalf("%s: messages = %#v", test.id, request["messages"])
+		}
+		encoded, err := json.Marshal(messages[0])
+		if err != nil {
+			t.Fatalf("%s: encode sent assistant message: %v", test.id, err)
+		}
+		if !strings.Contains(string(encoded), `"reasoning_content":"prior reasoning"`) {
+			t.Fatalf("%s: history with thinking dropped reasoning_content, got %s", test.id, encoded)
+		}
+	}
+}
+
 func TestOpenRouterUsesNormalizedReasoningObject(t *testing.T) {
 	var request map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
