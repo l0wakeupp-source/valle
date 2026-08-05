@@ -349,7 +349,7 @@ func latestSessionTitle(d Deps) string {
 //
 // Layout, widest first:
 //
-//	399k/1M ████████░░░░░░░░ 40%  ↑12.4k ↓3.4k ⚡2.0k  8.2s  reasoning:medium
+//	399k/1M ████████░░░░░░░░ 40%  ↑12.4k ↓3.4k ⚡2.0k 87.50%  8.2s  reasoning:medium
 //
 // Each piece is dropped in order of least value when the terminal is narrow,
 // so the gauge survives longest.
@@ -467,6 +467,9 @@ func (m *Model) contextGaugeCompact() string {
 // tokenSplit reports what the session has actually spent, by kind. Cache hits
 // are billed differently from fresh input, so they are worth separating.
 // Input = cache miss (new tokens), ⚡ = cache hit (read), ✏ = cache write.
+// The trailing percentage is the session cache hit rate
+// CacheRead/(Input+CacheRead); it drops below 90% (a ≥10% miss rate) and is
+// flagged in the warning colour when the cache is not paying off.
 func (m *Model) tokenSplit() string {
 	s := m.styles
 	if m.billed.Input+m.billed.Output+m.billed.CacheRead+m.billed.CacheWrite == 0 {
@@ -481,6 +484,17 @@ func (m *Model) tokenSplit() string {
 	}
 	if m.billed.CacheWrite > 0 {
 		parts = append(parts, s.Secondary.Render("✏"+humanTokens(m.billed.CacheWrite)))
+	}
+	if denom := m.billed.Input + m.billed.CacheRead; denom > 0 {
+		hitRate := float64(m.billed.CacheRead) * 100 / float64(denom)
+		style := s.Faint
+		if hitRate < 90 {
+			style = s.Warning
+		}
+		parts = append(parts, style.Render(fmt.Sprintf("%.2f%% hit", hitRate)))
+	}
+	if m.cacheMissCount > 0 {
+		parts = append(parts, s.Warning.Render(fmt.Sprintf("⚠%d miss (%s)", m.cacheMissCount, humanTokens(m.cacheMissTokens))))
 	}
 	return strings.Join(parts, " ")
 }
