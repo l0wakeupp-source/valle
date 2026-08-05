@@ -155,6 +155,9 @@ type wireRequest struct {
 	MaxTokens      int           `json:"max_completion_tokens,omitempty"`
 	Temperature    *float64      `json:"temperature,omitempty"`
 	PromptCacheKey string        `json:"prompt_cache_key,omitempty"`
+	// PromptCacheRetention is the OpenAI chat-completions cache-retention
+	// hint ("24h" for long retention). Gateway providers ignore it.
+	PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
 	// Effort is OpenAI's reasoning control; Qwen-style endpoints use the
 	// boolean instead. Only one is ever set.
 	Effort         string         `json:"reasoning_effort,omitempty"`
@@ -163,11 +166,14 @@ type wireRequest struct {
 	Reasoning      *wireReasoning `json:"reasoning,omitempty"`
 }
 
-func promptCacheKey(model, stableSystem string) string {
-	if strings.TrimSpace(stableSystem) == "" {
+// promptCacheKey derives a session-scoped cache key. The session id is stable
+// across resume, so a restarted session keeps hitting the same cache even if
+// the volatile system tail drifts between sessions.
+func promptCacheKey(model, sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(model + "\x00" + stableSystem))
+	digest := sha256.Sum256([]byte(model + "\x00" + sessionID))
 	return hex.EncodeToString(digest[:])
 }
 
@@ -337,7 +343,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		StreamOpts:     &streamOpts{IncludeUsage: true},
 		MaxTokens:      req.MaxTokens,
 		Temperature:    req.Temperature,
-		PromptCacheKey: promptCacheKey(req.Model, req.SystemStable),
+		PromptCacheKey: promptCacheKey(req.Model, req.SessionID),
 	}
 	if c.ID == "openai" {
 		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning)
@@ -346,6 +352,16 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
 		// hint. The stable system prefix is still sent to every provider.
 		body.PromptCacheKey = ""
+	}
+	switch req.CacheRetention {
+	case provider.CacheRetentionNone:
+		// "none" omits the cache key and retention hint so the one-off call
+		// (distillation, compaction) never reads or writes the session cache.
+		body.PromptCacheKey = ""
+	case provider.CacheRetentionLong:
+		if c.ID == "openai" {
+			body.PromptCacheRetention = "24h"
+		}
 	}
 
 	// OpenRouter has one normalized reasoning object. Use it for every
@@ -427,6 +443,20 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 	for k, v := range c.Headers {
 		httpReq.Header.Set(k, v)
+	}
+	// Session-affinity hints keep the prompt cache warm on the provider's
+	// router: direct OpenAI uses session_id/x-client-request-id (plus the
+	// legacy x-session-affinity), OpenRouter uses x-session-id. One-off calls
+	// (retention none) skip the hints so they never ride a session's cache.
+	if req.CacheRetention != provider.CacheRetentionNone && req.SessionID != "" {
+		switch {
+		case c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai"):
+			httpReq.Header.Set("x-session-id", req.SessionID)
+		case c.ID == "openai" || strings.Contains(c.BaseURL, "api.openai.com"):
+			httpReq.Header.Set("session_id", req.SessionID)
+			httpReq.Header.Set("x-client-request-id", req.SessionID)
+			httpReq.Header.Set("x-session-affinity", req.SessionID)
+		}
 	}
 
 	resp, err := c.HTTP.Do(httpReq)
@@ -519,8 +549,10 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 				PromptTokens        int `json:"prompt_tokens"`
 				CompletionTokens    int `json:"completion_tokens"`
 				PromptTokensDetails struct {
-					CachedTokens int `json:"cached_tokens"`
+					CachedTokens     int `json:"cached_tokens"`
+					CacheWriteTokens int `json:"cache_write_tokens"`
 				} `json:"prompt_tokens_details"`
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 			} `json:"usage"`
 			Error *struct {
 				Message string `json:"message"`
@@ -535,9 +567,23 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			return
 		}
 		if chunk.Usage != nil {
-			usage.InputTokens = chunk.Usage.PromptTokens - chunk.Usage.PromptTokensDetails.CachedTokens
+			// cached_tokens is the cache-read count; OpenRouter-compatible
+			// providers may additionally report cache_write_tokens. OpenAI
+			// does not document writes, so never subtract reads from the
+			// write bucket (pi/OpenRouter contract).
+			cacheRead := chunk.Usage.PromptTokensDetails.CachedTokens
+			if cacheRead == 0 {
+				cacheRead = chunk.Usage.PromptCacheHitTokens
+			}
+			cacheWrite := chunk.Usage.PromptTokensDetails.CacheWriteTokens
+			input := chunk.Usage.PromptTokens - cacheRead - cacheWrite
+			if input < 0 {
+				input = 0
+			}
+			usage.InputTokens = input
 			usage.OutputTokens = chunk.Usage.CompletionTokens
-			usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			usage.CacheReadTokens = cacheRead
+			usage.CacheWriteTokens = cacheWrite
 		}
 		for _, choice := range chunk.Choices {
 			if t := choice.Delta.Content; t != "" {
