@@ -1,8 +1,10 @@
 package sandbox
 
 import (
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"rick/internal/glob"
 )
@@ -36,11 +38,51 @@ var essentialVars = []string{
 	"VIRTUAL_ENV", "CONDA_PREFIX", "MSYSTEM", "PS_MODULE_PATH",
 }
 
+// environMemo caches the scrubbed base environment per policy so the
+// credential-pattern scan runs once instead of once per command invocation.
+var environMemo = struct {
+	sync.Mutex
+	m map[string][]string
+}{m: map[string][]string{}}
+
 // Environ builds the environment for a sandboxed command from the parent
-// environment, applying credential scrubbing and network blackholing.
+// environment, applying credential scrubbing and network blackholing. The
+// scrubbed base is memoized per policy; only the per-command extras vary.
 func Environ(p Policy, extra ...string) []string {
+	key := environFingerprint(p)
+	environMemo.Lock()
+	base, ok := environMemo.m[key]
+	if !ok {
+		base = scrubbedEnviron(p)
+		environMemo.m[key] = append([]string(nil), base...)
+		if len(environMemo.m) > 128 {
+			for existingKey := range environMemo.m {
+				if existingKey != key {
+					delete(environMemo.m, existingKey)
+					break
+				}
+			}
+		}
+	}
+	environMemo.Unlock()
+
+	out := append([]string(nil), base...)
+	out = append(out, extra...)
+	return out
+}
+
+// environFingerprint covers every policy field the scrub loop and the
+// blackhole flags read; identical fingerprints reuse the same base.
+func environFingerprint(p Policy) string {
+	return fmt.Sprintf("%s|%s|%t|%t|%v|%v|%s",
+		p.Mode, p.Enforcement, p.Network, p.KeepCredentials, p.AllowEnv, p.DenyEnv, p.Workspace)
+}
+
+// scrubbedEnviron applies the credential-scrub and blackhole logic to the
+// current parent environment.
+func scrubbedEnviron(p Policy) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+len(extra)+8)
+	out := make([]string, 0, len(base)+8)
 
 	for _, kv := range base {
 		key, _, ok := strings.Cut(kv, "=")
@@ -75,7 +117,6 @@ func Environ(p Policy, extra ...string) []string {
 		)
 	}
 
-	out = append(out, extra...)
 	return out
 }
 
@@ -112,12 +153,29 @@ func matchesAny(patterns []string, upper string) bool {
 // ScrubbedCount reports how many variables the policy would strip, for the
 // /sandbox display.
 func ScrubbedCount(p Policy) int {
+	key := environFingerprint(p)
+	environMemo.Lock()
+	defer environMemo.Unlock()
+	if n, ok := scrubbedMemo[key]; ok {
+		return n
+	}
 	n := 0
 	for _, kv := range os.Environ() {
-		key, _, ok := strings.Cut(kv, "=")
-		if ok && !p.keepVar(key) {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && !p.keepVar(k) {
 			n++
 		}
 	}
+	if len(scrubbedMemo) > 128 {
+		for existingKey := range scrubbedMemo {
+			if existingKey != key {
+				delete(scrubbedMemo, existingKey)
+				break
+			}
+		}
+	}
+	scrubbedMemo[key] = n
 	return n
 }
+
+var scrubbedMemo = map[string]int{}
