@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"rick/pkg/contextbudget"
 )
 
 // Permission levels.
@@ -27,6 +29,16 @@ func ValidateSubagentDepth(depth int) error {
 		return fmt.Errorf("subagent_depth must be 1..%d", MaxSubagentDepth)
 	}
 	return nil
+}
+
+// ValidateCacheRetention validates the cache_retention setting.
+func ValidateCacheRetention(retention string) error {
+	switch retention {
+	case "", "long", "none":
+		return nil
+	default:
+		return fmt.Errorf("cache_retention must be one of \"long\", \"none\", or empty (default), got %q", retention)
+	}
 }
 
 // Provider is one configured LLM backend.
@@ -161,19 +173,70 @@ type WebSearchProviderConfig struct {
 // provider pipeline. Existing domain and budget fields remain compatible with
 // the original web_search configuration shape.
 type WebSearchConfig struct {
-	AllowDomains          []string                           `json:"allow_domains,omitempty"`            // if set, only these domains
-	DenyDomains           []string                           `json:"deny_domains,omitempty"`             // always blocked
-	MaxResults            int                                `json:"max_results,omitempty"`              // default 5
-	MaxSearchesPerSession int                                `json:"max_searches_per_session,omitempty"` // budget, default 10
-	Provider              string                             `json:"provider,omitempty"`
-	Mode                  string                             `json:"mode,omitempty"`
-	Parallel              *bool                              `json:"parallel,omitempty"`
-	MaxParallel           int                                `json:"max_parallel,omitempty"`
-	HedgeAfterMS          int                                `json:"hedge_after_ms,omitempty"`
-	LogicalBudget         int                                `json:"logical_budget,omitempty"`
-	CacheTTLSeconds       int                                `json:"cache_ttl_seconds,omitempty"`
-	MaxConcurrent         int                                `json:"max_concurrent,omitempty"`
-	Providers             map[string]WebSearchProviderConfig `json:"providers,omitempty"`
+	AllowDomains          []string `json:"allow_domains,omitempty"`            // if set, only these domains
+	DenyDomains           []string `json:"deny_domains,omitempty"`             // always blocked
+	MaxResults            int      `json:"max_results,omitempty"`              // default 5
+	MaxSearchesPerSession int      `json:"max_searches_per_session,omitempty"` // budget, default 10
+	// CacheMaxLen bounds the in-memory/disk query cache entries.
+	CacheMaxLen     int                                `json:"cache_max_len,omitempty"`
+	Provider        string                             `json:"provider,omitempty"`
+	Mode            string                             `json:"mode,omitempty"`
+	Parallel        *bool                              `json:"parallel,omitempty"`
+	MaxParallel     int                                `json:"max_parallel,omitempty"`
+	HedgeAfterMS    int                                `json:"hedge_after_ms,omitempty"`
+	LogicalBudget   int                                `json:"logical_budget,omitempty"`
+	CacheTTLSeconds int                                `json:"cache_ttl_seconds,omitempty"`
+	MaxConcurrent   int                                `json:"max_concurrent,omitempty"`
+	Providers       map[string]WebSearchProviderConfig `json:"providers,omitempty"`
+}
+
+// ContextBudgetConfig exposes the session context manager knobs
+// (content-addressed dedup, cache boundaries, live-zone compression) as
+// rick.json settings. Zero values keep the built-in defaults.
+type ContextBudgetConfig struct {
+	// MinStableTurns is how many identical observations a history prefix
+	// needs before it becomes a cache boundary.
+	MinStableTurns int `json:"min_stable_turns,omitempty"`
+	// LiveZoneTurns is how many newest logical turns are excluded from
+	// cache boundaries.
+	LiveZoneTurns int `json:"live_zone_turns,omitempty"`
+	// MaxStableBytes is the minimum serialized prefix size worth caching.
+	MaxStableBytes int `json:"max_stable_bytes,omitempty"`
+	// MaxBoundaries caps the cache breakpoints emitted per request
+	// (Anthropic allows 4 total including system and tools).
+	MaxBoundaries int `json:"max_boundaries,omitempty"`
+	// MinCacheTokens is the minimum prefix size (in tokens) a breakpoint
+	// must guard (providers ignore smaller prefixes).
+	MinCacheTokens int `json:"min_cache_tokens,omitempty"`
+	// MinDedupBytes is the minimum tool-result size considered for
+	// content-addressed deduplication.
+	MinDedupBytes int `json:"min_dedup_bytes,omitempty"`
+	// MaxCABPayloads caps the content-addressed store size.
+	MaxCABPayloads int `json:"max_cab_payloads,omitempty"`
+	// MaxLivePayloads caps the reversible live-zone store size.
+	MaxLivePayloads int `json:"max_live_payloads,omitempty"`
+	// LiveZoneCapBytes bounds live-zone compressed tool output.
+	LiveZoneCapBytes int `json:"live_zone_cap_bytes,omitempty"`
+}
+
+// ContextBudgetOptions renders the knobs as contextbudget.Options; zero
+// values become defaults inside contextbudget.New.
+func (c *ContextBudgetConfig) ContextBudgetOptions() contextbudget.Options {
+	if c == nil {
+		return contextbudget.Options{}
+	}
+	return contextbudget.Options{
+		Enabled:          true,
+		MinStableTurns:   c.MinStableTurns,
+		LiveZoneTurns:    c.LiveZoneTurns,
+		MaxStableBytes:   c.MaxStableBytes,
+		MaxBoundaries:    c.MaxBoundaries,
+		MinCacheTokens:   c.MinCacheTokens,
+		MinDedupBytes:    c.MinDedupBytes,
+		MaxCABPayloads:   c.MaxCABPayloads,
+		MaxLivePayloads:  c.MaxLivePayloads,
+		LiveZoneCapBytes: c.LiveZoneCapBytes,
+	}
 }
 
 // Config is rick.json.
@@ -211,6 +274,11 @@ type Config struct {
 	MaxBackground    int              `json:"max_background,omitempty"`
 	Plugins          []string         `json:"plugin,omitempty"`
 	WebSearch        *WebSearchConfig `json:"web_search,omitempty"`
+	// CacheRetention is the prompt-cache retention policy for all requests:
+	// "" (default/short), "long" (extended TTL), or "none" (caching off).
+	CacheRetention string `json:"cache_retention,omitempty"`
+	// ContextBudget exposes the session context manager knobs.
+	ContextBudget *ContextBudgetConfig `json:"context_budget,omitempty"`
 }
 
 // DistillModelFor returns the model used for the background distillation
