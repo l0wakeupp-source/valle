@@ -133,14 +133,10 @@ func TestBuildRequestDistillsStableOverBudgetHistory(t *testing.T) {
 	messages = append(messages, pairMessage("tlive", strings.Repeat("live", 400))...)
 	messages = append(messages, provider.UserText("latest request"))
 
-	// First request: the cache prefix is not stable yet, so the summarizer
-	// must not run. Second identical request: stability reaches the threshold
-	// and the oldest stable prefix is distilled away.
+	// The prefix is stable from the first observation (MinStableTurns
+	// defaults to 1 now that the system prompt and tools are frozen per
+	// session), so an over-budget history is distilled right away.
 	summarizer := runner.cfg.DistillSummarizer.(*stubDistillSummarizer)
-	runner.buildRequest(messages, nil)
-	if summarizer.calls != 0 {
-		t.Fatalf("summarizer ran before the cache prefix was stable (%d calls)", summarizer.calls)
-	}
 	request := runner.buildRequest(messages, nil)
 	if summarizer.calls == 0 {
 		t.Fatal("over-budget stable history was not distilled")
