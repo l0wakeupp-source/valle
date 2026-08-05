@@ -77,6 +77,52 @@ func TestStreamUsesGLMThinkingAndReasoningContent(t *testing.T) {
 	}
 }
 
+func TestOpenCodeZenPreservesReasoningContent(t *testing.T) {
+	prior := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "prior reasoning"}}}
+	wire := toWireWithReasoning("", []provider.Message{prior}, true)
+	encoded, err := json.Marshal(wire[0])
+	if err != nil {
+		t.Fatalf("encode assistant message: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"reasoning_content":"prior reasoning"`) {
+		t.Fatalf("assistant reasoning content missing from %s", encoded)
+	}
+
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &request)
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New("opencode-zen", "test-key", server.URL)
+	client.HTTP = server.Client()
+	events := make(chan provider.Event)
+	go client.Stream(context.Background(), provider.Request{
+		// Zen models cluster around gpt/gemini names, which would normally be
+		// classified as OpenAI-style reasoning and drop reasoning_content.
+		Model:     "gemini-3-pro",
+		Messages:  []provider.Message{prior, provider.UserText("continue")},
+		Reasoning: provider.ReasoningHigh,
+	}, events)
+	for range events {
+	}
+
+	messages, ok := request["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages = %#v", request["messages"])
+	}
+	encoded, err = json.Marshal(messages[0])
+	if err != nil {
+		t.Fatalf("encode sent assistant message: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"reasoning_content":"prior reasoning"`) {
+		t.Fatalf("zen request dropped reasoning_content, got %s", encoded)
+	}
+}
+
 func TestOpenRouterUsesNormalizedReasoningObject(t *testing.T) {
 	var request map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

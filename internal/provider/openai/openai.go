@@ -335,6 +335,15 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	if c.ID == "openrouter" && advertised != nil && advertised.ReasoningKnown {
 		preserveReasoning = true
 	}
+	// OpenCode Zen/Go serve OpenAI-compatible reasoning models built on
+	// DeepSeek-style thinking, which require the provider to echo the prior
+	// turn's reasoning_content back in the next request. A model name here
+	// rarely maps to a DeepSeek dialect (names cluster around gpt/gemini), so
+	// force preservation so the endpoint never rejects the exchange with a
+	// "reasoning_content must be passed back" 400.
+	if c.ID == "opencode-zen" || c.ID == "opencode-go" {
+		preserveReasoning = true
+	}
 	body := wireRequest{
 		Model:          req.Model,
 		Messages:       toWireWithReasoning(req.System, req.Messages, preserveReasoning),
