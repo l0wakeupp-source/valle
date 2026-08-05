@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 )
 
 // Load resolves the full config chain for a working directory.
@@ -15,7 +17,141 @@ import (
 //  3. RICK_CONFIG  (explicit file path)
 //  4. project  <root>/rick.json + <root>/tui.json  (and .rick/ variants)
 //  5. RICK_CONFIG_CONTENT (inline JSON override)
+//
+// Results are memoized per working directory, keyed by the mtimes of every
+// input file plus the RICK_CONFIG* environment values, so the (expensive)
+// JSONC parse chain runs once per process. Callers always receive a copy, so
+// mutating the returned config can never poison the cache.
 func Load(cwd string) (*Loaded, error) {
+	root := cachedProjectRoot(cwd)
+	fp := configFingerprint(cwd, root)
+
+	loadCacheMu.Lock()
+	if entry, ok := loadCache[cwd]; ok && entry.fingerprint == fp {
+		loadCacheMu.Unlock()
+		return cloneLoaded(entry.loaded), nil
+	}
+	loadCacheMu.Unlock()
+
+	loaded, err := loadUncached(cwd)
+	if err != nil {
+		return nil, err
+	}
+	loadCacheMu.Lock()
+	loadCache[cwd] = &cachedLoad{fingerprint: fp, loaded: loaded}
+	if len(loadCache) > 64 {
+		for k := range loadCache {
+			if k != cwd {
+				delete(loadCache, k)
+				break
+			}
+		}
+	}
+	loadCacheMu.Unlock()
+	return cloneLoaded(loaded), nil
+}
+
+type cachedLoad struct {
+	fingerprint string
+	loaded      *Loaded
+}
+
+var (
+	loadCacheMu sync.Mutex
+	loadCache   = map[string]*cachedLoad{}
+	rootCacheMu sync.Mutex
+	rootCache   = map[string]string{}
+)
+
+// cachedProjectRoot memoizes the FindProjectRoot walk per working directory.
+func cachedProjectRoot(cwd string) string {
+	rootCacheMu.Lock()
+	if root, ok := rootCache[cwd]; ok {
+		rootCacheMu.Unlock()
+		return root
+	}
+	rootCacheMu.Unlock()
+	root := FindProjectRoot(cwd)
+	rootCacheMu.Lock()
+	rootCache[cwd] = root
+	if len(rootCache) > 128 {
+		for k := range rootCache {
+			if k != cwd {
+				delete(rootCache, k)
+				break
+			}
+		}
+	}
+	rootCacheMu.Unlock()
+	return root
+}
+
+// configFingerprint captures every input Load reads: the mtimes and sizes of
+// the candidate config files plus the RICK_CONFIG* environment overrides.
+func configFingerprint(cwd, root string) string {
+	g := GlobalDir()
+	candidates := []string{
+		firstExisting(filepath.Join(g, "rick.jsonc"), filepath.Join(g, "rick.json")),
+		firstExisting(filepath.Join(g, "tui.jsonc"), filepath.Join(g, "tui.json")),
+	}
+	if p := os.Getenv("RICK_CONFIG"); p != "" {
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates,
+		firstExisting(
+			filepath.Join(root, "rick.jsonc"), filepath.Join(root, "rick.json"),
+			filepath.Join(root, ".rick", "rick.jsonc"), filepath.Join(root, ".rick", "rick.json"),
+		),
+		firstExisting(
+			filepath.Join(root, "tui.jsonc"), filepath.Join(root, "tui.json"),
+			filepath.Join(root, ".rick", "tui.jsonc"), filepath.Join(root, ".rick", "tui.json"),
+		),
+	)
+	var b strings.Builder
+	b.WriteString("cwd=" + cwd + ";")
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		st, err := os.Stat(p)
+		if err != nil {
+			b.WriteString(p + ":gone;")
+			continue
+		}
+		fmt.Fprintf(&b, "%s:%d:%d;", p, st.Size(), st.ModTime().UnixNano())
+	}
+	b.WriteString("rc=" + os.Getenv("RICK_CONFIG") + ";")
+	b.WriteString("ri=" + os.Getenv("RICK_CONFIG_CONTENT") + ";")
+	return b.String()
+}
+
+// cloneLoaded copies a cached Loaded so callers can mutate it freely.
+func cloneLoaded(l *Loaded) *Loaded {
+	out := &Loaded{ProjectRoot: l.ProjectRoot, SandboxRoot: l.SandboxRoot}
+	out.Sources = append([]string(nil), l.Sources...)
+	out.Config = cloneConfig(l.Config)
+	out.TUI = cloneTUI(l.TUI)
+	return out
+}
+
+func cloneConfig(c Config) Config {
+	var out Config
+	if data, err := json.Marshal(c); err == nil && json.Unmarshal(data, &out) == nil {
+		return out
+	}
+	return c
+}
+
+func cloneTUI(t TUI) TUI {
+	var out TUI
+	if data, err := json.Marshal(t); err == nil && json.Unmarshal(data, &out) == nil {
+		return out
+	}
+	return t
+}
+
+// loadUncached performs the full file parse chain without any memoization.
+func loadUncached(cwd string) (*Loaded, error) {
 	cfg, tui := Defaults()
 	root := FindProjectRoot(cwd)
 	l := &Loaded{ProjectRoot: root}
@@ -68,6 +204,9 @@ func Load(cwd string) (*Loaded, error) {
 		cfg.SubagentDepth = &depth
 	}
 	if err := ValidateSubagentDepth(*cfg.SubagentDepth); err != nil {
+		return nil, err
+	}
+	if err := ValidateCacheRetention(cfg.CacheRetention); err != nil {
 		return nil, err
 	}
 	if cfg.MaxBackground <= 0 {
