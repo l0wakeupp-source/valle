@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 )
 
 // BuildPrompt is the system prompt for the default all-tools agent.
@@ -56,12 +55,15 @@ Be fast: grep and glob aggressively, read only what matters, stop when you can a
 Report concrete findings with file paths and line numbers, not a search narrative.`
 
 // Environment renders the environment block appended to every system prompt.
+// The block must stay byte-stable for the whole session: a `Today:` date
+// would roll at midnight and invalidate the provider prompt cache, so the
+// date is deliberately omitted — the model can read it with a tool if it
+// matters. The git line is frozen once per session by the caller.
 func Environment(cwd, model, agentName string, gitInfo string) string {
 	var b strings.Builder
 	b.WriteString("\n\n## Environment\n")
 	fmt.Fprintf(&b, "Working directory: %s\n", cwd)
 	fmt.Fprintf(&b, "Platform: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&b, "Today: %s\n", time.Now().Format("Monday, 2 January 2006"))
 	fmt.Fprintf(&b, "Model: %s\n", model)
 	fmt.Fprintf(&b, "Agent: %s\n", agentName)
 	if gitInfo != "" {
