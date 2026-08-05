@@ -37,7 +37,7 @@ import (
 	"rick/pkg/contextbudget"
 )
 
-var Version = "0.1.9"
+var Version = "0.1.10"
 
 func main() {
 	var (
@@ -286,7 +286,15 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 
 	todos := tools.NewTodoStore()
 	reg := tools.NewRegistry()
-	ctxBudget := contextbudget.New(contextbudget.Options{})
+	// The shared session context manager: content-addressed dedup, cache
+	// boundaries, live-zone compression. Knobs come from rick.json's
+	// context_budget block; zero values keep the built-in defaults. The
+	// min-cache-token guard defaults to a cheap bytes/4 estimate — exact BPE
+	// counting on the hot path would double every turn's tokenizer work.
+	ctxBudget := contextbudget.New(loaded.Config.ContextBudget.ContextBudgetOptions())
+	if ws := loaded.Config.WebSearch; ws != nil && ws.CacheMaxLen > 0 {
+		tools.SetCacheMaxLen(ws.CacheMaxLen)
+	}
 	depth := 1
 	if loaded.Config.SubagentDepth != nil {
 		depth = *loaded.Config.SubagentDepth
@@ -850,7 +858,7 @@ func execCmd() *cobra.Command {
 		"command sandbox: read-only | workspace-write | trusted | off")
 	c.Flags().StringVarP(&flagExecFormat, "output-format", "o", "text",
 		"output format: text | json | stream-json")
-	c.Flags().IntVar(&flagExecTurns, "max-turns", 50, "maximum agent turns")
+	c.Flags().IntVar(&flagExecTurns, "max-turns", 0, "maximum agent turns (0 = unlimited)")
 	c.Flags().StringVar(&flagExecProfile, "permission-profile", "",
 		"permission profile: readonly | standard | trusted | ci")
 	c.Flags().StringVarP(&flagExecPrompt, "prompt", "p", "", "prompt text (alternative to positional arg)")
