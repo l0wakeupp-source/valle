@@ -40,10 +40,11 @@ func (s providerSummarizer) Summarize(ctx context.Context, messages []provider.M
 		return "", errors.New("distill: provider or model unavailable")
 	}
 	req := provider.Request{
-		Model:     s.model,
-		System:    distillSystemPrompt,
-		Messages:  []provider.Message{provider.UserText(renderTranscript(messages))},
-		MaxTokens: distillMaxTokens,
+		Model:          s.model,
+		System:         distillSystemPrompt,
+		Messages:       []provider.Message{provider.UserText(renderTranscript(messages))},
+		MaxTokens:      distillMaxTokens,
+		CacheRetention: provider.CacheRetentionNone,
 	}
 	ctx, cancel := context.WithTimeout(ctx, distillTimeout)
 	defer cancel()
