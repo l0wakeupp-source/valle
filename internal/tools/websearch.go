@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -86,16 +87,18 @@ func waitHostGap(ctx context.Context, host string, d time.Duration) error {
 
 // --- LRU cache ---
 
+// cacheKey deliberately excludes maxResults: the same query caches one
+// result set and every caller trims to its own limit on read.
 type cacheKey struct {
-	provider   string
-	query      string
-	maxResults int
-	variant    string
+	provider string
+	query    string
+	variant  string
 }
 
 type cacheEntry struct {
 	key       cacheKey
 	results   []searchResult
+	err       string // serialized provider error for negative caching
 	expiresAt time.Time
 }
 
@@ -110,46 +113,70 @@ var (
 		"ddglite":    300 * time.Second,
 		"brave":      300 * time.Second,
 	}
-	cacheMaxLen = 100
+	cacheMaxLen      = 100
+	negativeCacheTTL = 10 * time.Second
 )
 
 const maxSearchResponseBytes = 4 << 20
 
-func cacheGet(provider string, query string, maxResults int) ([]searchResult, bool) {
-	return cacheGetVariant(provider, query, maxResults, "")
+// SetCacheMaxLen overrides the in-memory cache entry bound.
+func SetCacheMaxLen(n int) {
+	if n > 0 {
+		cacheMaxLen = n
+	}
 }
 
-func cacheGetVariant(provider string, query string, maxResults int, variant string) ([]searchResult, bool) {
+func cacheKeyFor(provider, query, variant string) cacheKey {
+	return cacheKey{provider: strings.ToLower(strings.TrimSpace(provider)), query: normalizedCacheQuery(query), variant: variant}
+}
+
+func cacheGet(provider string, query string, maxResults int) ([]searchResult, bool) {
+	results, _, ok := cacheGetVariant(provider, query, maxResults, "")
+	return results, ok
+}
+
+// cacheGetVariant returns the cached results, a cached provider error
+// (negative caching) or nothing. maxResults only trims the returned slice.
+func cacheGetVariant(provider string, query string, maxResults int, variant string) ([]searchResult, error, bool) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	key := cacheKey{provider: strings.ToLower(strings.TrimSpace(provider)), query: normalizedCacheQuery(query), maxResults: maxResults, variant: variant}
+	key := cacheKeyFor(provider, query, variant)
 	elem, ok := cacheMap[key]
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
 	entry := elem.Value.(*cacheEntry)
 	if time.Now().After(entry.expiresAt) {
 		delete(cacheMap, key)
 		cacheLRU.Remove(elem)
-		return nil, false
+		return nil, nil, false
 	}
 	cacheLRU.MoveToFront(elem)
-	return append([]searchResult(nil), entry.results...), true
+	if entry.err != "" {
+		return nil, errors.New(entry.err), true
+	}
+	out := append([]searchResult(nil), entry.results...)
+	if maxResults > 0 && len(out) > maxResults {
+		out = out[:maxResults]
+	}
+	return out, nil, true
 }
 
 func cachePut(provider, query string, maxResults int, results []searchResult, ttl time.Duration) {
-	cachePutVariant(provider, query, maxResults, results, ttl, "")
+	cachePutVariant(provider, query, results, ttl, "")
 }
 
-func cachePutVariant(provider, query string, maxResults int, results []searchResult, ttl time.Duration, variant string) {
+func cachePutVariant(provider, query string, results []searchResult, ttl time.Duration, variant string) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	key := cacheKey{provider: strings.ToLower(strings.TrimSpace(provider)), query: normalizedCacheQuery(query), maxResults: maxResults, variant: variant}
+	key := cacheKeyFor(provider, query, variant)
 	if elem, ok := cacheMap[key]; ok {
 		cacheLRU.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
 		entry.results = append([]searchResult(nil), results...)
+		entry.err = ""
 		entry.expiresAt = time.Now().Add(ttl)
+		persistWebsearchCache()
 		return
 	}
 	if cacheLRU.Len() >= cacheMaxLen {
@@ -160,8 +187,117 @@ func cachePutVariant(provider, query string, maxResults int, results []searchRes
 			delete(cacheMap, evictKey)
 		}
 	}
-	elem := cacheLRU.PushFront(&cacheEntry{results: append([]searchResult(nil), results...), expiresAt: time.Now().Add(ttl), key: key})
+	elem := cacheLRU.PushFront(&cacheEntry{
+		results:   append([]searchResult(nil), results...),
+		expiresAt: time.Now().Add(ttl),
+		key:       key,
+	})
 	cacheMap[key] = elem
+	persistWebsearchCache()
+}
+
+// cachePutErrorVariant negative-caches a provider failure for a short TTL so
+// a flapping provider is not hit again within the same turn.
+func cachePutErrorVariant(provider, query string, err error, ttl time.Duration, variant string) {
+	if err == nil {
+		return
+	}
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	key := cacheKeyFor(provider, query, variant)
+	if elem, ok := cacheMap[key]; ok {
+		cacheLRU.MoveToFront(elem)
+		entry := elem.Value.(*cacheEntry)
+		entry.results = nil
+		entry.err = err.Error()
+		entry.expiresAt = time.Now().Add(ttl)
+		persistWebsearchCache()
+		return
+	}
+	if cacheLRU.Len() >= cacheMaxLen {
+		oldest := cacheLRU.Back()
+		if oldest != nil {
+			evictKey := oldest.Value.(*cacheEntry).key
+			cacheLRU.Remove(oldest)
+			delete(cacheMap, evictKey)
+		}
+	}
+	elem := cacheLRU.PushFront(&cacheEntry{
+		err:       err.Error(),
+		expiresAt: time.Now().Add(ttl),
+		key:       key,
+	})
+	cacheMap[key] = elem
+	persistWebsearchCache()
+}
+
+// --- disk persistence ---
+//
+// The LRU is mirrored to a small JSON file so successful and negative
+// results survive process restarts within their TTL.
+
+var websearchCacheFile = filepath.Join(config.GlobalDir(), "websearch_cache.json")
+
+type diskCacheEntry struct {
+	Provider  string         `json:"provider"`
+	Query     string         `json:"query"`
+	Variant   string         `json:"variant"`
+	Results   []searchResult `json:"results"`
+	Err       string         `json:"err,omitempty"`
+	ExpiresAt time.Time      `json:"expires_at"`
+}
+
+// persistWebsearchCache writes the whole LRU to disk. cacheMu must be held.
+func persistWebsearchCache() {
+	entries := make([]diskCacheEntry, 0, cacheLRU.Len())
+	for elem := cacheLRU.Front(); elem != nil; elem = elem.Next() {
+		entry := elem.Value.(*cacheEntry)
+		entries = append(entries, diskCacheEntry{
+			Provider:  entry.key.provider,
+			Query:     entry.key.query,
+			Variant:   entry.key.variant,
+			Results:   entry.results,
+			Err:       entry.err,
+			ExpiresAt: entry.expiresAt,
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	tmp := websearchCacheFile + ".tmp"
+	if os.WriteFile(tmp, data, 0o644) == nil {
+		_ = os.Rename(tmp, websearchCacheFile)
+	}
+}
+
+func loadWebsearchCache() {
+	data, err := os.ReadFile(websearchCacheFile)
+	if err != nil {
+		return
+	}
+	var entries []diskCacheEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return
+	}
+	now := time.Now()
+	for _, e := range entries {
+		if !e.ExpiresAt.After(now) {
+			continue
+		}
+		key := cacheKeyFor(e.Provider, e.Query, e.Variant)
+		if _, exists := cacheMap[key]; exists || cacheLRU.Len() >= cacheMaxLen {
+			continue
+		}
+		elem := cacheLRU.PushFront(&cacheEntry{
+			key: key, results: e.Results, err: e.Err, expiresAt: e.ExpiresAt,
+		})
+		cacheMap[key] = elem
+	}
+}
+
+func init() {
+	loadWebsearchCache()
 }
 
 // --- SearXNG instance tracking ---
