@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"rick/internal/provider"
@@ -115,5 +117,87 @@ func TestRunnerStopsAtErrorWithoutWaitingForProviderClose(t *testing.T) {
 	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("hello")}, events)
 	if err == nil || err.Error() != "stream failed" {
 		t.Fatalf("Run error = %v, want provider error", err)
+	}
+}
+
+// workProvider emits tool calls for limit turns (input varies each turn so the
+// repeated-call guard does not fire), then finishes with a plain answer.
+type workProvider struct {
+	limit int
+	calls *int
+}
+
+func (workProvider) Name() string                 { return "work-provider" }
+func (workProvider) Models() []provider.ModelInfo { return nil }
+func (p workProvider) Stream(_ context.Context, _ provider.Request, ch chan<- provider.Event) {
+	defer close(ch)
+	*p.calls++
+	if *p.calls <= p.limit {
+		input, _ := json.Marshal(map[string]any{"command": fmt.Sprintf("work-%d", *p.calls)})
+		ch <- provider.Event{Kind: provider.EventToolCall, ToolCall: &provider.ToolCall{
+			ID: fmt.Sprintf("c%d", *p.calls), Name: "shell", Input: input,
+		}}
+		ch <- provider.Event{Kind: provider.EventDone, StopReason: "tool_use"}
+		return
+	}
+	ch <- provider.Event{Kind: provider.EventText, Text: "finished"}
+	ch <- provider.Event{Kind: provider.EventDone, StopReason: "end_turn"}
+}
+
+// TestRunnerUnlimitedTurnsByDefault pins that a runner without an explicit
+// MaxTurns cap runs past the old 50-turn default to a normal completion.
+func TestRunnerUnlimitedTurnsByDefault(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	calls := 0
+	runner := New(Config{
+		Provider: workProvider{limit: 60, calls: &calls},
+		Model:    "work-model",
+		Tools:    registry,
+	})
+	events := make(chan Event, 256)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("do the work")}, events)
+	if err != nil {
+		t.Fatalf("unlimited run should complete, got error: %v", err)
+	}
+	if calls != 61 {
+		t.Fatalf("provider should have run 60 tool turns plus a final answer (61 calls), got %d", calls)
+	}
+	sawDone := false
+	for event := range events {
+		if event.Kind == EvDone {
+			sawDone = true
+		}
+	}
+	if !sawDone {
+		t.Fatal("unlimited run did not emit EvDone")
+	}
+}
+
+// TestRunnerRespectsExplicitTurnCap pins that a positive MaxTurns still stops
+// the loop with the actionable error.
+func TestRunnerRespectsExplicitTurnCap(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	calls := 0
+	runner := New(Config{
+		Provider: workProvider{limit: 10, calls: &calls},
+		Model:    "work-model",
+		Tools:    registry,
+		MaxTurns: 3,
+	})
+	events := make(chan Event, 64)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("do the work")}, events)
+	if err == nil || !strings.Contains(err.Error(), "stopped after 3 turns") {
+		t.Fatalf("Run error = %v, want max-turns stop", err)
+	}
+	sawError := false
+	for event := range events {
+		if event.Kind == EvError {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("turn-cap stop did not emit an error event")
 	}
 }
