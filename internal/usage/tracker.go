@@ -34,6 +34,17 @@ func (d Day) Total() int {
 	return d.Input + d.Output + d.CacheRead + d.CacheWrite
 }
 
+// CacheHitRate returns the share of input tokens served from the provider
+// prompt cache, as a percentage (0..100). Input is the uncached input, so
+// CacheRead/(Input+CacheRead) is the proportion of the prompt that was a hit.
+func (d Day) CacheHitRate() float64 {
+	denom := d.Input + d.CacheRead
+	if denom <= 0 {
+		return 0
+	}
+	return float64(d.CacheRead) * 100 / float64(denom)
+}
+
 // Add merges another day into d.
 func (d *Day) Add(o Day) {
 	d.Input += o.Input
