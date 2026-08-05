@@ -20,6 +20,7 @@ import (
 	"golang.org/x/term"
 
 	"rick/internal/agent"
+	"rick/internal/cache"
 	"rick/internal/config"
 	"rick/internal/goal"
 	"rick/internal/mcp"
@@ -75,6 +76,10 @@ const (
 	modalPermission
 )
 
+// cacheMissNoiseFloor is the per-turn miss threshold below which a shortfall
+// is cache-breakpoint granularity noise, not a real miss (pi uses 1024).
+const cacheMissNoiseFloor = 1024
+
 // Model is the root bubbletea model.
 type Model struct {
 	deps      Deps
@@ -103,6 +108,34 @@ type Model struct {
 	// turn sends a byte-identical system suffix (provider cache stays warm).
 	repoMapOnce  sync.Once
 	repoMapBlock string
+	// repoDiskOnce/repoDiskDir open the content-addressed disk cache used to
+	// reuse RepoMap blocks across sessions with an unchanged git tree.
+	repoDiskOnce sync.Once
+	repoDiskDir  *cache.Dir
+
+	// sysPartsKey/sysPartsStable/sysPartsVolatile freeze the volatile system
+	// prompt bytes (skills match + environment: git state) once per
+	// (session, model, agent) so the provider cache prefix stays
+	// byte-identical. The session id in the key keeps a brand-new session
+	// from reusing the previous one's frozen bytes.
+	sysPartsKey      string
+	sysPartsStable   string
+	sysPartsVolatile string
+
+	// toolSchemasKey/toolSchemasPinned freeze the provider-facing tool list
+	// per (session, model, agent, tool-toggles) so mid-session plugin churn
+	// never changes the cached prefix bytes.
+	toolSchemasKey    string
+	toolSchemasPinned []provider.ToolSchema
+
+	// cachePrevPrompt/cachePrevReported track the previous request's prompt
+	// footprint so per-turn cache misses can be detected and surfaced
+	// (noise floor 1024 tokens, like pi's cache-stats.ts).
+	cachePrevPrompt   int
+	cachePrevReported bool
+	cacheMissTokens   int
+	cacheMissCount    int
+	cacheMissStreak   int
 
 	// streaming
 	running      bool
@@ -818,11 +851,24 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus("compact produced no summary")
 			return m, nil
 		}
-		newHistory := []provider.Message{
-			provider.UserText("Summary of the conversation so far:\n\n" + summary),
-			provider.AssistantText("Understood. Continuing from that state."),
+		// Keep the stable cached prefix intact: insert the summary right
+		// after the last cache boundary, dropping only the volatile head, so
+		// the bytes the provider still has cached stay byte-identical.
+		removed := len(m.history) - len(msg.tail)
+		if removed < 0 {
+			removed = 0
 		}
-		m.history = append(newHistory, msg.tail...)
+		insert := 0
+		if m.deps.Budget != nil {
+			insert = lastBoundaryBefore(m.history, removed, m.deps.Budget.ChooseBoundaries(m.history))
+		}
+		newHistory := append([]provider.Message{}, m.history[:insert]...)
+		newHistory = append(newHistory,
+			provider.UserText("Summary of the conversation so far:\n\n"+summary),
+			provider.AssistantText("Understood. Continuing from that state."),
+		)
+		newHistory = append(newHistory, msg.tail...)
+		m.history = newHistory
 		m.msgs = append([]ChatMsg{{Kind: MsgSystem,
 			Text: "context compacted\n\n" + summary, Time: time.Now()}},
 			messagesToChat(msg.tail)...)
@@ -1613,6 +1659,11 @@ func (m *Model) resetStats() {
 	m.billed = session.Usage{}
 	m.turnStart = time.Time{}
 	m.turnElapsed = 0
+	m.cachePrevPrompt = 0
+	m.cachePrevReported = false
+	m.cacheMissTokens = 0
+	m.cacheMissCount = 0
+	m.cacheMissStreak = 0
 }
 
 // SetTurnElapsed fakes a completed turn duration (test helper).
@@ -1645,6 +1696,11 @@ func (m *Model) setModel(id string) {
 	}
 	m.modelID = id
 	m.updateContextWindow()
+	// A model switch re-bills the whole prompt; do not count the next turn's
+	// small cache-read as a miss against the old model's footprint.
+	m.cachePrevPrompt = 0
+	m.cachePrevReported = false
+	m.cacheMissStreak = 0
 	// The switch itself always succeeds; only remembering it can fail, so
 	// say so in the status line rather than silently forgetting — matching
 	// how /theme reports a failed save.
