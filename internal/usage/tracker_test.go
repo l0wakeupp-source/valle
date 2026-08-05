@@ -45,3 +45,21 @@ func TestRecordBatchesUntilFlush(t *testing.T) {
 		t.Fatal("Flush did not persist the pending usage update")
 	}
 }
+
+func TestDayCacheHitRate(t *testing.T) {
+	cases := []struct {
+		day  Day
+		want float64
+	}{
+		{Day{Input: 0, CacheRead: 0}, 0},
+		{Day{Input: 100, CacheRead: 0}, 0},
+		{Day{Input: 100, CacheRead: 900}, 90},
+		{Day{Input: 0, CacheRead: 500}, 100},
+		{Day{Input: 300, CacheRead: 700, CacheWrite: 50}, 70}, // writes are not input
+	}
+	for _, c := range cases {
+		if got := c.day.CacheHitRate(); got != c.want {
+			t.Errorf("CacheHitRate(%+v) = %v, want %v", c.day, got, c.want)
+		}
+	}
+}
