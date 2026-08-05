@@ -12,6 +12,7 @@ import (
 	"rick/internal/agentnames"
 	"rick/internal/goal"
 	"rick/internal/plugin"
+	"rick/internal/provider"
 	"rick/internal/swarm"
 	"rick/internal/tools"
 )
@@ -213,7 +214,8 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 			MaxTokens: m.deps.Loaded.Config.MaxTokens, Tools: workerTools,
 			ToolFilter: toolFilter, Perms: m.deps.Perms, Ask: m.makeAsker(),
 			Cwd: m.deps.Cwd, SessionID: m.sessionID(), AgentName: spec.Name,
-			Depth: 1, MaxTurns: 30, Parallel: true,
+			Depth: 1, MaxTurns: 0, Parallel: true, // unlimited; the repeated-call guard still stops loops
+			CacheRetention: provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
 		}
 		cfg = inheritSwarmWorkerRuntime(cfg, snapshotter, m.deps.Plugins, m.deps.Goals)
 		taskID := spec.TaskID
