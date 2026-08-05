@@ -157,7 +157,7 @@ type Config struct {
 	SessionID      string
 	AgentName      string
 	Depth          int
-	MaxTurns       int
+	MaxTurns       int // cap on agent turns; <= 0 means unlimited
 	Snapshotter    Snapshotter
 	Parallel       bool // allow concurrent read-only tools
 	Plugins        *plugin.Registry
@@ -165,6 +165,13 @@ type Config struct {
 	Creds          *config.Credentials // for key rotation on rate-limit
 	Registry       *Registry           // optional live hierarchy registry
 	AgentID        string              // registry ID for this run
+	// CacheRetention is the prompt-cache policy for every request of this
+	// run: "" = provider default, "long" = extended TTL, "none" = disabled.
+	CacheRetention provider.CacheRetention
+	// PinnedToolSchemas fixes the provider-facing tool list for the whole
+	// run, so mid-session tool toggles or plugin churn never change the
+	// cached prefix bytes. When nil the registry + ToolFilter are used.
+	PinnedToolSchemas []provider.ToolSchema
 }
 
 // Runner executes the loop.
@@ -183,9 +190,6 @@ type Runner struct {
 
 // New builds a Runner.
 func New(cfg Config) *Runner {
-	if cfg.MaxTurns <= 0 {
-		cfg.MaxTurns = 50
-	}
 	if cfg.SandboxRoot == "" && cfg.Perms != nil {
 		cfg.SandboxRoot = cfg.Perms.SandboxRoot()
 	}
@@ -251,9 +255,15 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 	lastCallBatch := ""
 	repeatedCallCount := 0
 
-	schemas := r.cfg.Tools.Schemas(r.cfg.ToolFilter)
+	schemas := r.cfg.PinnedToolSchemas
+	if len(schemas) == 0 {
+		schemas = r.cfg.Tools.Schemas(r.cfg.ToolFilter)
+	}
 
-	for turn := 0; turn < r.cfg.MaxTurns; turn++ {
+	// MaxTurns caps the loop; <= 0 disables the cap so long tasks can run to
+	// completion. Pathological loops are still caught by the repeated-call
+	// guard below and by the goal token budget.
+	for turn := 0; r.cfg.MaxTurns <= 0 || turn < r.cfg.MaxTurns; turn++ {
 		if ctx.Err() != nil {
 			return appended, ctx.Err()
 		}
@@ -311,6 +321,9 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 					// Enforce the active goal's token budget, if any.
 					if r.cfg.Goals != nil {
 						if g, _ := r.cfg.Goals.GetActive(); g != nil && g.Status == "active" {
+							// Providers report InputTokens as uncached input
+							// and cache reads/writes disjointly, so summing
+							// all four counts every token once.
 							total := ev.Usage.InputTokens + ev.Usage.OutputTokens +
 								ev.Usage.CacheReadTokens + ev.Usage.CacheWriteTokens
 							_ = r.cfg.Goals.AddTokens(g.ID, total)
@@ -441,7 +454,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		appended = append(appended, userMsg)
 	}
 
-	lastErr = fmt.Errorf("agent: stopped after %d turns without a final answer", r.cfg.MaxTurns)
+	lastErr = fmt.Errorf("agent: stopped after %d turns without a final answer (max-turns reached; set --max-turns 0 for unlimited)", r.cfg.MaxTurns)
 	emit(Event{Kind: EvError, Err: lastErr})
 	return appended, lastErr
 }
@@ -626,12 +639,14 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		SafetyMarginTokens:   r.cfg.SafetyMarginTokens,
 	})
 
-	retained := retainMessages(messages, plan.RetainedMessageTokens, encoding)
-	// Deduplicate after trimming so a replaced payload's original is always
-	// present in the same sent transcript.
+	// Content-addressed dedup runs before trimming: the replacement set is
+	// persistent across turns, so the surviving bytes stay stable even when
+	// trimming later moves a payload's first occurrence out of the view.
+	view := messages
 	if r.budget.Enabled() {
-		retained = r.budget.ApplyDedup(retained).View
+		view = r.budget.ApplyDedup(view).View
 	}
+	retained := retainMessages(view, plan.RetainedMessageTokens, encoding)
 	boundaries := r.budget.ChooseBoundaries(retained)
 
 	// State distillation: when the transcript approaches the context budget,
@@ -654,6 +669,8 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		Temperature:     r.cfg.Temperature,
 		Reasoning:       r.cfg.Reasoning,
 		CacheBoundaries: boundaries,
+		CacheRetention:  r.cfg.CacheRetention,
+		SessionID:       r.cfg.SessionID,
 	}
 }
 
