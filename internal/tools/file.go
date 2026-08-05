@@ -250,6 +250,14 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		limit = 2000
 	}
 
+	// Content-addressed memo: identical reads of an unchanged file are served
+	// without touching the disk again (the key carries mtime and size).
+	key := memoKey("read", p, fileFingerprint(p), offset, limit, a.Full, a.Target, maxBytes)
+	if cached, ok := readMemo.get(key); ok {
+		markRead(p)
+		return cached, nil
+	}
+
 	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), file), 32<<10)
 	requestedEnd := offset - 1 + limit
 	lineCount := 0
@@ -312,11 +320,13 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 	if outputEnd < total && !outputTruncated {
 		foot = fmt.Sprintf("\n<showing lines %d-%d of %d; continue with offset=%d>", offset, outputEnd, total, outputEnd+1)
 	}
-	return Result{
+	result := Result{
 		Output: b.String() + foot,
 		Title:  fmt.Sprintf("%s (%d lines)", relTo(tc.Cwd, p), total),
 		Meta:   map[string]any{"path": p, "lines": total},
-	}, nil
+	}
+	readMemo.put(key, result)
+	return result, nil
 }
 
 func suggestSimilar(p string) string {
