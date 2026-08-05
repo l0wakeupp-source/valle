@@ -84,8 +84,9 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	if a.Pattern == "" {
 		return Errf("pattern is required"), nil
 	}
-	if ripgrepPath == "" {
-		return Errf("ripgrep (rg) not found on PATH; install it or set RICK_RIPGREP"), nil
+	searchPath := tc.Cwd
+	if a.Path != "" {
+		searchPath = resolvePath(tc.Cwd, a.Path)
 	}
 	limit := a.Limit
 	if limit <= 0 {
@@ -94,9 +95,15 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	if limit <= 0 {
 		limit = 100
 	}
-	searchPath := tc.Cwd
-	if a.Path != "" {
-		searchPath = resolvePath(tc.Cwd, a.Path)
+	// Content-addressed memo: identical calls with an unchanged directory are
+	// served without re-executing ripgrep. The TTL bounds staleness from
+	// nested file edits, which the directory stat alone cannot see.
+	key := memoKey("grep", searchPath, fileFingerprint(searchPath), a.Pattern, a.Include, a.Mode, a.CaseInsensitive, a.Context, limit)
+	if cached, ok := grepMemo.get(key); ok {
+		return cached, nil
+	}
+	if ripgrepPath == "" {
+		return Errf("ripgrep (rg) not found on PATH; install it or set RICK_RIPGREP"), nil
 	}
 
 	args := []string{"--no-heading", "--color=never", "--line-number", "--with-filename"}
@@ -134,32 +141,43 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		if err != nil && errb.Len() > 0 && !isExitCode(err, 1) {
 			return Errf("ripgrep: %s", strings.TrimSpace(errb.String())), nil
 		}
-		return Result{Output: "no matches found", Title: "grep " + a.Pattern}, nil
+		noMatch := Result{Output: "no matches found", Title: "grep " + a.Pattern}
+		grepMemo.put(key, noMatch)
+		return noMatch, nil
 	}
 
 	lines := []string{}
 	sc := bufio.NewScanner(strings.NewReader(out.String()))
 	sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
 	n := 0
+	truncatedAt := 0
 	for sc.Scan() {
 		line := capGrepLine(compactGrepLine(tc.Cwd, sc.Text()))
 		lines = append(lines, line)
 		n++
 		if n >= limit {
-			lines = append(lines, fmt.Sprintf("… <truncated at %d results>", limit))
+			truncatedAt = limit
 			break
 		}
 	}
+	// rg scans in filesystem order; sort by (path, line) so the output —
+	// and the provider cache prefix — is byte-stable across runs.
+	sortGrepLines(lines)
 
 	output := strings.Join(lines, "\n")
+	if truncatedAt > 0 {
+		output += fmt.Sprintf("\n… <truncated at %d results>", truncatedAt)
+	}
 	if out.Truncated() {
 		output += "\n… <ripgrep output capped>"
 	}
-	return Result{
+	result := Result{
 		Output: output,
 		Title:  fmt.Sprintf("grep %q (%d)", a.Pattern, n),
 		Meta:   map[string]any{"count": n},
-	}, nil
+	}
+	grepMemo.put(key, result)
+	return result, nil
 }
 
 func compactGrepLine(cwd, line string) string {
@@ -179,6 +197,40 @@ func compactGrepLine(cwd, line string) string {
 		}
 	}
 	return line
+}
+
+// grepLineKey splits a "path:line:text" output line into (path, numeric line)
+// so matches sort stably by path then line, independent of rg's scan order.
+func grepLineKey(line string) (string, int) {
+	for i := 1; i < len(line); i++ {
+		if line[i] != ':' {
+			continue
+		}
+		j := i + 1
+		digits := 0
+		lineNum := 0
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			lineNum = lineNum*10 + int(line[j]-'0')
+			digits++
+			j++
+		}
+		if digits == 0 {
+			continue
+		}
+		return line[:i], lineNum
+	}
+	return line, 0
+}
+
+func sortGrepLines(lines []string) {
+	sort.SliceStable(lines, func(i, j int) bool {
+		leftPath, leftLine := grepLineKey(lines[i])
+		rightPath, rightLine := grepLineKey(lines[j])
+		if leftPath != rightPath {
+			return leftPath < rightPath
+		}
+		return leftLine < rightLine
+	})
 }
 
 const maxGrepLineBytes = 4 << 10
@@ -283,19 +335,18 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		paths = walkGlob(searchPath, a.Pattern, limit*4)
 	}
 
-	type entry struct {
-		path string
-		mod  time.Time
-	}
-	entries := make([]entry, 0, len(paths))
+	entries := make([]string, 0, len(paths))
 	for _, p := range paths {
-		st, err := os.Stat(p)
-		if err != nil {
+		if _, err := os.Stat(p); err != nil {
 			continue
 		}
-		entries = append(entries, entry{p, st.ModTime()})
+		entries = append(entries, p)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].mod.After(entries[j].mod) })
+	// Sort by path for deterministic output; mtime ordering makes the prompt
+	// bytes (and the provider cache prefix) depend on filesystem timestamps.
+	sort.Slice(entries, func(i, j int) bool {
+		return filepath.ToSlash(entries[i]) < filepath.ToSlash(entries[j])
+	})
 
 	truncated := false
 	if len(entries) > limit {
@@ -308,7 +359,7 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 
 	var b strings.Builder
 	for _, e := range entries {
-		b.WriteString(relTo(tc.Cwd, e.path))
+		b.WriteString(relTo(tc.Cwd, e))
 		b.WriteByte('\n')
 	}
 	if truncated {
