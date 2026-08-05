@@ -95,8 +95,40 @@ func TestApplyDedupReplacesRepeatedPayloads(t *testing.T) {
 	}
 }
 
+func TestApplyDedupSupersedesTrimmedOriginal(t *testing.T) {
+	budget := New(Options{})
+	payload := strings.Repeat("identical large payload ", 200)
+
+	// Turn 1: payload appears twice; only the second is collapsed.
+	turn1 := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "tool_use", ID: "c1", Name: "bash"}}},
+		{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "tool_result", ToolUseID: "c1", Content: payload}}},
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "tool_use", ID: "c2", Name: "bash"}}},
+		{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "tool_result", ToolUseID: "c2", Content: payload}}},
+	}
+	first := budget.ApplyDedup(turn1).View
+	if !strings.Contains(first[1].Content[0].Content, payload) {
+		t.Fatal("first occurrence was collapsed while its original was present")
+	}
+	if !strings.Contains(first[3].Content[0].Content, "duplicate payload sha256:") {
+		t.Fatal("second occurrence was not collapsed")
+	}
+
+	// Turn 2: the original occurrence is trimmed away; the surviving
+	// occurrence must stay collapsed so the provider-facing bytes are stable.
+	turn2 := turn1[2:]
+	second := budget.ApplyDedup(turn2).View
+	if !strings.Contains(second[1].Content[0].Content, "duplicate payload sha256:") {
+		t.Fatalf("surviving occurrence flipped back to full payload: %s", second[1].Content[0].Content[:60])
+	}
+	// The original payload stays retrievable by its content address.
+	if original, ok := budget.StoredPayload(Hash(payload)); !ok || original != payload {
+		t.Fatal("content-addressed original is not retrievable")
+	}
+}
+
 func TestChooseBoundariesRequiresStability(t *testing.T) {
-	budget := New(Options{MinStableTurns: 2, MaxStableBytes: 64})
+	budget := New(Options{MinStableTurns: 2, LiveZoneTurns: 2, MaxStableBytes: 64, MinCacheTokens: 1})
 	history := []provider.Message{
 		provider.UserText(strings.Repeat("stable old context ", 20)),
 		provider.UserText(strings.Repeat("more stable context ", 20)),
@@ -120,7 +152,7 @@ func TestChooseBoundariesRequiresStability(t *testing.T) {
 }
 
 func TestChooseBoundariesNeverSplitsToolPair(t *testing.T) {
-	budget := New(Options{MinStableTurns: 2, MaxStableBytes: 64})
+	budget := New(Options{MinStableTurns: 2, LiveZoneTurns: 1, MaxStableBytes: 64, MinCacheTokens: 1})
 	history := []provider.Message{
 		provider.UserText(strings.Repeat("stable intro ", 20)),
 		provider.UserText(strings.Repeat("stable second ", 20)),
@@ -132,9 +164,14 @@ func TestChooseBoundariesNeverSplitsToolPair(t *testing.T) {
 	boundaries := budget.ChooseBoundaries(history)
 
 	for index := range boundaries {
-		if index == 2 || index == 3 {
-			t.Fatalf("boundary at %d splits a tool_use/tool_result pair", index)
+		if index == 3 {
+			t.Fatalf("boundary at %d lands inside a tool_use/tool_result pair", index)
 		}
+	}
+	// With a one-turn live zone the boundary may sit at the pair's start
+	// (the pair stays intact, after the boundary), warming the cache sooner.
+	if !boundaries[2] {
+		t.Fatalf("expected a boundary at the tool pair start, got %v", boundaries)
 	}
 }
 
