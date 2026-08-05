@@ -77,6 +77,22 @@ type wireBlock struct {
 
 type cacheControl struct {
 	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
+}
+
+// cacheControlFor renders the cache_control marker for a retention policy.
+// "none" disables prompt caching entirely: no breakpoints are emitted, so a
+// one-off call (distillation, compaction) never reads or writes the session
+// cache. "long" extends the provider's default 5-minute TTL to an hour.
+func cacheControlFor(retention provider.CacheRetention) *cacheControl {
+	switch retention {
+	case provider.CacheRetentionNone:
+		return nil
+	case provider.CacheRetentionLong:
+		return &cacheControl{Type: "ephemeral", TTL: "1h"}
+	default:
+		return &cacheControl{Type: "ephemeral"}
+	}
 }
 
 type wireTool struct {
@@ -103,14 +119,15 @@ type wireRequest struct {
 	Thinking     *wireThinking `json:"thinking,omitempty"`
 }
 
-func wireSystem(system, stable string) []wireBlock {
+func wireSystem(system, stable string, retention provider.CacheRetention) []wireBlock {
 	if strings.TrimSpace(system) == "" {
 		return nil
 	}
+	cc := cacheControlFor(retention)
 	if stable != "" && strings.HasPrefix(system, stable) && strings.TrimSpace(stable) != "" {
 		blocks := []wireBlock{{
 			Type: "text", Text: stable,
-			CacheControl: &cacheControl{Type: "ephemeral"},
+			CacheControl: cc,
 		}}
 		if suffix := strings.TrimPrefix(system, stable); strings.TrimSpace(suffix) != "" {
 			blocks = append(blocks, wireBlock{Type: "text", Text: suffix})
@@ -119,21 +136,24 @@ func wireSystem(system, stable string) []wireBlock {
 	}
 	return []wireBlock{{
 		Type: "text", Text: system,
-		CacheControl: &cacheControl{Type: "ephemeral"},
+		CacheControl: cc,
 	}}
 }
 
-func wireTools(tools []provider.ToolSchema) []wireTool {
+func wireTools(tools []provider.ToolSchema, retention provider.CacheRetention) []wireTool {
 	if len(tools) == 0 {
 		return nil
 	}
+	cc := cacheControlFor(retention)
 	out := make([]wireTool, 0, len(tools))
 	for _, tool := range tools {
 		out = append(out, wireTool{
 			Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema,
 		})
 	}
-	out[len(out)-1].CacheControl = &cacheControl{Type: "ephemeral"}
+	if cc != nil {
+		out[len(out)-1].CacheControl = cc
+	}
 	return out
 }
 
@@ -150,7 +170,17 @@ type wireImageSource struct {
 	Data      string `json:"data"`
 }
 
-func toWire(msgs []provider.Message, boundaries map[int]bool) []wireMessage {
+// toWire flattens rick's block model onto Anthropic's wire model. Marked
+// boundary messages get a cache_control on their first non-tool_result block
+// (Anthropic rejects cache_control on tool_result blocks). When retention is
+// "none" no breakpoints are emitted at all.
+//
+// Besides the requested boundaries, the newest message that can carry a
+// breakpoint always gets one (pi's "cache the whole history from turn 1"):
+// everything before the live turn is cached, so only the newest tool results
+// and the reply pay full price each turn.
+func toWire(msgs []provider.Message, boundaries map[int]bool, retention provider.CacheRetention) []wireMessage {
+	cc := cacheControlFor(retention)
 	out := make([]wireMessage, 0, len(msgs))
 	for index, m := range msgs {
 		wm := wireMessage{Role: m.Role}
@@ -193,13 +223,53 @@ func toWire(msgs []provider.Message, boundaries map[int]bool) []wireMessage {
 			continue // Anthropic rejects empty content arrays
 		}
 		// A stable cache boundary marks the message that ends a reusable
-		// prefix; everything before it is cached by the provider.
+		// prefix; everything before it is cached by the provider. The marker
+		// must sit on the first block that can carry cache_control
+		// (Anthropic rejects it on tool_result and thinking blocks).
 		if boundaries != nil && boundaries[index] {
-			wm.Content[0].CacheControl = &cacheControl{Type: "ephemeral"}
+			placeBoundary(wm.Content, cc)
 		}
 		out = append(out, wm)
 	}
+
+	// Eager last-message boundary: walk from the newest message backwards to
+	// the first that can carry a cache breakpoint and mark it. A boundary on
+	// the newest message means the entire prior history is cacheable.
+	if cc != nil && len(out) > 0 {
+		for index := len(out) - 1; index >= 0; index-- {
+			if hasMarkableBlock(out[index].Content) {
+				placeBoundary(out[index].Content, cc)
+				break
+			}
+		}
+	}
 	return out
+}
+
+// placeBoundary puts cache_control on the first block that can carry it.
+// Anthropic rejects cache_control on tool_result and thinking blocks.
+func placeBoundary(content []wireBlock, cc *cacheControl) {
+	for blockIndex, block := range content {
+		if !boundaryMarkable(block.Type) {
+			continue
+		}
+		content[blockIndex].CacheControl = cc
+		return
+	}
+}
+
+// hasMarkableBlock reports whether a wire message can carry cache_control.
+func hasMarkableBlock(content []wireBlock) bool {
+	for _, block := range content {
+		if boundaryMarkable(block.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+func boundaryMarkable(blockType string) bool {
+	return blockType != "tool_result" && blockType != "thinking"
 }
 
 // Stream implements provider.Provider. It owns ch and closes it exactly once.
@@ -224,13 +294,27 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	if maxTok <= 0 {
 		maxTok = 8192
 	}
+	// Anthropic allows 4 cache breakpoints per request: system, tools, and
+	// at most 2 message boundaries. toWire also adds an eager boundary on the
+	// newest markable message, so keep at most one budget boundary here (the
+	// oldest, which anchors the distillation/compaction summary cut).
+	boundaries := req.CacheBoundaries
+	if len(boundaries) > 1 {
+		oldest := -1
+		for index := range boundaries {
+			if oldest < 0 || index < oldest {
+				oldest = index
+			}
+		}
+		boundaries = map[int]bool{oldest: true}
+	}
 	body := wireRequest{
 		Model:        req.Model,
 		MaxTokens:    maxTok,
-		CacheControl: &cacheControl{Type: "ephemeral"},
-		System:       wireSystem(req.System, req.SystemStable),
-		Messages:     toWire(req.Messages, req.CacheBoundaries),
-		Tools:        wireTools(req.Tools),
+		CacheControl: cacheControlFor(req.CacheRetention),
+		System:       wireSystem(req.System, req.SystemStable, req.CacheRetention),
+		Messages:     toWire(req.Messages, boundaries, req.CacheRetention),
+		Tools:        wireTools(req.Tools, req.CacheRetention),
 		Stream:       true,
 		Temperature:  req.Temperature,
 	}
@@ -373,9 +457,18 @@ func (c *Client) handleEvent(event, data string, blocks map[int]*toolAccum,
 			} `json:"message"`
 		}
 		if json.Unmarshal([]byte(data), &d) == nil {
-			usage.InputTokens = d.Message.Usage.InputTokens
+			// Anthropic's input_tokens includes cache_creation tokens; the
+			// Usage contract is InputTokens = uncached input, with cache
+			// reads and writes disjoint. Normalize here so goal budgets,
+			// hit-rate math and the TUI split agree across providers.
+			creation := d.Message.Usage.CacheCreationInputTokens
+			input := d.Message.Usage.InputTokens - creation
+			if input < 0 {
+				input = 0
+			}
+			usage.InputTokens = input
 			usage.CacheReadTokens = d.Message.Usage.CacheReadInputTokens
-			usage.CacheWriteTokens = d.Message.Usage.CacheCreationInputTokens
+			usage.CacheWriteTokens = creation
 		}
 
 	case "content_block_start":
