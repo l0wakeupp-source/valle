@@ -156,12 +156,15 @@ func TestRunnerUnlimitedTurnsByDefault(t *testing.T) {
 		Tools:    registry,
 	})
 	events := make(chan Event, 256)
-	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("do the work")}, events)
+	appended, err := runner.Run(context.Background(), []provider.Message{provider.UserText("do the work")}, events)
 	if err != nil {
 		t.Fatalf("unlimited run should complete, got error: %v", err)
 	}
 	if calls != 61 {
 		t.Fatalf("provider should have run 60 tool turns plus a final answer (61 calls), got %d", calls)
+	}
+	if len(appended) == 0 || appended[len(appended)-1].Text() != "finished" {
+		t.Fatalf("final assistant response missing after tool turns: %+v", appended)
 	}
 	sawDone := false
 	for event := range events {

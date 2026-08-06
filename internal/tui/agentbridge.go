@@ -419,6 +419,16 @@ func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
 			flushAssistant()
 			flushResults()
 			out = append(out, provider.UserText(msg.Text))
+		case MsgThinking:
+			// GLM/DeepSeek-style endpoints require a prior turn's reasoning to
+			// be echoed back verbatim as reasoning_content. Keep the thinking
+			// block inside the assistant turn it belongs to so it is replayed.
+			if pendingAssistant == nil {
+				pendingAssistant = &provider.Message{Role: provider.RoleAssistant}
+			}
+			pendingAssistant.Content = append(pendingAssistant.Content, provider.ContentBlock{
+				Type: "thinking", Text: msg.Text,
+			})
 		case MsgAssistant:
 			if len(pendingResults) > 0 {
 				flushAssistant()
@@ -772,7 +782,14 @@ func (m *Model) sessionRepoMap(projectRoot, modelID string) string {
 		}
 		if disk := m.repoDisk(); disk != nil {
 			if tree := gitTreeHash(projectRoot); tree != "" {
-				key := strings.Join([]string{projectRoot, tree, string(encoding), prompt}, "\x00")
+				// The RepoMap skeleton depends on the file tree and token
+				// encoding, not on the prompt: opts.Prompt only weights which
+				// files rank higher after the global set is built. Leaving the
+				// prompt out of the key means a changed first task reuses the
+				// cached skeleton (re-weighting is cheap) instead of forcing a
+				// full rebuild — that rebuild is a CPU/IO spike on every new
+				// session and the main source of RepoMap cache misses.
+				key := strings.Join([]string{projectRoot, tree, string(encoding)}, "\x00")
 				if data, ok := disk.Get(key); ok && len(data) > 0 {
 					m.repoMapBlock = string(data)
 					return

@@ -47,6 +47,25 @@ func TestRebuildHistoryGroupsParallelToolCallsInOneAssistantTurn(t *testing.T) {
 	}
 }
 
+func TestRebuildHistoryPreservesThinkingBlockForReasoningEcho(t *testing.T) {
+	model := &Model{msgs: []ChatMsg{
+		{Kind: MsgUser, Text: "inspect"},
+		{Kind: MsgThinking, Text: "step one"},
+		{Kind: MsgAssistant, Text: "ok"},
+		{Kind: MsgTool, CallID: "call-1", ToolName: "read", ToolInput: json.RawMessage(`{"path":"a"}`), ToolOutput: "A"},
+	}}
+
+	model.rebuildHistory()
+
+	blocks := model.history[1].Content
+	if model.history[1].Role != provider.RoleAssistant {
+		t.Fatalf("reasoning turn role = %q, want assistant", model.history[1].Role)
+	}
+	if len(blocks) < 1 || blocks[0].Type != "thinking" || blocks[0].Text != "step one" {
+		t.Fatalf("thinking block dropped from rebuilt history: %#v", model.history[1].Content)
+	}
+}
+
 func TestSwarmWorkerConfigInheritsPolicyAndAccounting(t *testing.T) {
 	plugins := plugin.NewRegistry()
 	goals := &goal.Store{}
@@ -97,5 +116,23 @@ func TestMessagesToChatUsesCompactPreview(t *testing.T) {
 	chat := messagesToChat(msgs)
 	if len(chat) != 1 || chat[0].ToolOutput == output {
 		t.Fatalf("resume preview was not compacted: %+v", chat)
+	}
+}
+
+func TestMessagesToChatPreservesThinkingForRebuiltHistory(t *testing.T) {
+	messages := []provider.Message{{
+		Role: provider.RoleAssistant,
+		Content: []provider.ContentBlock{
+			{Type: "thinking", Text: "prior reasoning"},
+			provider.TextBlock("answer"),
+		},
+	}}
+
+	model := &Model{msgs: messagesToChat(messages)}
+	model.rebuildHistory()
+
+	blocks := model.history[0].Content
+	if len(blocks) != 2 || blocks[0].Type != "thinking" || blocks[0].Text != "prior reasoning" {
+		t.Fatalf("resume round-trip dropped thinking: %#v", blocks)
 	}
 }

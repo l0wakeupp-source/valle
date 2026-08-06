@@ -132,7 +132,7 @@ type wireImageURL struct {
 type wireMessage struct {
 	Role             string         `json:"role"`
 	Content          any            `json:"content,omitempty"`
-	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ReasoningContent *string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
@@ -230,19 +230,44 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 	} else if strings.TrimSpace(system) != "" {
 		out = append(out, wireMessage{Role: "system", Content: system})
 	}
-	for _, m := range msgs {
+
+	// DeepSeek/GLM require the *immediately previous* turn's reasoning echoed
+	// back to continue a tool exchange, but reasoning from older turns is dead
+	// weight: it multiplies the prompt, breaks the provider cache, and spikes
+	// CPU when compaction resends the whole head. Only the most recent
+	// assistant message that actually produced reasoning keeps its value;
+	// earlier turns still carry the reasoning_content field (so the endpoint
+	// never rejects them) but with an empty value.
+	lastThinking := -1
+	if includeReasoning {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			for _, b := range msgs[i].Content {
+				if b.Type == "thinking" && strings.TrimSpace(b.Text) != "" {
+					lastThinking = i
+					break
+				}
+			}
+			if lastThinking >= 0 {
+				break
+			}
+		}
+	}
+
+	for i, m := range msgs {
 		var text strings.Builder
 		var reasoning strings.Builder
 		var calls []wireToolCall
 		var results []wireMessage
 		var imageBlocks []wireImageContent
 
+		keeper := includeReasoning && i == lastThinking
+
 		for _, b := range m.Content {
 			switch b.Type {
 			case "text":
 				text.WriteString(b.Text)
 			case "thinking":
-				if includeReasoning {
+				if keeper {
 					reasoning.WriteString(b.Text)
 				}
 			case "tool_use":
@@ -278,8 +303,9 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 			if text.Len() > 0 {
 				wm.Content = text.String()
 			}
-			if reasoning.Len() > 0 {
-				wm.ReasoningContent = reasoning.String()
+			if reasoning.Len() > 0 || includeReasoning && len(calls) > 0 {
+				value := reasoning.String()
+				wm.ReasoningContent = &value
 			}
 			out = append(out, wm)
 		} else if m.Role == provider.RoleUser && (text.Len() > 0 || len(imageBlocks) > 0) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.12 — 2026-08-06
+
+### Performance
+
+- Lowered prompt weight: only the most recent reasoning/thinking block is echoed to providers (DeepSeek/GLM still need the prior turn, but stale reasoning from older turns was inflating every request — roughly two-thirds of a long session's bytes, breaking the provider cache and spiking CPU on compaction).
+- RepoMap disk cache key no longer includes the task prompt (it only affects ranking, not the skeleton), so a changed first task on the same git tree reuses the cached structural map instead of rebuilding it.
+
 ## v0.1.5 — 2026-08-02
 
 ### Performance

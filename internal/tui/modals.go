@@ -494,6 +494,11 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 					kind = MsgUser
 				}
 				out = append(out, ChatMsg{Kind: kind, Text: b.Text})
+			case "thinking":
+				if strings.TrimSpace(b.Text) == "" {
+					continue
+				}
+				out = append(out, ChatMsg{Kind: MsgThinking, Text: b.Text})
 			case "tool_use":
 				toolMsgIndex[b.ID] = len(out)
 				out = append(out, ChatMsg{

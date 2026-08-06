@@ -7,7 +7,7 @@
 //
 // Requests (→):
 //
-//	{"type":"run","session_id":"abc","prompt":"hi","model":"anthropic/...","yolo":false,"agent":"build","cwd":"/proj","resume":false,"attachments":[{"name":"shot.png","media_type":"image/png","data":"<base64>"}]}
+//	{"type":"run","session_id":"abc","prompt":"hi","model":"anthropic/...","permission_profile":"standard","sandbox":"workspace-write","thinking":"auto","yolo":false,"agent":"build","cwd":"/proj","resume":false,"attachments":[{"name":"shot.png","media_type":"image/png","data":"<base64>"}]}
 //	{"type":"permission_response","request_id":"r1","decision":"accept"}
 //	{"type":"interrupt","session_id":"abc"}
 //	{"type":"sessions","cwd":"/proj"}
@@ -80,15 +80,20 @@ const Version = "2.1.0"
 
 // Request is one inbound ndjson line.
 type Request struct {
-	Type      string `json:"type"`
-	SessionID string `json:"session_id,omitempty"`
-	Prompt    string `json:"prompt,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Yolo      bool   `json:"yolo,omitempty"`
-	MaxTurns  int    `json:"max_turns,omitempty"`
-	Agent     string `json:"agent,omitempty"`
-	Cwd       string `json:"cwd,omitempty"`
-	Resume    bool   `json:"resume,omitempty"`
+	Type              string `json:"type"`
+	RunID             string `json:"run_id,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	Prompt            string `json:"prompt,omitempty"`
+	Model             string `json:"model,omitempty"`
+	PermissionProfile string `json:"permission_profile,omitempty"`
+	Sandbox           string `json:"sandbox,omitempty"`
+	Thinking          string `json:"thinking,omitempty"`
+	Reasoning         string `json:"reasoning,omitempty"` // compatibility alias for thinking
+	Yolo              bool   `json:"yolo,omitempty"`
+	MaxTurns          int    `json:"max_turns,omitempty"`
+	Agent             string `json:"agent,omitempty"`
+	Cwd               string `json:"cwd,omitempty"`
+	Resume            bool   `json:"resume,omitempty"`
 	// Attachments carries base64-encoded files sent with the prompt.
 	// Images are delivered to vision-capable models as image blocks;
 	// text files are embedded verbatim after the prompt.
@@ -138,6 +143,8 @@ type Attachment struct {
 // Response is one outbound ndjson line.
 type Response struct {
 	Type      string          `json:"type"`
+	RequestID string          `json:"request_id,omitempty"`
+	RunID     string          `json:"run_id,omitempty"`
 	SessionID string          `json:"session_id,omitempty"`
 	Event     string          `json:"event,omitempty"`
 	Data      json.RawMessage `json:"data,omitempty"`
@@ -154,6 +161,26 @@ type writer struct {
 func newWriter(w io.Writer) *writer {
 	bw := bufio.NewWriter(w)
 	return &writer{bw: bw, enc: json.NewEncoder(bw)}
+}
+
+type responseEmitter interface {
+	emit(Response)
+}
+
+type runWriter struct {
+	parent    *writer
+	requestID string
+	runID     string
+}
+
+func (w *runWriter) emit(response Response) {
+	if response.RequestID == "" {
+		response.RequestID = w.requestID
+	}
+	if response.RunID == "" {
+		response.RunID = w.runID
+	}
+	w.parent.emit(response)
 }
 
 // emit writes one response line and flushes it immediately.
@@ -186,9 +213,14 @@ type server struct {
 	store   *session.Store
 	mcp     *mcp.Manager
 	sandbox *sandbox.Holder
-	usage   *usage.Tracker
-	creds   *config.Credentials
-	goals   *goal.Store
+	// Startup security flags are defaults only. Every run gets an isolated
+	// permission engine and sandbox holder so concurrent Desktop runs cannot
+	// change each other's policy.
+	defaultProfile string
+	defaultSandbox string
+	usage          *usage.Tracker
+	creds          *config.Credentials
+	goals          *goal.Store
 
 	// Snapshotter per cwd so undo/redo survives across runs.
 	snapMu sync.Mutex
@@ -210,7 +242,12 @@ type server struct {
 
 	// Active run cancellation: session_id -> cancel func.
 	runMu     sync.Mutex
-	runCancel map[string]context.CancelFunc
+	runCancel map[string]activeRun
+}
+
+type activeRun struct {
+	runID  string
+	cancel context.CancelFunc
 }
 
 func main() {
@@ -281,7 +318,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.11"
+var rickVersion = "0.1.12"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -311,11 +348,10 @@ func newServer(dir, sandboxMode, profile string) (*server, error) {
 		}
 	}
 
-	policy, err := resolveSandbox(loaded, sandboxMode, profile)
+	_, holder, err := resolveRunSecurity(loaded, profile, sandboxMode, false)
 	if err != nil {
 		return nil, err
 	}
-	holder := sandbox.NewHolder(policy)
 
 	todos := tools.NewTodoStore()
 	reg := tools.NewRegistry()
@@ -370,38 +406,48 @@ func newServer(dir, sandboxMode, profile string) (*server, error) {
 	usageTracker := usage.New(config.GlobalDir())
 
 	return &server{
-		loaded:      loaded,
-		cwd:         abs,
-		provs:       buildProviders(loaded.Config),
-		creds:       creds,
-		tools:       reg,
-		plugins:     plugins,
-		store:       store,
-		mcp:         mcp.NewManager(),
-		sandbox:     holder,
-		usage:       usageTracker,
-		goals:       goals,
-		snaps:       map[string]*session.Snapshotter{},
-		agents:      map[string]*agent.Registry{},
-		permPending: make(map[string]*pendingPerm),
-		runCancel:   make(map[string]context.CancelFunc),
+		loaded:         loaded,
+		cwd:            abs,
+		provs:          buildProviders(loaded.Config),
+		creds:          creds,
+		tools:          reg,
+		plugins:        plugins,
+		store:          store,
+		mcp:            mcp.NewManager(),
+		sandbox:        holder,
+		defaultProfile: profile,
+		defaultSandbox: sandboxMode,
+		usage:          usageTracker,
+		goals:          goals,
+		snaps:          map[string]*session.Snapshotter{},
+		agents:         map[string]*agent.Registry{},
+		permPending:    make(map[string]*pendingPerm),
+		runCancel:      make(map[string]activeRun),
 	}, nil
 }
 
-// resolveSandbox mirrors the sandbox half of the main binary's security
-// resolution: config block, optional profile override, optional flag override.
-func resolveSandbox(loaded *config.Loaded, mode, profile string) (sandbox.Policy, error) {
+// resolveRunSecurity mirrors cmd/rick's resolveSecurity for one daemon run.
+// Profile and sandbox overrides are deliberately run-local: rickserve can run
+// multiple Desktop sessions concurrently, each with different execution
+// controls.
+func resolveRunSecurity(loaded *config.Loaded, profile, mode string, yolo bool) (*permission.Engine, *sandbox.Holder, error) {
+	return resolveRunSecurityAtRoot(loaded, loaded.ProjectRoot, profile, mode, yolo)
+}
+
+func resolveRunSecurityAtRoot(loaded *config.Loaded, projectRoot, profile, mode string, yolo bool) (*permission.Engine, *sandbox.Holder, error) {
 	cfg := loaded.Config
 	perm := cfg.Permission
 	if profile != "" {
 		resolved, err := config.ResolveProfileByName(cfg, profile)
 		if err != nil {
-			return sandbox.Policy{}, err
+			return nil, nil, err
 		}
 		perm = resolved
 	} else {
 		perm = config.ResolvePermission(cfg, perm)
 	}
+	perms := permission.New(perm, projectRoot)
+	perms.SetProfile(profile)
 
 	sbCfg := cfg.Sandbox
 	if perm != nil && perm.Sandbox != nil {
@@ -411,15 +457,63 @@ func resolveSandbox(loaded *config.Loaded, mode, profile string) (sandbox.Policy
 			sbCfg = config.MergeSandbox(perm.Sandbox, cfg.Sandbox)
 		}
 	}
-	policy := sandbox.FromConfig(sbCfg, loaded.ProjectRoot)
+	policy := sandbox.FromConfig(sbCfg, projectRoot)
 	if mode != "" {
 		m, ok := sandbox.ParseMode(mode)
 		if !ok {
-			return sandbox.Policy{}, fmt.Errorf("unknown sandbox mode %q (want read-only, workspace-write, trusted or off)", mode)
+			return nil, nil, fmt.Errorf("unknown sandbox mode %q (want read-only, workspace-write, trusted or off)", mode)
 		}
 		policy.Mode = m
 	}
-	return policy.Normalize(loaded.ProjectRoot), nil
+	// Match TUI YOLO semantics: bypass both approval prompts and command
+	// sandboxing. Explicit protected-path denials remain enforced by perms.
+	if yolo {
+		policy.Mode = sandbox.ModeOff
+	}
+	policy = policy.Normalize(policy.Workspace)
+	perms.SetSandboxRoot(policy.Workspace, policy.Mode == sandbox.ModeWorkspace)
+	perms.SetProtectedPaths(policy.DenyPaths)
+	perms.SetYolo(yolo)
+	return perms, sandbox.NewHolder(policy), nil
+}
+
+// resolveRunReasoning accepts the TUI's thinking vocabulary. "auto" selects
+// the active model's model-specific default; an omitted value preserves the
+// daemon's legacy provider default behavior. Explicit Desktop choices pass
+// through unchanged because its generic selector is not model-specific.
+func resolveRunReasoning(providerID, modelID, value string, models []provider.ModelInfo) (provider.ReasoningEffort, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	var advertised *provider.ModelInfo
+	for i := range models {
+		if models[i].ID == modelID {
+			advertised = &models[i]
+			break
+		}
+	}
+	caps := provider.ReasoningCapabilitiesForProvider(providerID, modelID, advertised)
+	if strings.EqualFold(value, "auto") {
+		return caps.Default, nil
+	}
+	effort, ok := provider.ParseEffort(value)
+	if !ok {
+		return "", fmt.Errorf("unknown thinking level %q", value)
+	}
+	if len(caps.Efforts) > 0 {
+		supported := false
+		for _, candidate := range caps.Efforts {
+			if candidate == effort {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return "", fmt.Errorf("thinking level %q is not supported by %s/%s", value, providerID, modelID)
+		}
+	}
+	return effort, nil
 }
 
 // buildProviders instantiates every configured provider that has credentials.
@@ -563,7 +657,7 @@ func (s *server) serveConn(ctx context.Context, r io.Reader, out *writer) {
 func (s *server) dispatch(ctx context.Context, req Request, out *writer) {
 	switch req.Type {
 	case "", "run":
-		s.handleRun(ctx, req, out)
+		s.handleRun(ctx, req, &runWriter{parent: out, requestID: req.RequestID, runID: req.RunID})
 	case "permission_response":
 		s.handlePermissionResponse(req)
 	case "interrupt":
@@ -635,10 +729,10 @@ func (s *server) handlePermissionResponse(req Request) {
 
 func (s *server) handleInterrupt(req Request) {
 	s.runMu.Lock()
-	cancel, ok := s.runCancel[req.SessionID]
+	run, ok := s.runCancel[req.SessionID]
 	s.runMu.Unlock()
-	if ok {
-		cancel()
+	if ok && (req.RunID == "" || req.RunID == run.runID) {
+		run.cancel()
 	}
 }
 
@@ -656,19 +750,26 @@ func (s *server) handleSessions(req Request, out *writer) {
 
 func (s *server) handleModels(out *writer) {
 	type modelEntry struct {
-		Provider      string `json:"provider"`
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		ContextWindow int    `json:"context_window"`
+		Provider           string                     `json:"provider"`
+		ID                 string                     `json:"id"`
+		Name               string                     `json:"name"`
+		ContextWindow      int                        `json:"context_window"`
+		ReasoningEfforts   []provider.ReasoningEffort `json:"reasoning_efforts,omitempty"`
+		ReasoningDefault   provider.ReasoningEffort   `json:"reasoning_default,omitempty"`
+		ReasoningMandatory bool                       `json:"reasoning_mandatory,omitempty"`
 	}
 	var entries []modelEntry
 	for name, p := range s.provs {
 		for _, mi := range s.modelsForProvider(name, p) {
+			caps := provider.ReasoningCapabilitiesForProvider(name, mi.ID, &mi)
 			entries = append(entries, modelEntry{
-				Provider:      name,
-				ID:            mi.ID,
-				Name:          mi.Name,
-				ContextWindow: mi.ContextWindow,
+				Provider:           name,
+				ID:                 mi.ID,
+				Name:               mi.Name,
+				ContextWindow:      mi.ContextWindow,
+				ReasoningEfforts:   caps.Efforts,
+				ReasoningDefault:   caps.Default,
+				ReasoningMandatory: caps.Mandatory,
 			})
 		}
 	}
@@ -691,6 +792,10 @@ func (s *server) modelsForProvider(name string, p provider.Provider) []provider.
 	for _, id := range cred.VisionModels {
 		vision[id] = true
 	}
+	providerModels := make(map[string]provider.ModelInfo)
+	for _, modelInfo := range p.Models() {
+		providerModels[modelInfo.ID] = modelInfo
+	}
 	advertised := make([]provider.ModelInfo, 0, len(cred.Models))
 	for _, id := range cred.Models {
 		if strings.TrimSpace(id) == "" {
@@ -702,12 +807,17 @@ func (s *server) modelsForProvider(name string, p provider.Provider) []provider.
 		if override, ok := provider.ProviderContextWindow(name, id); ok {
 			contextWindow = override
 		}
-		advertised = append(advertised, provider.ModelInfo{
-			ID:             id,
-			Name:           id,
-			ContextWindow:  contextWindow,
-			SupportsImages: vision[id],
-		})
+		modelInfo := providerModels[id]
+		modelInfo.ID = id
+		if modelInfo.Name == "" {
+			modelInfo.Name = id
+		}
+		if contextWindow == 0 {
+			contextWindow = modelInfo.ContextWindow
+		}
+		modelInfo.ContextWindow = contextWindow
+		modelInfo.SupportsImages = modelInfo.SupportsImages || vision[id]
+		advertised = append(advertised, modelInfo)
 	}
 	if len(advertised) == 0 {
 		return provider.FilterChatModels(p.Models())
@@ -1579,7 +1689,7 @@ func (s *server) handleAgents(req Request, out *writer) {
 
 // handleRun executes one agent run using agent.Runner directly, streaming
 // events back as ndjson and routing permission requests to the client.
-func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
+func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter) {
 	sid := req.SessionID
 	if sid == "" {
 		sid = session.NewID()
@@ -1598,6 +1708,16 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
 		return
 	}
+	models := s.modelsForProvider(prov.Name(), prov)
+	thinking := req.Thinking
+	if thinking == "" {
+		thinking = req.Reasoning
+	}
+	reasoning, err := resolveRunReasoning(prov.Name(), modelID, thinking, models)
+	if err != nil {
+		out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
+		return
+	}
 
 	cwd := s.cwd
 	if req.Cwd != "" {
@@ -1612,14 +1732,26 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 	// maxTurns <= 0 means unlimited; the repeated-call guard still stops loops.
 	maxTurns := req.MaxTurns
 
-	// Build permission engine.
-	permPolicy := config.ResolvePermission(s.loaded.Config, s.loaded.Config.Permission)
-	perms := permission.New(permPolicy, s.loaded.ProjectRoot)
-	perms.SetYolo(req.Yolo)
+	// Build run-local permission and sandbox state. Desktop can dispatch
+	// concurrent sessions with different execution controls; mutating the
+	// daemon-wide holder here would make those runs race and leak policy.
+	profile := req.PermissionProfile
+	if profile == "" {
+		profile = s.defaultProfile
+	}
+	sandboxMode := req.Sandbox
+	if sandboxMode == "" {
+		sandboxMode = s.defaultSandbox
+	}
+	perms, runSandbox, err := resolveRunSecurityAtRoot(s.loaded, cwd, profile, sandboxMode, req.Yolo)
+	if err != nil {
+		out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
+		return
+	}
 
 	// Build the permission asker that routes to the client via ndjson.
 	var ask agent.PermissionAsker
-	if req.Yolo {
+	if perms.Yolo() {
 		ask = func(_ context.Context, _ permission.Request) agent.PermissionDecision {
 			return agent.DecideAlways
 		}
@@ -1656,7 +1788,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 
 	// Build system prompt. The instruction globs and the model id must match
 	// the TUI so the injected markdown is byte-identical in both frontends.
-	stableSystem := agent.BuildPrompt + agent.ProjectContext(s.loaded.ProjectRoot, s.loaded.Config.Instructions)
+	stableSystem := agent.BuildPrompt + agent.ProjectContext(cwd, s.loaded.Config.Instructions)
 	system := stableSystem + agent.Environment(cwd, modelID, agentName, "")
 
 	// Snapshotter for undo support, shared per project so undo/redo survives
@@ -1674,10 +1806,14 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 	}
 
 	// Build history: resume from existing session or start fresh.
-	var history []provider.Message
+	var (
+		history      []provider.Message
+		priorSession *session.Session
+	)
 	if req.Resume {
 		if existing, lerr := s.store.Load(sid); lerr == nil {
-			history = existing.Messages
+			priorSession = existing
+			history = append([]provider.Message(nil), existing.Messages...)
 		}
 	}
 	if len(history) == 0 {
@@ -1690,7 +1826,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 	// Attach files to the user message. Images require a vision-capable model;
 	// plain-text attachments are embedded after the prompt text.
 	if len(req.Attachments) > 0 {
-		userMsg, err := buildUserMessage(req.Prompt, req.Attachments, s.modelsForProvider(prov.Name(), prov), modelID)
+		userMsg, err := buildUserMessage(req.Prompt, req.Attachments, models, modelID)
 		if err != nil {
 			out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
 			return
@@ -1700,10 +1836,18 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		history[len(history)-1] = userMsg
 	}
 
-	// Create a cancellable context for this run.
+	// Create a cancellable context for this run. Only one generation may own a
+	// session at a time; otherwise cancellation and persisted history become
+	// ambiguous even when the client can reject stale correlated events.
 	runCtx, cancel := context.WithCancel(ctx)
 	s.runMu.Lock()
-	s.runCancel[sid] = cancel
+	if _, exists := s.runCancel[sid]; exists {
+		s.runMu.Unlock()
+		cancel()
+		out.emit(Response{Type: "error", SessionID: sid, Error: "session already has an active run"})
+		return
+	}
+	s.runCancel[sid] = activeRun{runID: req.RunID, cancel: cancel}
 	s.runMu.Unlock()
 	defer func() {
 		s.runMu.Lock()
@@ -1738,23 +1882,24 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 	}()
 
 	runner := agent.New(agent.Config{
-		Provider:     prov,
-		Model:        modelID,
-		System:       system,
-		SystemStable: stableSystem,
-		MaxTokens:    s.loaded.Config.MaxTokens,
-		Tools:        s.sessionTools(sid, cwd, model, ask, perms, reg, out),
-		Perms:        perms,
-		Ask:          ask,
-		Cwd:          cwd,
-		SessionID:    sid,
-		AgentName:    agentName,
-		AgentID:      agentID,
-		Registry:     reg,
-		MaxTurns:     maxTurns,
-		Plugins:      s.plugins,
-		Parallel:     true,
-		Snapshotter:  snapshotter,
+		Provider:       prov,
+		Model:          modelID,
+		System:         system,
+		SystemStable:   stableSystem,
+		MaxTokens:      s.loaded.Config.MaxTokens,
+		Reasoning:      reasoning,
+		Tools:          s.sessionTools(sid, cwd, model, reasoning, ask, perms, runSandbox, reg, out),
+		Perms:          perms,
+		Ask:            ask,
+		Cwd:            cwd,
+		SessionID:      sid,
+		AgentName:      agentName,
+		AgentID:        agentID,
+		Registry:       reg,
+		MaxTurns:       maxTurns,
+		Plugins:        s.plugins,
+		Parallel:       true,
+		Snapshotter:    snapshotter,
 		CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
 	})
 
@@ -1770,8 +1915,24 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		appended, runErr = runner.Run(runCtx, history, ch)
 	}()
 
-	// Track usage for the session.
+	// Track current context separately from cumulative billing usage. Context is
+	// the full provider-facing prompt for the latest turn, including cached
+	// tokens, whereas session counters accumulate over every resumed run.
 	var totalUsage session.Usage
+	var optimization session.OptimizationUsage
+	lastContextUsed := 0
+	if priorSession != nil {
+		totalUsage = priorSession.Usage
+		optimization = priorSession.Optimization
+		lastContextUsed = priorSession.ContextUsed
+	}
+	contextLimit := 0
+	for _, modelInfo := range models {
+		if modelInfo.ID == modelID {
+			contextLimit = modelInfo.ContextWindow
+			break
+		}
+	}
 
 	for ev := range ch {
 		switch ev.Kind {
@@ -1783,6 +1944,10 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 			totalUsage.Output += ev.Usage.OutputTokens
 			totalUsage.CacheRead += ev.Usage.CacheReadTokens
 			totalUsage.CacheWrite += ev.Usage.CacheWriteTokens
+			turnContextUsed := ev.Usage.InputTokens + ev.Usage.CacheReadTokens + ev.Usage.CacheWriteTokens
+			if turnContextUsed > 0 {
+				lastContextUsed = turnContextUsed
+			}
 			// Record in the usage tracker.
 			if s.usage != nil {
 				_ = s.usage.Record(model, ev.Usage.InputTokens, ev.Usage.OutputTokens,
@@ -1794,10 +1959,22 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 					"output_tokens":      ev.Usage.OutputTokens,
 					"cache_read_tokens":  ev.Usage.CacheReadTokens,
 					"cache_write_tokens": ev.Usage.CacheWriteTokens,
+					"context_tokens":     lastContextUsed,
+					"context_limit":      contextLimit,
 				})})
 
 		case agent.EvPermissionAsk:
 			// Handled by the ask callback — no separate event needed.
+
+		case agent.EvToolEnd:
+			if ev.Tool != nil && ev.Tool.Optimization != nil {
+				stats := ev.Tool.Optimization
+				optimization.ToolResults++
+				optimization.OriginalTokens += stats.OriginalTokens
+				optimization.ProviderTokens += stats.CompressedTokens
+				optimization.SavedTokens += stats.OriginalTokens - stats.CompressedTokens
+			}
+			emitAgentEvent(out, sid, ev)
 
 		case agent.EvDone:
 			// Loop will end when ch closes.
@@ -1815,27 +1992,36 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 		allMsgs = append(append([]provider.Message{}, history...), appended...)
 	}
 	sess := &session.Session{
-		ID:       sid,
-		Title:    session.Title(allMsgs),
-		Cwd:      cwd,
-		Model:    model,
-		Agent:    agentName,
-		Messages: allMsgs,
-		Usage:    totalUsage,
+		ID:             sid,
+		Title:          session.Title(allMsgs),
+		Cwd:            cwd,
+		Model:          model,
+		Agent:          agentName,
+		Messages:       allMsgs,
+		Usage:          totalUsage,
+		ContextUsed:    lastContextUsed,
+		SentTranscript: append([]provider.Message(nil), allMsgs...),
+		Optimization:   optimization,
 	}
 	// Preserve existing metadata on resume.
-	if req.Resume {
-		if prior, perr := s.store.Load(sid); perr == nil {
-			if prior.Title != "" && prior.Title != "untitled" {
-				sess.Title = prior.Title
-			}
-			sess.Created = prior.Created
-			sess.Category = prior.Category
-			sess.Favorite = prior.Favorite
+	metadataSource := priorSession
+	if latest, loadErr := s.store.Load(sid); loadErr == nil {
+		metadataSource = latest
+	}
+	if metadataSource != nil {
+		if metadataSource.Title != "" && metadataSource.Title != "untitled" {
+			sess.Title = metadataSource.Title
 		}
+		sess.Created = metadataSource.Created
+		sess.Category = metadataSource.Category
+		sess.Favorite = metadataSource.Favorite
+		sess.Parent = metadataSource.Parent
+		sess.EnvGit = metadataSource.EnvGit
 	}
 	if err := s.store.Save(sess); err != nil {
-		fmt.Fprintf(os.Stderr, "rickserve: warning: failed to save session: %v\n", err)
+		out.emit(Response{Type: "error", SessionID: sid, Error: fmt.Sprintf("failed to save session: %v", err)})
+		out.emit(Response{Type: "done", SessionID: sid})
+		return
 	}
 	_ = s.store.SetCurrent(cwd, sid)
 
@@ -1857,26 +2043,29 @@ func (s *server) handleRun(ctx context.Context, req Request, out *writer) {
 // tool set, so rickserve exposes the same tools the TUI gives its primary
 // agent. The registry is per-session because the spawn closure and the agent
 // registry are session-bound.
-func (s *server) sessionTools(sid, cwd, model string, ask agent.PermissionAsker, perms *permission.Engine, reg *agent.Registry, out *writer) *tools.Registry {
+func (s *server) sessionTools(sid, cwd, model string, reasoning provider.ReasoningEffort, ask agent.PermissionAsker, perms *permission.Engine, runSandbox *sandbox.Holder, reg *agent.Registry, out responseEmitter) *tools.Registry {
 	rt := tools.NewRegistry()
 	for _, name := range s.tools.Names() {
 		if t, ok := s.tools.Get(name); ok {
 			rt.Register(t)
 		}
 	}
+	// Replace the daemon-default bash tool with one bound to this run's holder.
+	// Registry.Register replaces by name without changing tool order.
+	rt.Register(tools.BashTool{Sandbox: runSandbox})
 
 	specs := s.subagentSpecs()
 	maxDepth := 1
 	if d := s.loaded.Config.SubagentDepth; d != nil && *d > 0 {
 		maxDepth = *d
 	}
-	spawn := s.spawnSubagent(sid, cwd, ask, perms, reg, out, rt, specs, maxDepth)
+	spawn := s.spawnSubagent(sid, cwd, reasoning, ask, perms, reg, out, rt, specs, maxDepth)
 	rt.Register(agent.TaskTool{Specs: specs, MaxDepth: maxDepth, Spawn: spawn})
 	rt.Register(agent.ParallelTaskTool{Specs: specs, MaxDepth: maxDepth, Spawn: spawn})
 	// Headless swarm support: the TUI registers the swarm tool only when a
 	// UI swarm manager exists; rickserve runs the same team machinery through
 	// RunTaskTeam so desktop sessions can spawn collaborative agent teams.
-	rt.Register(agent.SwarmTool{Manager: s.spawnSwarm(sid, cwd, model, ask, perms, out, rt)})
+	rt.Register(agent.SwarmTool{Manager: s.spawnSwarm(sid, cwd, model, reasoning, ask, perms, out, rt)})
 	if reg != nil {
 		rt.Register(agent.ChatTool{Registry: reg})
 		rt.Register(agent.SteerTool{Registry: reg})
@@ -1913,7 +2102,7 @@ func (s *server) subagentSpecs() map[string]agent.SubagentSpec {
 // spawnSubagent runs one subagent with the same provider, permission engine,
 // plugin set and event stream as the parent run, mirroring the TUI's
 // foreground delegation path.
-func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms *permission.Engine, reg *agent.Registry, out *writer, sessionTools *tools.Registry, specs map[string]agent.SubagentSpec, maxDepth int) func(context.Context, string, string, string, int) (string, error) {
+func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffort, ask agent.PermissionAsker, perms *permission.Engine, reg *agent.Registry, out responseEmitter, sessionTools *tools.Registry, specs map[string]agent.SubagentSpec, maxDepth int) func(context.Context, string, string, string, int) (string, error) {
 	return func(ctx context.Context, kind, description, prompt string, depth int) (string, error) {
 		if depth > maxDepth || depth > agent.MaxAllowedDepth {
 			return "", fmt.Errorf("subagent depth %d exceeds configured limit %d", depth, maxDepth)
@@ -1932,8 +2121,8 @@ func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
 
-		subPerms := agent.SubagentPermissions(spec, perms, s.loaded.ProjectRoot)
-		stableSys := spec.Prompt + agent.ProjectContext(s.loaded.ProjectRoot, s.loaded.Config.Instructions)
+		subPerms := agent.SubagentPermissions(spec, perms, cwd)
+		stableSys := spec.Prompt + agent.ProjectContext(cwd, s.loaded.Config.Instructions)
 		sys := stableSys + agent.Environment(cwd, modelID, kind, "")
 		toolSpec := spec
 		if perms != nil && perms.Yolo() {
@@ -1943,25 +2132,27 @@ func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms
 		out.emit(Response{Type: "event", SessionID: sid, Event: "SubagentStart",
 			Data: mustJSON(map[string]string{"kind": kind, "description": description})})
 		toolCount := 0
+		budgetAgentName := kind + "-" + session.NewID()
 		result, runErr := agent.RunSubagent(ctx, agent.Config{
-			Provider:     prov,
-			Model:        modelID,
-			System:       sys,
-			SystemStable: stableSys,
-			MaxTokens:    s.loaded.Config.MaxTokens,
-			Tools:        sessionTools,
-			ToolFilter:   agent.SubagentToolFilter(toolSpec, nil),
-			Perms:        subPerms,
-			Ask:          ask,
-			Cwd:          cwd,
-			SessionID:    sid,
-			AgentName:    kind,
-			Depth:        depth,
-			MaxTurns:     0, // unlimited; the repeated-call guard still stops loops
-			Plugins:      s.plugins,
+			Provider:       prov,
+			Model:          modelID,
+			System:         sys,
+			SystemStable:   stableSys,
+			MaxTokens:      s.loaded.Config.MaxTokens,
+			Reasoning:      reasoning,
+			Tools:          sessionTools,
+			ToolFilter:     agent.SubagentToolFilter(toolSpec, nil),
+			Perms:          subPerms,
+			Ask:            ask,
+			Cwd:            cwd,
+			SessionID:      sid,
+			AgentName:      budgetAgentName,
+			Depth:          depth,
+			MaxTurns:       0, // unlimited; the repeated-call guard still stops loops
+			Plugins:        s.plugins,
 			CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
-			Parallel:     true,
-			Registry:     reg,
+			Parallel:       true,
+			Registry:       reg,
 		}, prompt, func(ev agent.Event) {
 			if ev.Kind == agent.EvUsage && ev.Usage != nil && s.usage != nil {
 				_ = s.usage.Record(modelRef, ev.Usage.InputTokens, ev.Usage.OutputTokens,
@@ -1978,11 +2169,60 @@ func (s *server) spawnSubagent(sid, cwd string, ask agent.PermissionAsker, perms
 	}
 }
 
+func swarmRuntimeResponse(sid, swarmID, swarmName string, event swarm.RuntimeEvent) (Response, bool) {
+	agentState := map[string]any{"id": event.Name, "name": event.Name}
+	switch event.Kind {
+	case swarm.EventAgentStart:
+		agentState["status"] = "working"
+		agentState["action"] = "starting"
+	case swarm.EventAgentDone:
+		agentState["status"] = "completed"
+		agentState["action"] = "done"
+		if result, ok := event.Value.(string); ok {
+			agentState["result"] = truncate(result, 4000)
+		}
+	case swarm.EventAgentFailed:
+		agentState["status"] = "failed"
+		agentState["action"] = "failed"
+		if err, ok := event.Value.(error); ok {
+			agentState["error"] = err.Error()
+		}
+	case swarm.EventAgentTool:
+		agentEvent, ok := event.Value.(agent.Event)
+		if !ok {
+			return Response{}, false
+		}
+		if agentEvent.Kind == agent.EvUsage {
+			return Response{}, false
+		}
+		if (agentEvent.Kind != agent.EvToolStart && agentEvent.Kind != agent.EvToolEnd) || agentEvent.Tool == nil {
+			return Response{}, false
+		}
+		agentState["status"] = "working"
+		agentState["current_tool"] = agentEvent.Tool.Name
+		if agentEvent.Kind == agent.EvToolStart {
+			agentState["action"] = strings.TrimSpace(agentEvent.Tool.Name + " " + agentEvent.Tool.Title)
+		} else if agentEvent.Tool.IsError {
+			agentState["action"] = agentEvent.Tool.Name + " failed"
+		} else {
+			agentState["action"] = agentEvent.Tool.Name + " completed"
+		}
+	default:
+		return Response{}, false
+	}
+	return Response{Type: "event", SessionID: sid, Event: "agent.updated", Data: mustJSON(map[string]any{
+		"swarm_id": swarmID,
+		"name":     swarmName,
+		"agents":   []any{agentState},
+	})}, true
+}
+
 // spawnSwarm runs a swarm headlessly through the same worker machinery as the
 // TUI: one agent.Runner per teammate, a shared task board, and RunTaskTeam for
-// dependency-aware scheduling. Worker activity streams to the client like
-// subagent output so the desktop transcript shows the team's work.
-func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, perms *permission.Engine, out *writer, sessionTools *tools.Registry) func(context.Context, string, string, []agent.SwarmAgentSpec, swarm.Topology) (string, error) {
+// dependency-aware scheduling. Worker activity is folded into one AgentUpdate
+// stream so desktop renders the same in-place team status the TUI does instead
+// of appending every worker tool call to the parent transcript.
+func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.ReasoningEffort, ask agent.PermissionAsker, perms *permission.Engine, out responseEmitter, sessionTools *tools.Registry) func(context.Context, string, string, []agent.SwarmAgentSpec, swarm.Topology) (string, error) {
 	return func(ctx context.Context, name, goal string, specs []agent.SwarmAgentSpec, topo swarm.Topology) (string, error) {
 		if len(specs) < 2 {
 			return "", fmt.Errorf("at least 2 agents are required for a swarm (got %d)", len(specs))
@@ -2029,20 +2269,22 @@ func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, p
 			workerTools.Register(agent.TeamTool{Swarm: team})
 			system := "You are an independent teammate reporting to the lead agent. Use the team tool to confirm your assigned task, inspect messages, share only useful findings, and complete or fail the task explicitly. Do not delegate or spawn agents. Return ONLY factual findings—no narration, no 'I'll research', and no 'Let me dig deeper'. Output clean, complete results with sources when applicable."
 			cfg := agent.Config{
-				Provider:  prov,
-				Model:     modelID,
-				System:    system,
-				MaxTokens: s.loaded.Config.MaxTokens,
-				Tools:     workerTools,
-				Perms:     perms,
-				Ask:       ask,
-				Cwd:       cwd,
-				SessionID: sid,
-				AgentName: spec.Name,
-				Depth:     1,
-				MaxTurns:  0, // unlimited; the repeated-call guard still stops loops
-				Plugins:   s.plugins,
-				Parallel:  true,
+				Provider:       prov,
+				Model:          modelID,
+				System:         system,
+				MaxTokens:      s.loaded.Config.MaxTokens,
+				Reasoning:      reasoning,
+				Tools:          workerTools,
+				Perms:          perms,
+				Ask:            ask,
+				Cwd:            cwd,
+				SessionID:      sid,
+				AgentName:      spec.Name,
+				AgentID:        team.ID + "/" + spec.Name,
+				Depth:          1,
+				MaxTurns:       0, // unlimited; the repeated-call guard still stops loops
+				Plugins:        s.plugins,
+				Parallel:       true,
 				CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
 			}
 			taskID := spec.TaskID
@@ -2054,15 +2296,16 @@ func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, p
 		}
 
 		out.emit(Response{Type: "event", SessionID: sid, Event: "SwarmStart",
-			Data: mustJSON(map[string]any{"name": name, "goal": goal, "agents": len(specs)})})
+			Data: mustJSON(map[string]any{"swarm_id": team.ID, "name": name, "goal": goal, "agents": len(specs)})})
 		results := swarm.RunTaskTeam(ctx, jobs, team.Tasks, 4, func(ev swarm.RuntimeEvent) {
 			if aev, ok := ev.Value.(agent.Event); ok {
 				if aev.Kind == agent.EvUsage && aev.Usage != nil && s.usage != nil {
 					_ = s.usage.Record(model, aev.Usage.InputTokens, aev.Usage.OutputTokens,
 						aev.Usage.CacheReadTokens, aev.Usage.CacheWriteTokens)
-					return
 				}
-				emitAgentEvent(out, sid, aev)
+			}
+			if response, ok := swarmRuntimeResponse(sid, team.ID, name, ev); ok {
+				out.emit(response)
 			}
 		})
 		var b strings.Builder
@@ -2080,7 +2323,7 @@ func (s *server) spawnSwarm(sid, cwd, model string, ask agent.PermissionAsker, p
 
 // emitAgentEvent streams a non-usage agent event to the client in the exact
 // shape the main run loop uses, so subagent activity renders identically.
-func emitAgentEvent(out *writer, sid string, ev agent.Event) {
+func emitAgentEvent(out responseEmitter, sid string, ev agent.Event) {
 	switch ev.Kind {
 	case agent.EvText:
 		out.emit(Response{Type: "event", SessionID: sid, Event: "Content",
@@ -2096,9 +2339,10 @@ func emitAgentEvent(out *writer, sid string, ev agent.Event) {
 		}
 		out.emit(Response{Type: "event", SessionID: sid, Event: "ToolUse",
 			Data: mustJSON(map[string]any{
-				"name":  ev.Tool.Name,
-				"title": ev.Tool.Title,
-				"input": json.RawMessage(orNull(ev.Tool.Input)),
+				"call_id": ev.Tool.CallID,
+				"name":    ev.Tool.Name,
+				"title":   ev.Tool.Title,
+				"input":   json.RawMessage(orNull(ev.Tool.Input)),
 			})})
 
 	case agent.EvToolEnd:
@@ -2107,9 +2351,10 @@ func emitAgentEvent(out *writer, sid string, ev agent.Event) {
 		}
 		out.emit(Response{Type: "event", SessionID: sid, Event: "ToolResult",
 			Data: mustJSON(map[string]any{
+				"call_id":  ev.Tool.CallID,
 				"name":     ev.Tool.Name,
 				"title":    ev.Tool.Title,
-				"output":   truncate(ev.Tool.Output, 4000),
+				"output":   ev.Tool.Output,
 				"is_error": ev.Tool.IsError,
 				"elapsed":  ev.Tool.Elapsed.Round(time.Millisecond).String(),
 			})})

@@ -37,7 +37,7 @@ import (
 	"rick/pkg/contextbudget"
 )
 
-var Version = "0.1.11"
+var Version = "0.1.12"
 
 func main() {
 	var (

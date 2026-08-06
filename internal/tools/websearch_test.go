@@ -22,6 +22,35 @@ func TestFilterResultsNilConfig(t *testing.T) {
 	}
 }
 
+func TestWebSearchBudgetIDScopesParallelAgentsIndependently(t *testing.T) {
+	first := webSearchBudgetID(Context{SessionID: "session", Agent: "explore", AgentID: "explore-1", Depth: 1})
+	second := webSearchBudgetID(Context{SessionID: "session", Agent: "explore", AgentID: "explore-2", Depth: 1})
+	if first == second {
+		t.Fatalf("parallel agents share budget id %q", first)
+	}
+	resetBudget(first)
+	resetBudget(second)
+	defer resetBudget(first)
+	defer resetBudget(second)
+	if allowed, _ := checkBudget(first, 1); !allowed {
+		t.Fatal("first agent could not use its budget")
+	}
+	if allowed, _ := checkBudget(first, 1); allowed {
+		t.Fatal("first agent exceeded its own budget")
+	}
+	if allowed, _ := checkBudget(second, 1); !allowed {
+		t.Fatal("first agent exhausted the second agent's budget")
+	}
+	if got := webSearchBudgetID(Context{SessionID: "session"}); got != "session" {
+		t.Fatalf("root budget id = %q, want session", got)
+	}
+	rootFirst := webSearchBudgetID(Context{SessionID: "session", Agent: "build", AgentID: "root-1"})
+	rootSecond := webSearchBudgetID(Context{SessionID: "session", Agent: "build", AgentID: "root-2"})
+	if rootFirst != rootSecond {
+		t.Fatalf("root run identity reset the session budget: %q != %q", rootFirst, rootSecond)
+	}
+}
+
 func TestFilterResultsEmptyConfig(t *testing.T) {
 	results := []searchResult{
 		{Title: "A", URL: "https://example.com/page"},

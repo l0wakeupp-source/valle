@@ -123,6 +123,21 @@ func TestOpenCodeZenPreservesReasoningContent(t *testing.T) {
 	}
 }
 
+func TestOpenCodeZenKeepsEmptyReasoningFieldOnToolTurns(t *testing.T) {
+	toolTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{
+		Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`),
+	}}}
+
+	request := reasoningEchoClient(t, "opencode-zen", "deepseek-v4-flash-free", []provider.Message{toolTurn}, provider.ReasoningHigh)
+	encoded, err := json.Marshal(request["messages"])
+	if err != nil {
+		t.Fatalf("encode sent messages: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"reasoning_content":""`) {
+		t.Fatalf("assistant tool turn omitted empty reasoning_content: %s", encoded)
+	}
+}
+
 // reasoningEchoClient runs Stream against a probe server and returns the
 // decoded JSON request it received.
 func reasoningEchoClient(t *testing.T, providerID, model string, messages []provider.Message, level provider.ReasoningEffort) map[string]any {
@@ -283,5 +298,45 @@ func TestUnknownModelOnlyGetsGenericReasoningWhenEnabled(t *testing.T) {
 		if test.wantField && request["reasoning_effort"] != string(provider.ReasoningMedium) {
 			t.Fatalf("reasoning_effort = %#v, want %q", request["reasoning_effort"], provider.ReasoningMedium)
 		}
+	}
+}
+
+// Older reasoning blocks are dead weight that multiplies prompt size and
+// breaks the provider cache. Only the most recent thinking-carrying assistant
+// turn must be echoed back (DeepSeek/GLM need the previous turn's reasoning);
+// older turns keep an empty reasoning_content so the endpoint accepts them.
+func TestOnlyMostRecentReasoningIsEchoed(t *testing.T) {
+	old := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: strings.Repeat("old reasoning ", 100)},
+		{Type: "text", Text: "old answer"},
+	}}
+	recent := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "recent reasoning"},
+		{Type: "tool_use", ID: "c1", Name: "read", Input: json.RawMessage(`{"path":"x"}`)},
+	}}
+	msgs := []provider.Message{old, provider.UserText("turn 2"), recent}
+	wire := toWireWithReasoning("", msgs, true)
+
+	var oldReasoning, recentReasoning *string
+	for _, wm := range wire {
+		if wm.Role != "assistant" {
+			continue
+		}
+		if wm.ReasoningContent == nil {
+			continue
+		}
+		if *wm.ReasoningContent == "recent reasoning" {
+			recentReasoning = wm.ReasoningContent
+		}
+		if strings.Contains(*wm.ReasoningContent, "old reasoning") {
+			oldReasoning = wm.ReasoningContent
+		}
+	}
+
+	if recentReasoning == nil {
+		t.Fatal("most recent thinking must be echoed back")
+	}
+	if oldReasoning != nil {
+		t.Fatalf("stale reasoning must be stripped, got %q (len %d)", *oldReasoning, len(*oldReasoning))
 	}
 }

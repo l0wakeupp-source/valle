@@ -518,6 +518,21 @@ type searchResult struct {
 	Snippet string
 }
 
+func webSearchBudgetID(tc Context) string {
+	sessionID := strings.TrimSpace(tc.SessionID)
+	if sessionID == "" {
+		return nextAnonymousBudgetID()
+	}
+	agentIdentity := strings.TrimSpace(tc.Agent)
+	if tc.Depth > 0 && strings.TrimSpace(tc.AgentID) != "" {
+		agentIdentity = strings.TrimSpace(tc.AgentID)
+	}
+	if agentIdentity == "" {
+		return sessionID
+	}
+	return sessionID + "\x00agent:" + agentIdentity
+}
+
 func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var args searchArgs
 	if err := json.Unmarshal(in, &args); err != nil {
@@ -543,10 +558,7 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 			maxSession = cfg.MaxSearchesPerSession
 		}
 	}
-	budgetID := tc.SessionID
-	if strings.TrimSpace(budgetID) == "" {
-		budgetID = nextAnonymousBudgetID()
-	}
+	budgetID := webSearchBudgetID(tc)
 	allowed, n := checkBudget(budgetID, maxSession)
 	if !allowed {
 		return Result{

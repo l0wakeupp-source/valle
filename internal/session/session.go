@@ -35,9 +35,13 @@ type Session struct {
 	// EnvGit is the git-state line (branch + dirty count) frozen when the
 	// session started. Resuming reuses it so the system prompt's environment
 	// block is byte-identical and the provider cache survives the restart.
-	EnvGit       string            `json:"env_git,omitempty"`
-	Snapshots    []Snapshot        `json:"snapshots,omitempty"`
-	Usage        Usage             `json:"usage"`
+	EnvGit    string     `json:"env_git,omitempty"`
+	Snapshots []Snapshot `json:"snapshots,omitempty"`
+	Usage     Usage      `json:"usage"`
+	// ContextUsed is the provider-facing prompt size from the latest turn. It is
+	// intentionally separate from cumulative Usage so resumed clients can
+	// restore an accurate context gauge.
+	ContextUsed  int               `json:"context_used,omitempty"`
 	Optimization OptimizationUsage `json:"optimization,omitempty"`
 }
 
