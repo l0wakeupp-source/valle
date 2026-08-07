@@ -45,6 +45,9 @@ type ChatMsg struct {
 	Choices     []choiceOption
 	choiceID    uint64
 	CallID      string
+	// TurnBoundary marks the final tool result in a provider turn so streamed
+	// reasoning from the next turn cannot be regrouped with the prior call.
+	TurnBoundary bool
 
 	// Diff entries
 	DiffPath string

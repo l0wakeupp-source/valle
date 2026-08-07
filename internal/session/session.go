@@ -28,6 +28,9 @@ type Session struct {
 	Created  time.Time          `json:"created"`
 	Updated  time.Time          `json:"updated"`
 	Messages []provider.Message `json:"messages"`
+	// RunError records the last terminal provider/agent failure for diagnostics.
+	// It is not part of Messages and is never replayed to the provider.
+	RunError string `json:"run_error,omitempty"`
 	// SentTranscript is the exact bounded provider-facing view last sent, so
 	// a resumed session can replay byte-identical bytes and warm the provider
 	// prompt cache on its first turn.

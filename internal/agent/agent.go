@@ -383,12 +383,41 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			emit(Event{Kind: EvError, Err: streamErr})
 			return appended, streamErr
 		}
-		assistant := provider.Message{Role: provider.RoleAssistant}
-		for i := range calls {
-			if calls[i].ID == "" {
-				calls[i].ID = fmt.Sprintf("rick-tool-%d-%d", time.Now().UnixNano(), i)
-			}
+		if strings.TrimSpace(textBuf.String()) == "" && strings.TrimSpace(thinkBuf.String()) == "" && len(calls) == 0 {
+			streamErr = fmt.Errorf("agent: provider returned an empty completion")
+			emit(Event{Kind: EvError, Err: streamErr})
+			return appended, streamErr
 		}
+		seenCallIDs := make(map[string]struct{}, len(calls))
+		for index := range calls {
+			call := &calls[index]
+			if strings.TrimSpace(call.Name) == "" {
+				streamErr = fmt.Errorf("agent: malformed tool call: missing function name")
+				emit(Event{Kind: EvError, Err: streamErr})
+				return appended, streamErr
+			}
+			input := strings.TrimSpace(string(call.Input))
+			if !json.Valid(call.Input) {
+				streamErr = fmt.Errorf("agent: malformed arguments for tool %q", call.Name)
+				emit(Event{Kind: EvError, Err: streamErr})
+				return appended, streamErr
+			}
+			if input == "" || input[0] != '{' {
+				streamErr = fmt.Errorf("agent: arguments for tool %q must be a JSON object", call.Name)
+				emit(Event{Kind: EvError, Err: streamErr})
+				return appended, streamErr
+			}
+			if call.ID == "" {
+				call.ID = fmt.Sprintf("rick-tool-%d-%d", time.Now().UnixNano(), index)
+			}
+			if _, duplicate := seenCallIDs[call.ID]; duplicate {
+				streamErr = fmt.Errorf("agent: duplicate tool call ID %q", call.ID)
+				emit(Event{Kind: EvError, Err: streamErr})
+				return appended, streamErr
+			}
+			seenCallIDs[call.ID] = struct{}{}
+		}
+		assistant := provider.Message{Role: provider.RoleAssistant}
 		if thinkBuf.Len() > 0 {
 			assistant.Content = append(assistant.Content, provider.ContentBlock{
 				Type: "thinking", Text: thinkBuf.String(),

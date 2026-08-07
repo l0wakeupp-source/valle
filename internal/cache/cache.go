@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,7 @@ import (
 type Dir struct {
 	path     string
 	maxFiles int
+	writeMu  sync.Mutex
 }
 
 // New opens (and creates) a cache directory. maxFiles bounds the entry count;
@@ -58,11 +60,40 @@ func (d *Dir) Put(key string, value []byte) {
 	if d == nil || len(value) == 0 {
 		return
 	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	path := d.filePath(key)
 	if err := os.WriteFile(path, value, 0o644); err != nil {
 		return
 	}
+	d.ensureNewest(path)
 	d.evict()
+}
+
+// ensureNewest makes insertion order unambiguous on filesystems whose native
+// modification timestamps coalesce rapid writes. Eviction otherwise becomes
+// nondeterministic when several entries share the same timestamp.
+func (d *Dir) ensureNewest(path string) {
+	entries, err := os.ReadDir(d.path)
+	if err != nil {
+		return
+	}
+	var newest time.Time
+	for _, entry := range entries {
+		entryPath := filepath.Join(d.path, entry.Name())
+		if entry.IsDir() || entryPath == path {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	modified := time.Now()
+	if !modified.After(newest) {
+		modified = newest.Add(time.Millisecond)
+	}
+	_ = os.Chtimes(path, modified, modified)
 }
 
 func (d *Dir) filePath(key string) string {

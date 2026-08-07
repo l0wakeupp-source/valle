@@ -169,3 +169,19 @@ func TestCacheControlForLongRetentionAddsTTL(t *testing.T) {
 		t.Fatalf("none retention = %#v, want nil", cc)
 	}
 }
+
+// A ttl:"1h" breakpoint is rejected by Anthropic unless the request opts in to
+// the extended-cache-ttl beta. "long" retention must therefore always carry
+// the beta header, while auto/none must not (they would not even reach a 1h
+// TTL, and sending the beta unconditionally can break proxy/gateway routes).
+func TestCacheBetaHeaderMatchesRetention(t *testing.T) {
+	if got := cacheBetaHeader(provider.CacheRetentionLong); got != extendedCacheTTLBeta {
+		t.Fatalf("long retention beta = %q, want %q", got, extendedCacheTTLBeta)
+	}
+	if got := cacheBetaHeader(provider.CacheRetentionAuto); got != "" {
+		t.Fatalf("auto retention beta = %q, want empty", got)
+	}
+	if got := cacheBetaHeader(provider.CacheRetentionNone); got != "" {
+		t.Fatalf("none retention beta = %q, want empty", got)
+	}
+}

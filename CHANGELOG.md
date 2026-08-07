@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.13 — 2026-08-07
+
+### Performance
+
+- Anthropic `cache_retention: "long"` now sends the `extended-cache-ttl` beta header, so 1h prompt-cache TTLs are honoured instead of silently degrading to the 5-minute default and re-writing the cache every turn.
+- DeepSeek-line providers (opencode-zen, deepseek, openrouter) echo reasoning for every assistant turn instead of stripping to the newest window. The serialized prompt is append-only, so the provider's automatic prefix cache hits the whole history each turn instead of re-billing the tail on every prefix change.
+- Disk-cache writes receive a deterministic monotonic modification order, so rapid Windows writes cannot evict a newer entry when filesystem timestamps collide.
+
+### Reliability
+
+- Malformed SSE frames, streams truncated before a completion marker, empty completions, non-object tool arguments, nameless calls, and duplicate tool-call IDs now fail visibly before tool execution instead of ending as a silent user-only turn or poisoning the next request.
+- OpenAI-compatible streamed safety refusals are surfaced as assistant text instead of being misclassified as empty completions.
+- Streamed tool/reasoning history retains exact provider-turn boundaries during save and resume, preventing adjacent reasoning/tool turns from being regrouped and destabilizing the cache prefix.
+- The last provider/agent run error is persisted as session diagnostics without replaying it into the model prompt, restored on resume, and cleared for a new or successful session.
+- Session persistence failures now produce visible diagnostics instead of being discarded.
+
 ## v0.1.12 — 2026-08-06
 
 ### Performance

@@ -67,7 +67,7 @@ func TestStreamUsesGLMThinkingAndReasoningContent(t *testing.T) {
 		t.Fatalf("messages = %#v", request["messages"])
 	}
 	prior := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "prior reasoning"}}}
-	wire := toWireWithReasoning("", []provider.Message{prior}, true)
+	wire := toWireWithReasoning("", []provider.Message{prior}, true, false)
 	encoded, err := json.Marshal(wire[0])
 	if err != nil {
 		t.Fatalf("encode assistant message: %v", err)
@@ -79,7 +79,7 @@ func TestStreamUsesGLMThinkingAndReasoningContent(t *testing.T) {
 
 func TestOpenCodeZenPreservesReasoningContent(t *testing.T) {
 	prior := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "thinking", Text: "prior reasoning"}}}
-	wire := toWireWithReasoning("", []provider.Message{prior}, true)
+	wire := toWireWithReasoning("", []provider.Message{prior}, true, false)
 	encoded, err := json.Marshal(wire[0])
 	if err != nil {
 		t.Fatalf("encode assistant message: %v", err)
@@ -315,7 +315,7 @@ func TestOnlyMostRecentReasoningIsEchoed(t *testing.T) {
 		{Type: "tool_use", ID: "c1", Name: "read", Input: json.RawMessage(`{"path":"x"}`)},
 	}}
 	msgs := []provider.Message{old, provider.UserText("turn 2"), recent}
-	wire := toWireWithReasoning("", msgs, true)
+	wire := toWireWithReasoning("", msgs, true, false)
 
 	var oldReasoning, recentReasoning *string
 	for _, wm := range wire {
@@ -339,4 +339,70 @@ func TestOnlyMostRecentReasoningIsEchoed(t *testing.T) {
 	if oldReasoning != nil {
 		t.Fatalf("stale reasoning must be stripped, got %q (len %d)", *oldReasoning, len(*oldReasoning))
 	}
+}
+
+// DeepSeek-line providers keys prompt caching off a byte-identical prefix, so
+// stripping stale reasoning every turn (the pre-fix behavior) makes the prefix
+// change in the middle and re-bills the whole tail. Retaining all reasoning is
+// append-only: the previous request's bytes are a prefix of the next, so the
+// automatic cache hits and only the new tail is charged.
+func TestRetainAllReasoningKeepsAppendOnlyPrefix(t *testing.T) {
+	old := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "old reasoning"},
+		{Type: "text", Text: "old answer"},
+	}}
+	recent := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "recent reasoning"},
+		{Type: "tool_use", ID: "c1", Name: "read", Input: json.RawMessage(`{"path":"x"}`)},
+	}}
+	msgs := []provider.Message{old, provider.UserText("turn 2"), recent}
+	wire := toWireWithReasoning("", msgs, true, true)
+
+	var oldReasoning, recentReasoning *string
+	for _, wm := range wire {
+		if wm.Role != "assistant" || wm.ReasoningContent == nil {
+			continue
+		}
+		if *wm.ReasoningContent == "recent reasoning" {
+			recentReasoning = wm.ReasoningContent
+		}
+		if strings.Contains(*wm.ReasoningContent, "old reasoning") {
+			oldReasoning = wm.ReasoningContent
+		}
+	}
+
+	if recentReasoning == nil {
+		t.Fatal("most recent thinking must be echoed back")
+	}
+	if oldReasoning == nil {
+		t.Fatal("retain-all must keep the older reasoning block for an append-only prefix")
+	}
+	if *oldReasoning != "old reasoning" {
+		t.Fatalf("older reasoning = %q, want the full original value", *oldReasoning)
+	}
+}
+
+// A DeepSeek-line end-to-end request (opencode-zen gateway) must keep the older
+// reasoning block alongside the newest one so the prompt grows only at the end.
+func TestOpenCodeZenRequestRetainsAllReasoning(t *testing.T) {
+	old := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "old reasoning"}, {Type: "text", Text: "old answer"},
+	}}
+	recent := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "recent reasoning"},
+		{Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`)},
+	}}
+	request := reasoningEchoClient(t, "opencode-zen", "deepseek-v4-flash-free",
+		[]provider.Message{old, provider.UserText("turn 2"), recent}, provider.ReasoningHigh)
+	for _, raw := range request["messages"].([]any) {
+		msg := raw.(map[string]any)
+		if msg["role"] != "assistant" {
+			continue
+		}
+		reasoning, _ := msg["reasoning_content"].(string)
+		if reasoning == "old reasoning" {
+			return // older reasoning retained: prefix stays append-only
+		}
+	}
+	t.Fatalf("opencode-zen request dropped older reasoning; sent: %v", request["messages"])
 }

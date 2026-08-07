@@ -195,13 +195,16 @@ type streamOpts struct {
 
 // toWire flattens rick's block model onto OpenAI's message model.
 func toWire(system string, msgs []provider.Message) []wireMessage {
-	return toWireWithReasoning(system, msgs, false)
+	return toWireWithReasoning(system, msgs, false, false)
 }
 
 // toWireWithReasoning preserves reasoning_content for providers such as GLM
 // and DeepSeek that require it when a tool call is followed by another turn.
-func toWireWithReasoning(system string, msgs []provider.Message, includeReasoning bool) []wireMessage {
-	return toWireWithStable(system, "", msgs, includeReasoning)
+// retainAllReasoning keeps reasoning for every assistant turn (append-only) so
+// the serialized prompt stays a strict prefix of the next request — DeepSeek's
+// automatic prefix cache then hits the whole stable history every turn.
+func toWireWithReasoning(system string, msgs []provider.Message, includeReasoning, retainAllReasoning bool) []wireMessage {
+	return toWireWithStable(system, "", msgs, includeReasoning, retainAllReasoning)
 }
 
 // hasThinkingBlocks reports whether any prior turn produced reasoning that a
@@ -220,7 +223,7 @@ func hasThinkingBlocks(msgs []provider.Message) bool {
 // toWireWithStable keeps the stable prompt in an earlier message than the
 // per-turn tail. Direct OpenAI caching can then retain the stable prefix while
 // the volatile environment and skill instructions continue to be sent.
-func toWireWithStable(system, stable string, msgs []provider.Message, includeReasoning bool) []wireMessage {
+func toWireWithStable(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning bool) []wireMessage {
 	var out []wireMessage
 	if strings.TrimSpace(stable) != "" && strings.HasPrefix(system, stable) {
 		out = append(out, wireMessage{Role: "system", Content: stable})
@@ -232,14 +235,22 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 	}
 
 	// DeepSeek/GLM require the *immediately previous* turn's reasoning echoed
-	// back to continue a tool exchange, but reasoning from older turns is dead
-	// weight: it multiplies the prompt, breaks the provider cache, and spikes
-	// CPU when compaction resends the whole head. Only the most recent
-	// assistant message that actually produced reasoning keeps its value;
-	// earlier turns still carry the reasoning_content field (so the endpoint
-	// never rejects them) but with an empty value.
+	// back to continue a tool exchange. Reasoning from older turns is normally
+	// dead weight: it multiplies the prompt and spikes CPU when compaction
+	// resends the whole head, so by default only the most recent thinking
+	// assistant message keeps its value (older turns carry an empty
+	// reasoning_content so the endpoint never rejects them).
+	//
+	// For DeepSeek-line providers that preserve the reasoning, that stripping
+	// also *breaks the provider cache*: the "previous" assistant message flips
+	// from a full reasoning value to an empty one as the window moves, so the
+	// serialized prefix changes in the middle of the prompt and every turn
+	// re-bills the whole tail (DeepSeek's automatic cache is prefix-based and
+	// only hits a byte-identical prefix). Retaining every reasoning block is
+	// append-only — the prompt only grows at the end — so the cache stays hot
+	// and cached reasoning is billed at DeepSeek's discounted 0.1x rate.
 	lastThinking := -1
-	if includeReasoning {
+	if includeReasoning && !retainAllReasoning {
 		for i := len(msgs) - 1; i >= 0; i-- {
 			for _, b := range msgs[i].Content {
 				if b.Type == "thinking" && strings.TrimSpace(b.Text) != "" {
@@ -260,7 +271,7 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 		var results []wireMessage
 		var imageBlocks []wireImageContent
 
-		keeper := includeReasoning && i == lastThinking
+		keeper := includeReasoning && (retainAllReasoning || i == lastThinking)
 
 		for _, b := range m.Content {
 			switch b.Type {
@@ -392,9 +403,18 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	if hasThinkingBlocks(req.Messages) {
 		preserveReasoning = true
 	}
+	// DeepSeek-line endpoints (Zen/Go gateways build on DeepSeek-style thinking)
+	// get an append-only prompt: every turn keeps all of its reasoning instead
+	// of stripping to the most-recent window. That keeps the serialized prefix
+	// byte-identical across turns so the provider's automatic prefix cache hits,
+	// instead of re-billing the whole tail every turn. Other reasoning
+	// providers keep the token-saving strip.
+	retainAllReasoning := c.ID == "opencode-zen" || c.ID == "opencode-go" ||
+		style == provider.ReasoningStyleDeepSeek ||
+		(hasThinkingBlocks(req.Messages) && (c.ID == "deepseek" || c.ID == "openrouter"))
 	body := wireRequest{
 		Model:          req.Model,
-		Messages:       toWireWithReasoning(req.System, req.Messages, preserveReasoning),
+		Messages:       toWireWithReasoning(req.System, req.Messages, preserveReasoning, retainAllReasoning),
 		Tools:          toWireTools(req.Tools),
 		Stream:         true,
 		StreamOpts:     &streamOpts{IncludeUsage: true},
@@ -403,7 +423,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		PromptCacheKey: promptCacheKey(req.Model, req.SessionID),
 	}
 	if c.ID == "openai" {
-		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning)
+		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning)
 	}
 	if c.ID != "openai" {
 		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
@@ -550,28 +570,69 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 	calls := map[int]*callAccum{}
 	usage := provider.Usage{}
 	stopReason := ""
+	sawOutput := false
+	completed := false
 
 	flushCalls := func() bool {
-		// Emit in index order for determinism without assuming call indexes are
-		// contiguous or bounded by the number of accumulated calls.
+		// Validate the complete batch before emitting any call. This preserves
+		// all-or-nothing semantics when a later call in the batch is malformed.
 		indices := make([]int, 0, len(calls))
 		for index := range calls {
 			indices = append(indices, index)
 		}
 		sort.Ints(indices)
+		validatedCalls := make([]provider.ToolCall, 0, len(indices))
+		seenIDs := make(map[string]struct{}, len(indices))
 		for _, index := range indices {
 			acc := calls[index]
 			args := strings.TrimSpace(acc.args.String())
 			if args == "" {
 				args = "{}"
 			}
+			if strings.TrimSpace(acc.name) == "" {
+				emit(provider.Event{Kind: provider.EventError,
+					Err: fmt.Errorf("%s: malformed tool call at index %d: missing function name", c.ID, index)})
+				return false
+			}
+			if !json.Valid([]byte(args)) {
+				emit(provider.Event{Kind: provider.EventError,
+					Err: fmt.Errorf("%s: malformed arguments for tool %q at index %d", c.ID, acc.name, index)})
+				return false
+			}
+			if args[0] != '{' {
+				emit(provider.Event{Kind: provider.EventError,
+					Err: fmt.Errorf("%s: arguments for tool %q at index %d must be a JSON object", c.ID, acc.name, index)})
+				return false
+			}
+			if acc.id != "" {
+				if _, duplicate := seenIDs[acc.id]; duplicate {
+					emit(provider.Event{Kind: provider.EventError,
+						Err: fmt.Errorf("%s: duplicate tool call ID %q", c.ID, acc.id)})
+					return false
+				}
+				seenIDs[acc.id] = struct{}{}
+			}
+			validatedCalls = append(validatedCalls,
+				provider.ToolCall{ID: acc.id, Name: acc.name, Input: json.RawMessage(args)})
+		}
+		for _, index := range indices {
 			delete(calls, index)
-			if !emit(provider.Event{Kind: provider.EventToolCall,
-				ToolCall: &provider.ToolCall{ID: acc.id, Name: acc.name, Input: json.RawMessage(args)}}) {
+		}
+		for index := range validatedCalls {
+			if !emit(provider.Event{Kind: provider.EventToolCall, ToolCall: &validatedCalls[index]}) {
 				return false
 			}
 		}
 		return true
+	}
+	emitAssistantText := func(text string) bool {
+		if text == "" {
+			return true
+		}
+		if strings.TrimSpace(text) != "" {
+			sawOutput = true
+		}
+		return emit(provider.Event{Kind: provider.EventText, Text: text})
 	}
 
 	for sc.Scan() {
@@ -589,6 +650,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			continue
 		}
 		if data == "[DONE]" {
+			completed = true
 			break
 		}
 
@@ -596,6 +658,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			Choices []struct {
 				Delta struct {
 					Content          string         `json:"content"`
+					Refusal          string         `json:"refusal"`
 					Reasoning        string         `json:"reasoning"`
 					ReasoningContent string         `json:"reasoning_content"`
 					ToolCalls        []wireToolCall `json:"tool_calls"`
@@ -616,7 +679,9 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
+			emit(provider.Event{Kind: provider.EventError,
+				Err: fmt.Errorf("%s: malformed SSE data: %w", c.ID, err)})
+			return
 		}
 		if chunk.Error != nil {
 			emit(provider.Event{Kind: provider.EventError,
@@ -643,17 +708,22 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			usage.CacheWriteTokens = cacheWrite
 		}
 		for _, choice := range chunk.Choices {
-			if t := choice.Delta.Content; t != "" {
-				if !emit(provider.Event{Kind: provider.EventText, Text: t}) {
-					return
-				}
+			if !emitAssistantText(choice.Delta.Content) {
+				return
+			}
+			if !emitAssistantText(choice.Delta.Refusal) {
+				return
 			}
 			if t := choice.Delta.Reasoning + choice.Delta.ReasoningContent; t != "" {
+				if strings.TrimSpace(t) != "" {
+					sawOutput = true
+				}
 				if !emit(provider.Event{Kind: provider.EventThinking, Text: t}) {
 					return
 				}
 			}
 			for _, tc := range choice.Delta.ToolCalls {
+				sawOutput = true
 				if existing, ok := calls[tc.Index]; ok && tc.ID != "" && existing.id != "" && existing.id != tc.ID {
 					if !flushCalls() {
 						return
@@ -682,6 +752,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 			}
 			if choice.FinishReason != "" {
 				stopReason = choice.FinishReason
+				completed = true
 			}
 		}
 	}
@@ -690,10 +761,20 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 		emit(provider.Event{Kind: provider.EventError, Err: err})
 		return
 	}
+	if !completed {
+		emit(provider.Event{Kind: provider.EventError,
+			Err: fmt.Errorf("%s: stream ended without a completion marker", c.ID)})
+		return
+	}
 	if !flushCalls() {
 		return
 	}
 	emit(provider.Event{Kind: provider.EventUsage, Usage: &usage})
+	if !sawOutput {
+		emit(provider.Event{Kind: provider.EventError,
+			Err: fmt.Errorf("%s: empty completion: provider returned no text, reasoning, or tool calls", c.ID)})
+		return
+	}
 	emit(provider.Event{Kind: provider.EventDone, StopReason: stopReason})
 }
 

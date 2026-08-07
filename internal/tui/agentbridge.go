@@ -124,6 +124,7 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 
 	// Track appended messages by reconstructing them in the Update loop.
 	m.pendingTools = map[string]int{}
+	m.turnBoundaryPending = false
 	return tea.Batch(m.drainCmd(runID), m.spinnerCmd())
 }
 
@@ -140,9 +141,6 @@ func (m *Model) sessionID() string {
 			ID:      session.NewID(),
 			Cwd:     m.deps.Cwd,
 			Created: time.Now(),
-		}
-		if m.deps.Store != nil {
-			_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
 		}
 	}
 	return m.sess.ID
@@ -186,9 +184,11 @@ func (m *Model) drainAgent(runID uint64) (tea.Model, tea.Cmd) {
 func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 	switch ev.Kind {
 	case agent.EvText:
+		m.flushTurnBoundary()
 		m.streamBuf.WriteString(ev.Text)
 
 	case agent.EvThinking:
+		m.flushTurnBoundary()
 		m.thinkBuf.WriteString(ev.Text)
 
 	case agent.EvToolStart:
@@ -268,6 +268,8 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvTurnEnd:
 		m.flushStream()
+		m.flushTurnBoundary()
+		m.turnBoundaryPending = true
 
 	case agent.EvAgentBackground, agent.EvAgentReattached, agent.EvAgentMessage:
 		if strings.TrimSpace(ev.Text) != "" {
@@ -277,6 +279,7 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvError:
 		m.flushStream()
+		m.flushTurnBoundary()
 		if ev.Err != nil {
 			m.msgs = append(m.msgs, ChatMsg{Kind: MsgError, Text: ev.Err.Error(), Time: time.Now()})
 		}
@@ -284,38 +287,82 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvDone:
 		m.flushStream()
+		m.flushTurnBoundary()
 		return m.finishRun(nil), true
 	}
 	return nil, false
 }
 
+func (m *Model) flushTurnBoundary() {
+	if !m.turnBoundaryPending {
+		return
+	}
+	for index := len(m.msgs) - 1; index >= 0; index-- {
+		if m.msgs[index].Kind == MsgTool {
+			m.msgs[index].TurnBoundary = true
+			break
+		}
+	}
+	m.turnBoundaryPending = false
+}
+
 // observeCacheUsage detects per-turn cache misses (pi's cache-stats.ts
 // contract): prompt tokens that were in the previous request's prompt but
 // were not read from cache, above a 1024-token noise floor. Consecutive
-// misses get a one-line system notice so cache regressions are visible.
+// misses get a one-line system notice so cache regressions are visible. The
+// notice distinguishes the two causes: an idle gap that outlived the
+// provider's cache TTL (a timeout) versus a genuine prompt prefix change.
 func (m *Model) observeCacheUsage(u *provider.Usage) {
 	promptTokens := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
 	if promptTokens <= 0 {
 		return
 	}
 	reported := u.CacheReadTokens+u.CacheWriteTokens > 0
-	if m.cachePrevPrompt > 0 && (reported || m.cachePrevReported) {
+	// Only measure a miss when this turn actually reports cache tokens.
+	// Gateways that omit the cache fields on some turns (e.g. a usage chunk
+	// without cached_tokens) must not be read as "the whole history was
+	// re-billed": with the old latch, one cached turn made every later
+	// cache-less turn count a full-prompt miss, inflating the miss counter.
+	missCause := ""
+	if m.cachePrevPrompt > 0 && reported {
 		missed := min(m.cachePrevPrompt, promptTokens) - u.CacheReadTokens
 		if missed > cacheMissNoiseFloor {
 			m.cacheMissTokens += missed
 			m.cacheMissCount++
 			m.cacheMissStreak++
+			missCause = m.cacheMissReason()
 			if m.cacheMissStreak == 2 {
 				m.appendMsg(ChatMsg{Kind: MsgSystem,
-					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (idle gap or prefix change)",
-						humanTokens(missed)), Time: time.Now()})
+					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (%s)",
+						humanTokens(missed), missCause), Time: time.Now()})
 			}
 		} else {
 			m.cacheMissStreak = 0
 		}
 	}
+	m.cacheLastUsage = time.Now()
 	m.cachePrevPrompt = promptTokens
-	m.cachePrevReported = m.cachePrevReported || reported
+}
+
+// cacheTTL returns the provider cache TTL for the configured retention.
+// Long retention (Anthropic 1h / OpenAI 24h) is capped at an hour here; the
+// default 5-minute Anthropic ephemeral TTL is otherwise assumed.
+func (m *Model) cacheTTL() time.Duration {
+	if m.deps.Loaded != nil &&
+		provider.CacheRetention(m.deps.Loaded.Config.CacheRetention) == provider.CacheRetentionLong {
+		return time.Hour
+	}
+	return 5 * time.Minute
+}
+
+// cacheMissReason tells apart an idle-gap timeout from a prefix change, so
+// cache regressions caused by conversation edits are distinguishable from
+// the cheap misses that come from simply waiting too long.
+func (m *Model) cacheMissReason() string {
+	if !m.cacheLastUsage.IsZero() && time.Since(m.cacheLastUsage) > m.cacheTTL() {
+		return "idle gap (cache expired)"
+	}
+	return "prefix change"
 }
 
 // recordChildUsage updates persistent accounting from a child runner. Child
@@ -357,6 +404,7 @@ func (m *Model) flushStream() {
 
 func (m *Model) finishRun(err error) tea.Cmd {
 	m.flushStream()
+	m.flushTurnBoundary()
 	m.running = false
 	if !m.turnStart.IsZero() {
 		m.turnElapsed = time.Since(m.turnStart)
@@ -371,7 +419,10 @@ func (m *Model) finishRun(err error) tea.Cmd {
 	// Rebuild the canonical history from what actually happened so the next
 	// turn replays tool calls and results correctly.
 	m.rebuildHistory()
-	m.saveSession()
+	m.recordRunError(err)
+	if saveErr := m.saveSession(); saveErr != nil {
+		m.reportSessionSaveError(saveErr)
+	}
 	m.refresh()
 
 	if err != nil {
@@ -386,6 +437,32 @@ func (m *Model) finishRun(err error) tea.Cmd {
 		return compactCmd
 	}
 	return nil
+}
+
+func (m *Model) reportSessionSaveError(err error) {
+	if err == nil {
+		return
+	}
+	m.msgs = append(m.msgs, ChatMsg{Kind: MsgError, Text: "session save: " + err.Error(), Time: time.Now()})
+	m.tx.noteAppend()
+	m.setStatus("session save failed: " + truncate(err.Error(), 48))
+}
+
+func (m *Model) recordRunError(err error) {
+	m.lastRunError = ""
+	if err != nil {
+		m.lastRunError = err.Error()
+	}
+	if m.sess != nil {
+		m.sess.RunError = m.lastRunError
+	}
+}
+
+func (m *Model) restoreRunError(sess *session.Session) {
+	m.lastRunError = ""
+	if sess != nil {
+		m.lastRunError = sess.RunError
+	}
 }
 
 // rebuildHistory reconstructs bounded provider messages from the rendered
@@ -469,6 +546,10 @@ func (m *Model) buildHistory(toolOutputLimit int) []provider.Message {
 			})
 			pendingResults = append(pendingResults,
 				provider.ToolResultBlock(msg.CallID, compactToolOutput(m.fullToolOutput(msg), toolOutputLimit), msg.ToolErr))
+			if msg.TurnBoundary {
+				flushAssistant()
+				flushResults()
+			}
 		}
 	}
 	flushAssistant()

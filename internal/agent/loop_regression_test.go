@@ -76,6 +76,116 @@ func TestRunnerReportsProviderStreamWithoutDone(t *testing.T) {
 	}
 }
 
+type emptyCompletionProvider struct{}
+
+func (emptyCompletionProvider) Name() string                 { return "empty-completion-provider" }
+func (emptyCompletionProvider) Models() []provider.ModelInfo { return nil }
+func (emptyCompletionProvider) Stream(_ context.Context, _ provider.Request, ch chan<- provider.Event) {
+	defer close(ch)
+	ch <- provider.Event{Kind: provider.EventDone, StopReason: "end_turn"}
+}
+
+func TestRunnerReportsEmptyProviderCompletion(t *testing.T) {
+	runner := New(Config{Provider: emptyCompletionProvider{}, Model: "empty-model", Tools: tools.NewRegistry()})
+	events := make(chan Event, 16)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("hello")}, events)
+	if err == nil || !strings.Contains(err.Error(), "empty completion") {
+		t.Fatalf("Run error = %v, want empty completion error", err)
+	}
+	for event := range events {
+		if event.Kind == EvDone {
+			t.Fatalf("empty completion emitted success: %#v", event)
+		}
+	}
+}
+
+type staticCallProvider struct {
+	name  string
+	calls []provider.ToolCall
+}
+
+func (p staticCallProvider) Name() string               { return p.name }
+func (staticCallProvider) Models() []provider.ModelInfo { return nil }
+func (p staticCallProvider) Stream(_ context.Context, _ provider.Request, ch chan<- provider.Event) {
+	defer close(ch)
+	for index := range p.calls {
+		call := p.calls[index]
+		ch <- provider.Event{Kind: provider.EventToolCall, ToolCall: &call}
+	}
+	ch <- provider.Event{Kind: provider.EventDone, StopReason: "tool_use"}
+}
+
+func TestRunnerRejectsMalformedToolArgumentsBeforeExecution(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	callProvider := staticCallProvider{name: "malformed-call-provider", calls: []provider.ToolCall{{
+		ID: "bad-call", Name: "shell", Input: json.RawMessage(`{"command":`),
+	}}}
+	runner := New(Config{Provider: callProvider, Model: "test-model", Tools: registry})
+	events := make(chan Event, 16)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("test")}, events)
+	if err == nil || !strings.Contains(err.Error(), "malformed arguments for tool") {
+		t.Fatalf("Run error = %v, want malformed tool arguments", err)
+	}
+	for event := range events {
+		if event.Kind == EvToolStart || event.Kind == EvToolEnd {
+			t.Fatalf("malformed tool call reached execution: %#v", event)
+		}
+	}
+}
+
+func TestRunnerRejectsToolCallWithoutNameBeforeExecution(t *testing.T) {
+	callProvider := staticCallProvider{name: "nameless-call-provider", calls: []provider.ToolCall{{
+		ID: "bad-call", Input: json.RawMessage(`{}`),
+	}}}
+	runner := New(Config{Provider: callProvider, Model: "test-model", Tools: tools.NewRegistry()})
+	events := make(chan Event, 16)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("test")}, events)
+	if err == nil || !strings.Contains(err.Error(), "missing function name") {
+		t.Fatalf("Run error = %v, want missing function name", err)
+	}
+	for event := range events {
+		if event.Kind == EvToolStart || event.Kind == EvToolEnd {
+			t.Fatalf("nameless tool call reached execution: %#v", event)
+		}
+	}
+}
+
+func TestRunnerRejectsNonObjectToolArgumentsBeforeExecution(t *testing.T) {
+	callProvider := staticCallProvider{name: "non-object-call-provider", calls: []provider.ToolCall{{
+		ID: "bad-call", Name: "shell", Input: json.RawMessage(`[]`),
+	}}}
+	runner := New(Config{Provider: callProvider, Model: "test-model", Tools: tools.NewRegistry()})
+	events := make(chan Event, 16)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("test")}, events)
+	if err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("Run error = %v, want JSON object error", err)
+	}
+	for event := range events {
+		if event.Kind == EvToolStart || event.Kind == EvToolEnd {
+			t.Fatalf("non-object tool call reached execution: %#v", event)
+		}
+	}
+}
+
+func TestRunnerRejectsDuplicateToolCallIDsBeforeExecution(t *testing.T) {
+	callProvider := staticCallProvider{name: "duplicate-id-provider", calls: []provider.ToolCall{
+		{ID: "duplicate", Name: "shell", Input: json.RawMessage(`{"command":"one"}`)},
+		{ID: "duplicate", Name: "shell", Input: json.RawMessage(`{"command":"two"}`)},
+	}}
+	runner := New(Config{Provider: callProvider, Model: "test-model", Tools: tools.NewRegistry()})
+	events := make(chan Event, 16)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("test")}, events)
+	if err == nil || !strings.Contains(err.Error(), "duplicate tool call ID") {
+		t.Fatalf("Run error = %v, want duplicate ID error", err)
+	}
+	for event := range events {
+		if event.Kind == EvToolStart || event.Kind == EvToolEnd {
+			t.Fatalf("duplicate-ID tool calls reached execution: %#v", event)
+		}
+	}
+}
+
 type doneWithoutCloseProvider struct{}
 
 func (doneWithoutCloseProvider) Name() string                 { return "done-without-close" }

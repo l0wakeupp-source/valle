@@ -21,7 +21,23 @@ import (
 const (
 	defaultBaseURL = "https://api.anthropic.com"
 	apiVersion     = "2023-06-01"
+	// extendedCacheTTLBeta opt-in for cache_control ttl:"1h". Anthropic
+	// rejects a 1h TTL with a 400 unless this beta header is present, so
+	// "long" retention must not be sent without it or it silently degrades
+	// to the default 5-minute TTL and costs a cache re-write every turn.
+	extendedCacheTTLBeta = "extended-cache-ttl-2025-04-11"
 )
+
+// cacheBetaHeader returns the anthropic-beta header needed for the request's
+// retention policy, or "". "long" asks for a 1h cache TTL, which Anthropic
+// only honours when the extended-cache-ttl beta is opted in per request
+// (mirrors oh-my-pi: the header travels exactly when ttl:"1h" is emitted).
+func cacheBetaHeader(retention provider.CacheRetention) string {
+	if retention == provider.CacheRetentionLong {
+		return extendedCacheTTLBeta
+	}
+	return ""
+}
 
 // Client is an Anthropic provider.
 type Client struct {
@@ -344,6 +360,9 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	httpReq.Header.Set("anthropic-version", apiVersion)
 	httpReq.Header.Set("content-type", "application/json")
 	httpReq.Header.Set("accept", "text/event-stream")
+	if beta := cacheBetaHeader(req.CacheRetention); beta != "" {
+		httpReq.Header.Set("anthropic-beta", beta)
+	}
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {

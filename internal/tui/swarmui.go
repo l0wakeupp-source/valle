@@ -367,7 +367,9 @@ func (m *Model) applySwarmComplete(msg swarmCompleteMsg) {
 	m.billed.CacheWrite += cw
 	m.touch(view.MsgIndex)
 	m.refresh()
-	m.saveSession()
+	if err := m.saveSession(); err != nil {
+		m.reportSessionSaveError(err)
+	}
 }
 
 func (view *SwarmView) computeTotals() (in, out, cr, cw int) {

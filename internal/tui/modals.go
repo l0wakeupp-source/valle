@@ -460,6 +460,7 @@ func (m *Model) doResume(id string) {
 	}
 	m.toolOutputs = toolOutputsFromHistory(sess.Messages)
 	m.resetStats()
+	m.restoreRunError(sess)
 	m.usage = sess.Usage
 	m.optimization = sess.Optimization
 	if sess.Model != "" {
@@ -483,6 +484,7 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 	var out []ChatMsg
 	toolMsgIndex := map[string]int{}
 	for _, msg := range msgs {
+		turnBoundaryIndex := -1
 		for _, b := range msg.Content {
 			switch b.Type {
 			case "text":
@@ -509,8 +511,12 @@ func messagesToChat(msgs []provider.Message) []ChatMsg {
 				if index, ok := toolMsgIndex[b.ToolUseID]; ok && index < len(out) {
 					out[index].ToolOutput = truncate(b.Content, toolOutputPreviewChars)
 					out[index].ToolErr = b.IsError
+					turnBoundaryIndex = index
 				}
 			}
+		}
+		if turnBoundaryIndex >= 0 {
+			out[turnBoundaryIndex].TurnBoundary = true
 		}
 	}
 	return out
@@ -562,9 +568,12 @@ func toolOutputsFromHistory(history []provider.Message) map[string]string {
 	return outputs
 }
 
-func (m *Model) saveSession() {
+func (m *Model) saveSession() error {
 	if len(m.history) == 0 {
-		return
+		return nil
+	}
+	if m.deps.Store == nil {
+		return fmt.Errorf("session store is unavailable")
 	}
 	if m.sess == nil {
 		m.sess = &session.Session{
@@ -572,7 +581,6 @@ func (m *Model) saveSession() {
 			Cwd:     m.deps.Cwd,
 			Created: time.Now(),
 		}
-		_ = m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
 	}
 	// Keep the complete canonical transcript on disk for local expansion and
 	// export. Only the provider-facing m.history is bounded by rebuildHistory.
@@ -582,15 +590,20 @@ func (m *Model) saveSession() {
 	m.sess.SentTranscript = append([]provider.Message(nil), m.history...)
 	m.sess.Model = m.modelID
 	m.sess.Agent = m.agentName
+	m.sess.RunError = m.lastRunError
 	m.sess.Usage = m.usage
 	m.sess.Optimization = m.optimization
-	if m.deps.Snapshots.Enabled() {
+	if m.deps.Snapshots != nil && m.deps.Snapshots.Enabled() {
 		m.sess.Snapshots = m.deps.Snapshots.History()
 	}
 	if m.sess.Title == "" {
 		m.sess.Title = session.Title(m.sess.Messages)
 	}
-	_ = m.deps.Store.Save(m.sess)
+	if err := m.deps.Store.Save(m.sess); err != nil {
+		return err
+	}
+	// Publish the current pointer only after the referenced session exists.
+	return m.deps.Store.SetCurrent(m.deps.Cwd, m.sess.ID)
 }
 
 func (m *Model) cmdUndo() (tea.Model, tea.Cmd) {

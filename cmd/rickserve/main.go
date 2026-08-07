@@ -282,6 +282,10 @@ func main() {
 
 			if len(srv.loaded.Config.MCP) > 0 {
 				srv.mcp.Connect(ctx, srv.loaded.Config.MCP)
+				// Registering exposes the connected servers' tools to the
+				// daemon-wide registry, so handleTools and every session
+				// surface them. Connect alone only dials + discovers them.
+				srv.mcp.Register(srv.tools, srv.loaded.Config.Tools)
 			}
 
 			// Emit a ready banner so clients know the daemon is alive.
@@ -318,7 +322,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.12"
+var rickVersion = "0.1.13"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {

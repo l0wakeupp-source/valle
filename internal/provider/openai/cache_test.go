@@ -89,7 +89,7 @@ func TestStreamSendsRetentionAndAffinityForDirectOpenAI(t *testing.T) {
 		gotHeaders = r.Header.Clone()
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("content-type", "text/event-stream")
-		w.Write([]byte("data: [DONE]\n\n"))
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -134,7 +134,7 @@ func TestStreamOmitsCacheFieldsForNoneRetention(t *testing.T) {
 		gotHeaders = r.Header.Clone()
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("content-type", "text/event-stream")
-		w.Write([]byte("data: [DONE]\n\n"))
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -187,7 +187,7 @@ func TestStreamUsageAccountsCacheWritesSeparately(t *testing.T) {
 }
 
 func TestStableSystemPrefixIsSentBeforeVolatileTail(t *testing.T) {
-	wire := toWireWithStable("stable instructions\nvolatile environment", "stable instructions", nil, false)
+	wire := toWireWithStable("stable instructions\nvolatile environment", "stable instructions", nil, false, false)
 	if len(wire) != 2 {
 		t.Fatalf("wire message count = %d, want 2", len(wire))
 	}

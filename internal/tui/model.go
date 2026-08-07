@@ -128,25 +128,29 @@ type Model struct {
 	toolSchemasKey    string
 	toolSchemasPinned []provider.ToolSchema
 
-	// cachePrevPrompt/cachePrevReported track the previous request's prompt
-	// footprint so per-turn cache misses can be detected and surfaced
-	// (noise floor 1024 tokens, like pi's cache-stats.ts).
-	cachePrevPrompt   int
-	cachePrevReported bool
-	cacheMissTokens   int
-	cacheMissCount    int
-	cacheMissStreak   int
+	// cachePrevPrompt tracks the previous request's prompt footprint so
+	// per-turn cache misses can be detected and surfaced (noise floor 1024
+	// tokens, like pi's cache-stats.ts). A miss is only measured when the
+	// turn reports cache tokens at all.
+	cachePrevPrompt int
+	cacheMissTokens int
+	cacheMissCount  int
+	cacheMissStreak int
+	cacheLastUsage  time.Time
 
 	// streaming
-	running      bool
-	agentCh      chan agent.Event
-	agentCancel  context.CancelFunc
-	streamBuf    strings.Builder
-	thinkBuf     strings.Builder
-	pendingTools map[string]int // callID -> index into msgs
-	shellSeq     uint64
-	toolOutputs  map[string]string // full tool output, kept out of render entries
-	spinnerTick  int
+	running     bool
+	agentCh     chan agent.Event
+	agentCancel context.CancelFunc
+	streamBuf   strings.Builder
+	thinkBuf    strings.Builder
+	// Armed by EvTurnEnd and committed after that turn's tool results,
+	// immediately before the next model turn.
+	turnBoundaryPending bool
+	pendingTools        map[string]int // callID -> index into msgs
+	shellSeq            uint64
+	toolOutputs         map[string]string // full tool output, kept out of render entries
+	spinnerTick         int
 
 	// permission prompt
 	permReq    permission.Request
@@ -187,6 +191,7 @@ type Model struct {
 	// status
 	status             string
 	statusTime         time.Time
+	lastRunError       string
 	usage              session.Usage
 	optimization       session.OptimizationUsage
 	ctxWindow          int
@@ -878,7 +883,9 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.usage = session.Usage{}
 		m.refresh()
 		m.setStatus("context compacted")
-		m.saveSession()
+		if err := m.saveSession(); err != nil {
+			m.reportSessionSaveError(err)
+		}
 		return m, nil
 
 	case refreshDoneMsg:
@@ -1654,16 +1661,17 @@ func (m *Model) StatusBar() string { return m.StatusLine() }
 // These are session-scoped, not process-scoped: leaving them behind made a
 // brand-new conversation report the previous one's tokens and turn time.
 func (m *Model) resetStats() {
+	m.lastRunError = ""
 	m.usage = session.Usage{}
 	m.optimization = session.OptimizationUsage{}
 	m.billed = session.Usage{}
 	m.turnStart = time.Time{}
 	m.turnElapsed = 0
 	m.cachePrevPrompt = 0
-	m.cachePrevReported = false
 	m.cacheMissTokens = 0
 	m.cacheMissCount = 0
 	m.cacheMissStreak = 0
+	m.cacheLastUsage = time.Time{}
 }
 
 // SetTurnElapsed fakes a completed turn duration (test helper).
@@ -1699,7 +1707,6 @@ func (m *Model) setModel(id string) {
 	// A model switch re-bills the whole prompt; do not count the next turn's
 	// small cache-read as a miss against the old model's footprint.
 	m.cachePrevPrompt = 0
-	m.cachePrevReported = false
 	m.cacheMissStreak = 0
 	// The switch itself always succeeds; only remembering it can fail, so
 	// say so in the status line rather than silently forgetting — matching
