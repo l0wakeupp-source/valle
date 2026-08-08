@@ -1,4 +1,4 @@
-# rick
+# rick v
 
 A fast, focused terminal AI coding agent for building, inspecting, and changing
 projects without leaving your shell.
