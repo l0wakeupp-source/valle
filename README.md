@@ -1,4 +1,4 @@
-# rick v
+# NOT UPLOADED VALLE YET! WAIT FOR UPDATES
 
 A fast, focused terminal AI coding agent for building, inspecting, and changing
 projects without leaving your shell.
